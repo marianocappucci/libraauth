@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "libraauth"
+description = "Motor transversal de autenticacion (sesion por cookie + usuarios) para la familia de productos Libra, sobre SQLAlchemy."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [
+    { name = "Mariano Cappucci" },
+]
+dynamic = ["version"]
+dependencies = [
+    "starlette",
+    "fastapi>=0.111.0",
+    "sqlalchemy>=2.0",
+    "itsdangerous>=2.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+# Tags sin 'v' inicial en el numero de version (v0.1.0 -> 0.1.0), y un
+# esquema simple para que un commit sin tag no rompa el build (usa el commit
+# hash como sufijo de desarrollo en vez de fallar).
+local_scheme = "no-local-version"
+
+[tool.hatch.build.targets.wheel]
+packages = ["libraauth"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
