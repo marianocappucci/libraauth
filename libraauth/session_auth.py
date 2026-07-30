@@ -8,10 +8,11 @@ aplica a un producto de instancia unica) y el endpoint `/auth/verify` de
 `build_json_api_auth_router()` (login de `/docs/` de una landing publica
 — este paquete no asume que el consumidor tenga una).
 """
+import hmac
 import os
 from typing import Callable
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Header, Response
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from pydantic import BaseModel
 from starlette.requests import Request
@@ -127,6 +128,16 @@ class _UserOut(BaseModel):
     active: bool
 
 
+# Solo para `POST /auth/verify` (opt-in, ver build_json_api_auth_router).
+class _VerifyRequest(BaseModel):
+    username: str
+    password: str
+
+
+class _VerifyResponse(BaseModel):
+    valid: bool
+
+
 def json_api_get_session_auth(request: Request) -> "SessionAuth":
     return request.app.state.session_auth
 
@@ -162,10 +173,23 @@ json_api_require_admin = json_api_require_role("admin")
 json_api_require_staff = json_api_require_role("admin", "staff")
 
 
-def build_json_api_auth_router() -> APIRouter:
+def build_json_api_auth_router(*, incluir_verify: bool = False) -> APIRouter:
     """Router `/auth` (login/logout/me) para SPAs sin backoffice
     server-rendered propio. Espera `request.app.state.users`/
-    `request.app.state.session_auth` ya configurados al arrancar la app."""
+    `request.app.state.session_auth` ya configurados al arrancar la app.
+
+    `incluir_verify=True` agrega `POST /auth/verify`: el chequeo stateless de
+    credenciales que usa el login de `/docs/` de la landing del producto
+    (server-to-server con el secreto compartido `DOCS_AUTH_SECRET`, nunca crea
+    cookie de sesion). Es opt-in porque no todo consumidor tiene landing —
+    LibraDesk no la tenia cuando se creo este paquete, y por eso el endpoint
+    habia quedado afuera.
+
+    Que exista aca es lo que permite **borrar `libracore/auth.py`**: los tres
+    productos con landing (Gestiolibra/MedLibra/VentaLibra) seguian importando
+    el router de LibraCore justamente por este endpoint, asi que sin esto la
+    migracion no se podia terminar sin romperles el `/docs/`.
+    """
     router = APIRouter(prefix="/auth", tags=["auth"])
 
     @router.post("/login", response_model=_UserOut)
@@ -185,5 +209,25 @@ def build_json_api_auth_router() -> APIRouter:
     @router.get("/me", response_model=_UserOut)
     def me(user: dict = Depends(json_api_get_current_user)):
         return user
+
+    if incluir_verify:
+        @router.post("/verify", response_model=_VerifyResponse)
+        def verify(
+            data: _VerifyRequest,
+            request: Request,
+            x_internal_auth: str = Header(default=""),
+        ):
+            """Chequeo de credenciales stateless para el login de `/docs/` de
+            la landing del producto. Server-to-server (secreto compartido
+            `DOCS_AUTH_SECRET`), nunca crea cookie de sesion. **Falla cerrado
+            si el secreto no esta configurado**: sin eso, un `DOCS_AUTH_SECRET`
+            vacio en la app haria que cualquiera pudiera validar credenciales
+            sin header."""
+            secret = os.environ.get("DOCS_AUTH_SECRET", "")
+            if not secret or not hmac.compare_digest(x_internal_auth, secret):
+                raise HTTPException(401, "invalid internal auth")
+            users = request.app.state.users
+            user = users.check_credentials(data.username, data.password)
+            return _VerifyResponse(valid=user is not None)
 
     return router
