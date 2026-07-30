@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from libraauth.bootstrap import ensure_default_admin
+from libraauth.bootstrap import ensure_admin_user, ensure_default_admin
 from libraauth.models import Base
 from libraauth.repository import UserRepository, UsernameTaken
 
@@ -236,3 +236,74 @@ def test_el_contrato_viejo_sigue_intacto(repo):
     assert set(u) == {"id", "username", "name", "email", "role", "active"}
     assert isinstance(u["id"], str)
     assert isinstance(u["active"], bool)
+
+
+# ── ensure_admin_user (variante server-rendered, portada en v0.4.0) ───────
+
+def test_ensure_admin_user_crea_el_admin_con_las_env_vars(repo, monkeypatch, capsys):
+    """Env vars SIN prefijo de producto, a diferencia de ensure_default_admin."""
+    monkeypatch.setenv("ADMIN_USER", "jefe")
+    monkeypatch.setenv("ADMIN_PASSWORD", "clave-elegida")
+    monkeypatch.setenv("ADMIN_NOMBRE", "La Jefa")
+
+    ensure_admin_user(repo)
+
+    u = repo.get_by_username("jefe")
+    assert u is not None and u["role"] == "admin" and u["name"] == "La Jefa"
+    assert repo.check_credentials("jefe", "clave-elegida")
+    assert "creado" in capsys.readouterr().out
+
+
+def test_ensure_admin_user_usa_los_defaults(repo, monkeypatch):
+    for k in ("ADMIN_USER", "ADMIN_NOMBRE"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("ADMIN_PASSWORD", "x")
+    ensure_admin_user(repo)
+    u = repo.get_by_username("admin")
+    assert u is not None and u["name"] == "Administrador"
+
+
+def test_ensure_admin_user_no_hace_nada_si_ya_hay_usuarios(repo, monkeypatch):
+    """Idempotente: no pisa al admin real ni le cambia la contrasena."""
+    repo.create(username="existente", name="Ya Estaba", password="su-clave", role="admin")
+    monkeypatch.setenv("ADMIN_USER", "jefe")
+    monkeypatch.setenv("ADMIN_PASSWORD", "otra-clave")
+
+    ensure_admin_user(repo)
+
+    assert repo.get_by_username("jefe") is None
+    assert len(repo.list()) == 1
+    assert repo.check_credentials("existente", "su-clave")
+
+
+def test_ensure_admin_user_SIN_password_genera_una_y_la_imprime(repo, monkeypatch, capsys):
+    """LA diferencia con ensure_default_admin: no es fail-closed, arranca igual.
+
+    Se preserva a proposito (es el comportamiento de Contalibra/Restolibra),
+    pero deja la contrasena inicial en los logs del contenedor."""
+    monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    monkeypatch.setenv("ADMIN_USER", "admin")
+    monkeypatch.setenv("ENV", "production")   # ni siquiera en produccion falla
+
+    ensure_admin_user(repo)
+
+    salida = capsys.readouterr().out
+    assert "WARN" in salida and "generada" in salida
+    generada = salida.split("generada:")[1].split("\n")[0].strip()
+    assert len(generada) >= 12
+    assert repo.check_credentials("admin", generada)
+
+
+def test_las_dos_variantes_difieren_justo_donde_importa(repo, monkeypatch):
+    """ensure_default_admin es fail-closed sin password; ensure_admin_user no.
+    Por eso NO son intercambiables al migrar un producto."""
+    monkeypatch.setenv("ENV", "production")
+    monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    monkeypatch.delenv("RESTOLIBRA_ADMIN_PASSWORD", raising=False)
+
+    with pytest.raises(RuntimeError, match="ADMIN_PASSWORD"):
+        ensure_default_admin(repo, env_prefix="RESTOLIBRA")
+
+    assert repo.list() == []
+    ensure_admin_user(repo)          # esta no levanta: arranca igual
+    assert len(repo.list()) == 1
