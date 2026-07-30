@@ -7,7 +7,7 @@ from sqlalchemy.orm import sessionmaker
 
 from libraauth.bootstrap import ensure_default_admin
 from libraauth.models import Base
-from libraauth.repository import UserRepository
+from libraauth.repository import UserRepository, UsernameTaken
 
 
 @pytest.fixture
@@ -133,3 +133,26 @@ def test_ensure_default_admin_allows_fallback_password_in_development(repo, monk
     monkeypatch.setenv("ENV", "development")
     ensure_default_admin(repo, env_prefix="ACME")
     assert repo.check_credentials("admin", "admin") is not None
+
+
+def test_create_con_username_duplicado_levanta_UsernameTaken(repo):
+    """Antes de v0.1.1 esto propagaba sqlalchemy.exc.IntegrityError, y los
+    routers de la familia —que venian de libracore y capturaban
+    sqlite3.IntegrityError— devolvian 500 en vez de 409. El motor ahora expone
+    una excepcion de dominio para que el consumidor no conozca el storage."""
+    repo.create(username="repetido", name="Primero", password="x", role="admin")
+
+    with pytest.raises(UsernameTaken) as exc:
+        repo.create(username="repetido", name="Segundo", password="y", role="admin")
+    assert "repetido" in str(exc.value)
+
+    # La sesion quedo usable despues del rollback: el repo sigue funcionando.
+    assert len(repo.list()) == 1
+    assert repo.check_credentials("repetido", "x")
+
+
+def test_username_duplicado_se_detecta_con_espacios(repo):
+    """`create` hace strip del username, asi que " repetido " choca igual."""
+    repo.create(username="conespacios", name="Primero", password="x", role="admin")
+    with pytest.raises(UsernameTaken):
+        repo.create(username="  conespacios  ", name="Segundo", password="y", role="admin")

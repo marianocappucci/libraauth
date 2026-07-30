@@ -10,10 +10,25 @@ from contextlib import AbstractContextManager
 from typing import Callable
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .hashing import DUMMY_PASSWORD_HASH, hash_password, verify_password
 from .models import Usuario
+
+
+class UsernameTaken(Exception):
+    """El username ya existe.
+
+    Existe para que los consumidores no tengan que capturar la excepcion del
+    motor de storage. Antes de esto, los routers de la familia hacian
+    `except sqlite3.IntegrityError` — la excepcion cruda que filtraba la
+    implementacion sqlite3 de `libracore.db.usuarios`—, asi que al migrar a
+    este paquete (SQLAlchemy) el `except` dejaba de matchear y un username
+    duplicado devolvia 500 en vez de 409. Se encontro migrando Gestiolibra el
+    2026-07-30, con un test de ese repo en rojo; LibraDesk tenia el mismo bug
+    latente, sin test que lo cubriera.
+    """
 
 
 def _to_json_dict(u: Usuario) -> dict:
@@ -52,7 +67,16 @@ class UserRepository:
                 activo=True,
             )
             session.add(u)
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                # `username` es la unica constraint UNIQUE de la tabla, pero se
+                # chequea el mensaje para no convertir en UsernameTaken una
+                # violacion futura de otra constraint.
+                if "username" in str(exc.orig).lower():
+                    raise UsernameTaken(username.strip()) from exc
+                raise
             session.refresh(u)
             return _to_json_dict(u)
 
