@@ -22,5 +22,15 @@ jobs:
       - name: Install package + dev deps
         run: pip install -e ".[dev]"
 
+      # Lint antes que los tests: tarda segundos y su rojo se lee mucho mas
+      # facil que el de una suite. El ruleset vive en pyproject.toml y esta
+      # CURADO para dar cero hallazgos hoy en los 12 repos de la familia --
+      # ver el comentario largo ahi. Un rojo aca es una regresion, no deuda.
+      - name: Lint (ruff)
+        run: ruff check .
+
+      # `--cov` sin argumento toma el paquete de [tool.coverage.run] del
+      # pyproject. El piso (fail_under) tambien esta ahi: es un trinquete
+      # fijado 2 puntos debajo de lo medido el 2026-07-31, no una meta.
       - name: Run tests
-        run: pytest -v
+        run: pytest -v --cov --cov-report=term-missing
