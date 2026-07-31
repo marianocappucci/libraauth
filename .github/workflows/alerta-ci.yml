@@ -1,0 +1,79 @@
+name: Alerta CI
+
+# Avisa por Telegram cuando una corrida de este repo termina mal.
+#
+# Por que un archivo aparte y no un job dentro de cada workflow: asi se
+# suma UNA sola vez por repo y cubre todos sus workflows, sin editar los
+# que ya existen. `workflow_run` se dispara cuando termina alguno de los
+# que se listan abajo.
+#
+# Por que no un vigia centralizado que mire los 20 repos: eso necesitaria
+# un PAT (el GITHUB_TOKEN de un workflow solo alcanza a su propio repo), y
+# la regla del ecosistema es no usar PAT -- ver CLAUDE.md, "Autenticacion
+# git <-> GitHub". Aca no hace falta ninguna credencial de GitHub: el aviso
+# sale con el token del bot, que es de Telegram.
+#
+# OJO: `workflow_run` solo corre si este archivo esta en la rama DEFAULT
+# del repo (main). En una rama de feature no se dispara.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  # Para probar el canal sin tener que romper nada a proposito.
+  workflow_dispatch:
+
+jobs:
+  avisar:
+    # Solo si la corrida vigilada fallo. `workflow_dispatch` entra siempre,
+    # que es el modo de prueba.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Avisar por Telegram
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ES_PRUEBA: ${{ github.event_name == 'workflow_dispatch' }}
+          REPO: ${{ github.repository }}
+          FLUJO: ${{ github.event.workflow_run.name }}
+          RAMA: ${{ github.event.workflow_run.head_branch }}
+          AUTOR: ${{ github.event.workflow_run.actor.login }}
+          COMMIT: ${{ github.event.workflow_run.head_commit.message }}
+          URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -u
+          # Sin secrets cargados el paso NO falla: poner el CI en rojo para
+          # avisar que la alerta no anda seria contraproducente. Queda un
+          # warning visible en la corrida.
+          if [ -z "${TOKEN}" ] || [ -z "${CHAT}" ]; then
+            echo "::warning::Faltan TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID en este repo: no se envio el aviso."
+            exit 0
+          fi
+          if [ "${ES_PRUEBA}" = "true" ]; then
+            TEXTO=$(printf '%s\n\n%s' \
+              "✅ Prueba de alerta desde ${REPO}" \
+              "El canal funciona. Se disparo a mano, no hubo ninguna falla.")
+          else
+            TITULO=$(printf '%s' "${COMMIT}" | head -1 | cut -c1-90)
+            TEXTO=$(printf '%s\n\n%s\n%s\n%s\n%s\n%s\n\n%s' \
+              "🔴 CI en rojo" \
+              "Repo:     ${REPO}" \
+              "Workflow: ${FLUJO}" \
+              "Rama:     ${RAMA}" \
+              "Commit:   ${TITULO}" \
+              "Autor:    ${AUTOR}" \
+              "${URL}")
+          fi
+          # --fail-with-body para que un rechazo de la API de Telegram se
+          # vea en el log en vez de pasar como exito silencioso.
+          if ! respuesta=$(curl -sS --fail-with-body -X POST \
+              "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT}" \
+              --data-urlencode "text=${TEXTO}" 2>&1); then
+            echo "::error::Telegram rechazo el envio: ${respuesta}"
+            exit 1
+          fi
+          echo "Aviso enviado."
