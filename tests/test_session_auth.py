@@ -306,3 +306,85 @@ def test_json_api_require_staff_allows_both_admin_and_staff():
     client = FastAPITestClient(_make_json_api_app(), base_url="https://testserver")
     client.post("/auth/login", json={"username": "staffer", "password": "staffpw"})
     assert client.get("/staff-only").status_code == 200
+
+
+# ── POST /auth/verify (opt-in) ───────────────────────────────────────────
+
+def _make_verify_app():
+    """Igual que _make_json_api_app pero con el router opt-in de /verify."""
+    app = FastAPI()
+    users = _FakeJsonApiUsers()
+    app.state.users = users
+    app.state.session_auth = SessionAuth(
+        dev_secret_fallback="test-secret",
+        get_user_by_username=users.get_by_username,
+        check_credentials=users.check_credentials,
+        cookie_name="test_json_session",
+    )
+    app.include_router(build_json_api_auth_router(incluir_verify=True))
+    return app
+
+
+def test_verify_no_se_monta_por_defecto():
+    """Es opt-in: un consumidor sin landing no expone el endpoint."""
+    client = FastAPITestClient(_make_json_api_app(), base_url="https://testserver")
+    r = client.post("/auth/verify", json={"username": "admin", "password": "adminpw"})
+    assert r.status_code == 404
+
+
+def test_verify_credenciales_correctas(monkeypatch):
+    monkeypatch.setenv("DOCS_AUTH_SECRET", "secreto-compartido")
+    client = FastAPITestClient(_make_verify_app(), base_url="https://testserver")
+    r = client.post("/auth/verify", json={"username": "admin", "password": "adminpw"},
+                    headers={"X-Internal-Auth": "secreto-compartido"})
+    assert r.status_code == 200
+    assert r.json() == {"valid": True}
+
+
+def test_verify_password_incorrecta_no_es_401_sino_valid_false(monkeypatch):
+    """El 401 esta reservado al secreto server-to-server; una credencial mala
+    del usuario final es una respuesta valida con valid=false."""
+    monkeypatch.setenv("DOCS_AUTH_SECRET", "secreto-compartido")
+    client = FastAPITestClient(_make_verify_app(), base_url="https://testserver")
+    r = client.post("/auth/verify", json={"username": "admin", "password": "no-es"},
+                    headers={"X-Internal-Auth": "secreto-compartido"})
+    assert r.status_code == 200
+    assert r.json() == {"valid": False}
+
+
+def test_verify_sin_header_da_401(monkeypatch):
+    monkeypatch.setenv("DOCS_AUTH_SECRET", "secreto-compartido")
+    client = FastAPITestClient(_make_verify_app(), base_url="https://testserver")
+    r = client.post("/auth/verify", json={"username": "admin", "password": "adminpw"})
+    assert r.status_code == 401
+
+
+def test_verify_con_header_equivocado_da_401(monkeypatch):
+    monkeypatch.setenv("DOCS_AUTH_SECRET", "secreto-compartido")
+    client = FastAPITestClient(_make_verify_app(), base_url="https://testserver")
+    r = client.post("/auth/verify", json={"username": "admin", "password": "adminpw"},
+                    headers={"X-Internal-Auth": "otro-secreto"})
+    assert r.status_code == 401
+
+
+def test_verify_falla_cerrado_sin_secreto_configurado(monkeypatch):
+    """Si DOCS_AUTH_SECRET esta vacio NO se valida a nadie, ni siquiera con el
+    header vacio: sin esto, una instancia mal configurada quedaria como oraculo
+    de credenciales abierto."""
+    monkeypatch.delenv("DOCS_AUTH_SECRET", raising=False)
+    client = FastAPITestClient(_make_verify_app(), base_url="https://testserver")
+    for headers in ({}, {"X-Internal-Auth": ""}, {"X-Internal-Auth": "cualquiera"}):
+        r = client.post("/auth/verify", json={"username": "admin", "password": "adminpw"},
+                        headers=headers)
+        assert r.status_code == 401, headers
+
+
+def test_verify_no_crea_cookie_de_sesion(monkeypatch):
+    """Es server-to-server: no debe dejar sesion abierta."""
+    monkeypatch.setenv("DOCS_AUTH_SECRET", "secreto-compartido")
+    client = FastAPITestClient(_make_verify_app(), base_url="https://testserver")
+    r = client.post("/auth/verify", json={"username": "admin", "password": "adminpw"},
+                    headers={"X-Internal-Auth": "secreto-compartido"})
+    assert r.json() == {"valid": True}
+    assert "test_json_session" not in client.cookies
+    assert client.get("/auth/me").status_code == 401

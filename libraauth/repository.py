@@ -10,17 +10,37 @@ from contextlib import AbstractContextManager
 from typing import Callable
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .hashing import DUMMY_PASSWORD_HASH, hash_password, verify_password
 from .models import Usuario
 
 
+class UsernameTaken(Exception):
+    """El username ya existe.
+
+    Existe para que los consumidores no tengan que capturar la excepcion del
+    motor de storage. Antes de esto, los routers de la familia hacian
+    `except sqlite3.IntegrityError` — la excepcion cruda que filtraba la
+    implementacion sqlite3 de `libracore.db.usuarios`—, asi que al migrar a
+    este paquete (SQLAlchemy) el `except` dejaba de matchear y un username
+    duplicado devolvia 500 en vez de 409. Se encontro migrando Gestiolibra el
+    2026-07-30, con un test de ese repo en rojo; LibraDesk tenia el mismo bug
+    latente, sin test que lo cubriera.
+    """
+
+
 def _to_json_dict(u: Usuario) -> dict:
+    # `email` se agrego en v0.3.0. Es aditivo: los consumidores que no lo
+    # esperaban lo ignoran. Se sumo porque Restolibra/Contalibra lo crean, lo
+    # editan y lo DEVUELVEN en la API que consume su SPA — migrarlos sin esto
+    # les borraba el campo de la pantalla de usuarios.
     return {
         "id": str(u.id),
         "username": u.username,
         "name": u.nombre,
+        "email": u.email or "",
         "role": u.role,
         "active": bool(u.activo),
     }
@@ -39,20 +59,30 @@ class UserRepository:
         self.session_factory = session_factory
         self.roles = roles
 
-    def create(self, username: str, name: str, password: str, role: str) -> dict:
+    def create(self, username: str, name: str, password: str, role: str,
+               email: str = "") -> dict:
         if role not in self.roles:
             raise ValueError(f"invalid role: {role!r} (expected one of {self.roles})")
         with self.session_factory() as session:
             u = Usuario(
                 username=username.strip(),
                 nombre=name.strip(),
-                email="",
+                email=(email or "").strip(),
                 password_hash=hash_password(password),
                 role=role,
                 activo=True,
             )
             session.add(u)
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                # `username` es la unica constraint UNIQUE de la tabla, pero se
+                # chequea el mensaje para no convertir en UsernameTaken una
+                # violacion futura de otra constraint.
+                if "username" in str(exc.orig).lower():
+                    raise UsernameTaken(username.strip()) from exc
+                raise
             session.refresh(u)
             return _to_json_dict(u)
 
@@ -79,7 +109,15 @@ class UserRepository:
             ).scalars()
             return [_to_json_dict(u) for u in rows]
 
-    def update(self, user_id: str, name: str, role: str, active: bool) -> dict:
+    def update(self, user_id: str, name: str, role: str, active: bool,
+               email: str | None = None) -> dict:
+        """`email=None` **deja el valor como esta**, no lo borra.
+
+        El default es None y no "" a proposito: los consumidores que ya existian
+        llaman `update(id, name, role, active)` sin email, y con un default vacio
+        cada edicion de nombre o rol les habria borrado el email en silencio.
+        Para vaciarlo hay que pedirlo explicitamente con `email=""`.
+        """
         if role not in self.roles:
             raise ValueError(f"invalid role: {role!r} (expected one of {self.roles})")
         uid = self._require_uid(user_id)
@@ -88,6 +126,8 @@ class UserRepository:
             u.nombre = name.strip()
             u.role = role
             u.activo = active
+            if email is not None:
+                u.email = email.strip()
             session.commit()
             session.refresh(u)
             return _to_json_dict(u)

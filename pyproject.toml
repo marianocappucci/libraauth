@@ -21,6 +21,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "pytest-cov>=6",
+    "ruff>=0.13",
     "pytest>=8.0",
     "httpx>=0.27",
 ]
@@ -39,3 +41,48 @@ packages = ["libraauth"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# === lint + coverage (agregado 2026-07-31) ===
+# Lint activado en los 12 repos de la familia el mismo dia. El ruleset es
+# CURADO, no el default de ruff: el default tiraba entre 132 y 224 hallazgos
+# por repo, casi todo estilo, y un lint que arranca en rojo se ignora desde el
+# primer dia. Estas reglas dan CERO hallazgos hoy en los 12, asi que cualquier
+# rojo futuro es una regresion real y no deuda vieja.
+#
+# F401 (import sin usar) queda AFUERA A PROPOSITO: son ~396 en la familia y
+# buena parte son re-exports deliberados en __init__.py, donde el import ES la
+# API publica del modulo. Sacarlos a ciegas rompe a quien importa desde ahi.
+# Queda como backlog aparte, para revisar a mano archivo por archivo.
+[tool.ruff]
+line-length = 120
+extend-exclude = ["frontend", "website", "node_modules"]
+
+[tool.ruff.lint]
+select = [
+    "E9",    # el archivo no parsea, o error de IO al leerlo
+    "F63",   # comparaciones invalidas (`is` contra un literal, `in` mal usado)
+    "F7",    # `break` / `continue` / `return` fuera de lugar
+    "F811",  # redefinicion de un nombre ya definido o importado
+    "F821",  # nombre no definido -> NameError seguro en runtime
+    "F822",  # nombre listado en __all__ que no existe en el modulo
+    "F823",  # variable local usada antes de asignarse
+    "F841",  # variable asignada y nunca usada (codigo muerto)
+    "F541",  # f-string sin placeholders (suele ser llaves olvidadas)
+    "F502", "F506", "F522", "F524",  # %/format() con argumentos mal armados
+    "F601", "F602",                  # `x in 1, 2` en vez de `x in (1, 2)`
+]
+
+[tool.coverage.run]
+source = ["libraauth"]
+branch = true
+omit = ["*/tests/*", "*/migrations/*", "*/.venv/*", "*/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+# Piso de cobertura. Es un TRINQUETE, no una meta: se fijo 2 puntos por
+# debajo de lo que el repo media el 2026-07-31 (96%), asi que hoy pasa
+# holgado y lo unico que puede ponerlo en rojo es una regresion. Cuando la
+# cobertura suba de verdad, subir tambien este numero -- nunca bajarlo para
+# que pase un cambio.
+fail_under = 94

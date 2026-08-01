@@ -5,9 +5,9 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from libraauth.bootstrap import ensure_default_admin
+from libraauth.bootstrap import ensure_admin_user, ensure_default_admin
 from libraauth.models import Base
-from libraauth.repository import UserRepository
+from libraauth.repository import UserRepository, UsernameTaken
 
 
 @pytest.fixture
@@ -20,9 +20,13 @@ def repo(tmp_path):
 
 def test_create_returns_json_contract(repo):
     user = repo.create(username="staff-1", name="Empleada", password="s3cret", role="staff")
+    # `email` se sumo al contrato en v0.3.0 (aditivo). Este test compara por
+    # igualdad exacta y no por subconjunto a proposito: existe para que cualquier
+    # cambio del contrato sea una decision consciente y no un efecto colateral —
+    # y funciono, se puso rojo al agregarse email.
     assert user == {
         "id": user["id"], "username": "staff-1", "name": "Empleada",
-        "role": "staff", "active": True,
+        "email": "", "role": "staff", "active": True,
     }
     assert "password" not in user and "password_hash" not in user
 
@@ -133,3 +137,173 @@ def test_ensure_default_admin_allows_fallback_password_in_development(repo, monk
     monkeypatch.setenv("ENV", "development")
     ensure_default_admin(repo, env_prefix="ACME")
     assert repo.check_credentials("admin", "admin") is not None
+
+
+def test_create_con_username_duplicado_levanta_UsernameTaken(repo):
+    """Antes de v0.1.1 esto propagaba sqlalchemy.exc.IntegrityError, y los
+    routers de la familia —que venian de libracore y capturaban
+    sqlite3.IntegrityError— devolvian 500 en vez de 409. El motor ahora expone
+    una excepcion de dominio para que el consumidor no conozca el storage."""
+    repo.create(username="repetido", name="Primero", password="x", role="admin")
+
+    with pytest.raises(UsernameTaken) as exc:
+        repo.create(username="repetido", name="Segundo", password="y", role="admin")
+    assert "repetido" in str(exc.value)
+
+    # La sesion quedo usable despues del rollback: el repo sigue funcionando.
+    assert len(repo.list()) == 1
+    assert repo.check_credentials("repetido", "x")
+
+
+def test_username_duplicado_se_detecta_con_espacios(repo):
+    """`create` hace strip del username, asi que " repetido " choca igual."""
+    repo.create(username="conespacios", name="Primero", password="x", role="admin")
+    with pytest.raises(UsernameTaken):
+        repo.create(username="  conespacios  ", name="Segundo", password="y", role="admin")
+
+
+# ── email (agregado en v0.3.0) ───────────────────────────────────────────
+
+def test_create_acepta_email_y_lo_devuelve(repo):
+    u = repo.create(username="conmail", name="Con Mail", password="x",
+                    role="admin", email="a@example.com")
+    assert u["email"] == "a@example.com"
+    assert repo.get_by_username("conmail")["email"] == "a@example.com"
+
+
+def test_create_sin_email_queda_vacio_no_None(repo):
+    """El contrato devuelve siempre string: la SPA no tiene que lidiar con null."""
+    u = repo.create(username="sinmail", name="Sin Mail", password="x", role="admin")
+    assert u["email"] == ""
+
+
+def test_create_hace_strip_del_email(repo):
+    u = repo.create(username="espacios", name="X", password="x", role="admin",
+                    email="  b@example.com  ")
+    assert u["email"] == "b@example.com"
+
+
+def test_update_SIN_email_no_lo_borra(repo):
+    """El caso peligroso: los consumidores que ya existian llaman
+    update(id, name, role, active) sin email. Con un default "" en vez de None,
+    cada edicion de nombre o rol habria borrado el email en silencio."""
+    u = repo.create(username="preserva", name="Antes", password="x",
+                    role="admin", email="no-me-borres@example.com")
+
+    actualizado = repo.update(u["id"], name="Despues", role="admin", active=True)
+
+    assert actualizado["name"] == "Despues"
+    assert actualizado["email"] == "no-me-borres@example.com"
+    assert repo.get_by_username("preserva")["email"] == "no-me-borres@example.com"
+
+
+def test_update_con_email_lo_cambia(repo):
+    u = repo.create(username="cambia", name="X", password="x", role="admin",
+                    email="viejo@example.com")
+    actualizado = repo.update(u["id"], name="X", role="admin", active=True,
+                              email="nuevo@example.com")
+    assert actualizado["email"] == "nuevo@example.com"
+
+
+def test_update_con_email_vacio_SI_lo_borra(repo):
+    """Vaciarlo tiene que ser posible, pero explicito."""
+    u = repo.create(username="vacia", name="X", password="x", role="admin",
+                    email="algo@example.com")
+    actualizado = repo.update(u["id"], name="X", role="admin", active=True, email="")
+    assert actualizado["email"] == ""
+
+
+def test_list_y_get_incluyen_email(repo):
+    repo.create(username="enlista", name="X", password="x", role="admin",
+                email="lista@example.com")
+    assert all("email" in u for u in repo.list())
+    uid = repo.get_by_username("enlista")["id"]
+    assert repo.get_by_id(uid)["email"] == "lista@example.com"
+
+
+def test_email_no_afecta_la_autenticacion(repo):
+    """Se agrega un campo, no se cambia como se valida."""
+    repo.create(username="auth", name="X", password="clave-real", role="admin",
+                email="auth@example.com")
+    assert repo.check_credentials("auth", "clave-real")
+    assert not repo.check_credentials("auth", "otra")
+
+
+def test_el_contrato_viejo_sigue_intacto(repo):
+    """Las 5 claves que ya devolvia siguen estando y con los mismos tipos: el
+    agregado es aditivo para los otros 4 consumidores."""
+    u = repo.create(username="contrato", name="X", password="x", role="admin")
+    assert set(u) == {"id", "username", "name", "email", "role", "active"}
+    assert isinstance(u["id"], str)
+    assert isinstance(u["active"], bool)
+
+
+# ── ensure_admin_user (variante server-rendered, portada en v0.4.0) ───────
+
+def test_ensure_admin_user_crea_el_admin_con_las_env_vars(repo, monkeypatch, capsys):
+    """Env vars SIN prefijo de producto, a diferencia de ensure_default_admin."""
+    monkeypatch.setenv("ADMIN_USER", "jefe")
+    monkeypatch.setenv("ADMIN_PASSWORD", "clave-elegida")
+    monkeypatch.setenv("ADMIN_NOMBRE", "La Jefa")
+
+    ensure_admin_user(repo)
+
+    u = repo.get_by_username("jefe")
+    assert u is not None and u["role"] == "admin" and u["name"] == "La Jefa"
+    assert repo.check_credentials("jefe", "clave-elegida")
+    assert "creado" in capsys.readouterr().out
+
+
+def test_ensure_admin_user_usa_los_defaults(repo, monkeypatch):
+    for k in ("ADMIN_USER", "ADMIN_NOMBRE"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("ADMIN_PASSWORD", "x")
+    ensure_admin_user(repo)
+    u = repo.get_by_username("admin")
+    assert u is not None and u["name"] == "Administrador"
+
+
+def test_ensure_admin_user_no_hace_nada_si_ya_hay_usuarios(repo, monkeypatch):
+    """Idempotente: no pisa al admin real ni le cambia la contrasena."""
+    repo.create(username="existente", name="Ya Estaba", password="su-clave", role="admin")
+    monkeypatch.setenv("ADMIN_USER", "jefe")
+    monkeypatch.setenv("ADMIN_PASSWORD", "otra-clave")
+
+    ensure_admin_user(repo)
+
+    assert repo.get_by_username("jefe") is None
+    assert len(repo.list()) == 1
+    assert repo.check_credentials("existente", "su-clave")
+
+
+def test_ensure_admin_user_SIN_password_genera_una_y_la_imprime(repo, monkeypatch, capsys):
+    """LA diferencia con ensure_default_admin: no es fail-closed, arranca igual.
+
+    Se preserva a proposito (es el comportamiento de Contalibra/Restolibra),
+    pero deja la contrasena inicial en los logs del contenedor."""
+    monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    monkeypatch.setenv("ADMIN_USER", "admin")
+    monkeypatch.setenv("ENV", "production")   # ni siquiera en produccion falla
+
+    ensure_admin_user(repo)
+
+    salida = capsys.readouterr().out
+    assert "WARN" in salida and "generada" in salida
+    generada = salida.split("generada:")[1].split("\n")[0].strip()
+    assert len(generada) >= 12
+    assert repo.check_credentials("admin", generada)
+
+
+def test_las_dos_variantes_difieren_justo_donde_importa(repo, monkeypatch):
+    """ensure_default_admin es fail-closed sin password; ensure_admin_user no.
+    Por eso NO son intercambiables al migrar un producto."""
+    monkeypatch.setenv("ENV", "production")
+    monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    monkeypatch.delenv("RESTOLIBRA_ADMIN_PASSWORD", raising=False)
+
+    with pytest.raises(RuntimeError, match="ADMIN_PASSWORD"):
+        ensure_default_admin(repo, env_prefix="RESTOLIBRA")
+
+    assert repo.list() == []
+    ensure_admin_user(repo)          # esta no levanta: arranca igual
+    assert len(repo.list()) == 1

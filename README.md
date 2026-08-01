@@ -52,6 +52,65 @@ app.state.session_auth = session_auth
 app.include_router(build_json_api_auth_router())
 ```
 
+## Recuperacion de contrasena por correo (v0.5.0)
+
+Opt-in: son dos endpoints mas en el router y un servicio propio, y **no se
+prenden solos** porque necesitan SMTP y una pantalla del producto donde
+aterrice el link.
+
+```python
+from libraauth.password_reset import PasswordResetService
+
+app.state.password_reset = PasswordResetService(
+    session_factory,                      # el mismo del UserRepository
+    product_name="Gestiolibra",           # sale en el asunto y el cuerpo
+    reset_url_base="https://dev.gestiolibra.com.ar/reset-password",
+    ttl_minutes=60,                       # default
+)
+app.include_router(build_json_api_auth_router(incluir_password_reset=True))
+```
+
+SMTP **propio del motor**, por variables de entorno (no reusa el de
+LibraCore: libraauth existe para que un producto que no factura no tenga que
+arrastrarlo):
+
+```
+LIBRAAUTH_SMTP_HOST=smtp.empresa.com
+LIBRAAUTH_SMTP_PORT=587              # default
+LIBRAAUTH_SMTP_USER=cuenta           # opcional (relays internos sin auth)
+LIBRAAUTH_SMTP_PASSWORD=...
+LIBRAAUTH_SMTP_FROM_EMAIL=...        # si falta, usa LIBRAAUTH_SMTP_USER
+LIBRAAUTH_SMTP_FROM_NAME=Soporte     # opcional
+```
+
+Sin SMTP configurado la app **levanta igual**; el que avisa es el endpoint,
+con un `503`, recien cuando alguien pide un reset.
+
+Endpoints:
+
+| Endpoint | Que hace |
+|---|---|
+| `POST /auth/forgot-password` `{identificador}` | Acepta username **o** email. Responde **siempre** `{"ok": true}` |
+| `POST /auth/reset-password` `{token, new_password}` | Cambia la contrasena. `400` si el enlace no sirve, `422` si la contrasena es corta |
+
+Lo que hay que saber antes de tocarlo:
+
+- **`forgot-password` responde igual exista o no el usuario.** Es a proposito:
+  es publico y sin sesion, y una respuesta distinta lo convertiria en un
+  buscador de usuarios y correos dados de alta. Hay un test que lo fija
+  comparando status y cuerpo de los dos casos.
+- **De la base no sale ningun token usable**: se guarda solo su `sha256`.
+- **Un solo uso y con vencimiento** (60 min por defecto), y un reset exitoso
+  quema tambien los demas tokens pendientes de ese usuario.
+- **`reset-password` no crea sesion**: quien cambio la contrasena entra con
+  ella, lo que ademas confirma que quedo bien.
+- El reloj se inyecta (`now=`) para poder probar el vencimiento sin depender
+  de la hora real.
+
+Queda **afuera a proposito**: limitar la cantidad de pedidos por usuario/IP
+(rate limiting). Hoy nada impide pedir muchos mails seguidos para la misma
+cuenta; si se vuelve un problema, el lugar natural es el proxy, no el motor.
+
 ## Desarrollo
 
 ```
