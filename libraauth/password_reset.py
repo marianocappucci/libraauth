@@ -72,7 +72,7 @@ class PasswordResetService:
         product_name: str,
         reset_url_base: str,
         ttl_minutes: int = 60,
-        smtp_config: SmtpConfig | None = None,
+        smtp_config: "SmtpConfig | Callable[[], SmtpConfig] | None" = None,
         send_email: Callable[..., None] | None = None,
         min_password_length: int = 6,
         now: Callable[[], datetime] = _utcnow,
@@ -81,10 +81,27 @@ class PasswordResetService:
         self.product_name = product_name
         self.reset_url_base = reset_url_base.rstrip("?&")
         self.ttl_minutes = ttl_minutes
-        self.smtp_config = smtp_config if smtp_config is not None else SmtpConfig.from_env()
+        # Se guarda la FUENTE, no el valor. Ver `smtp_config` mas abajo.
+        self._smtp_config_source = (
+            smtp_config if smtp_config is not None else SmtpConfig.from_env
+        )
         self._send_email = send_email
         self.min_password_length = min_password_length
         self._now = now
+
+    @property
+    def smtp_config(self) -> SmtpConfig:
+        """Se resuelve **en cada uso**, no una vez al construir el servicio.
+
+        Es lo que hace util a la config editable por backoffice (v0.6.0): si
+        se resolviera al arrancar, guardar el SMTP por pantalla no tendria
+        efecto hasta recrear el contenedor — el mismo problema que se venia a
+        resolver. Sigue aceptando un `SmtpConfig` fijo (lo que hacian los
+        consumidores hasta la v0.5.0) y ahora tambien un callable que lo
+        devuelva, como `lambda: resolver_smtp_config(session_factory)`.
+        """
+        fuente = self._smtp_config_source
+        return fuente() if callable(fuente) else fuente
 
     # ── Paso 1: pedir el reset ──────────────────────────────────────────────
 
@@ -101,10 +118,15 @@ class PasswordResetService:
         cuerpo: si no, quien comparte casilla no sabria cual cuenta esta
         recuperando.
         """
-        if not self.smtp_config.configurado:
+        # Se resuelve UNA vez por pedido y se pasa hacia abajo: con la config
+        # en base, leerla de nuevo por cada destinatario serian N consultas
+        # para un valor que no puede cambiar en el medio.
+        smtp = self.smtp_config
+        if not smtp.configurado:
             raise EmailNotConfigured(
                 "Falta configurar el SMTP del motor de auth "
-                "(LIBRAAUTH_SMTP_HOST y LIBRAAUTH_SMTP_FROM_EMAIL)."
+                "(por backoffice, o LIBRAAUTH_SMTP_HOST y "
+                "LIBRAAUTH_SMTP_FROM_EMAIL en el entorno)."
             )
 
         ident = (identificador or "").strip()
@@ -143,10 +165,12 @@ class PasswordResetService:
             session.commit()
 
         for email, username, nombre, token in destinatarios:
-            self._enviar(email=email, username=username, nombre=nombre, token=token)
+            self._enviar(smtp, email=email, username=username, nombre=nombre, token=token)
         return len(destinatarios)
 
-    def _enviar(self, *, email: str, username: str, nombre: str, token: str) -> None:
+    def _enviar(
+        self, smtp: SmtpConfig, *, email: str, username: str, nombre: str, token: str
+    ) -> None:
         link = f"{self.reset_url_base}?token={token}"
         asunto = f"Recuperar la contraseña de {self.product_name}"
         cuerpo = (
@@ -162,7 +186,7 @@ class PasswordResetService:
         if self._send_email is not None:
             self._send_email(to_email=email, asunto=asunto, cuerpo=cuerpo)
         else:
-            enviar_email(self.smtp_config, to_email=email, asunto=asunto, cuerpo=cuerpo)
+            enviar_email(smtp, to_email=email, asunto=asunto, cuerpo=cuerpo)
 
     # ── Paso 2: usar el token ───────────────────────────────────────────────
 

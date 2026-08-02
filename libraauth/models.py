@@ -8,7 +8,7 @@ propias tablas.
 """
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -59,3 +59,42 @@ class PasswordResetToken(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     # Sello de un solo uso. `None` = todavia no se uso.
     used_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class SmtpSettings(Base):
+    """Configuracion SMTP de la instancia, editable por backoffice (v0.6.0).
+
+    **Una sola fila**, con `id` fijo en 1 (ver `FILA_UNICA` en
+    `smtp_settings.py`). No es una tabla clave/valor generica a proposito:
+    son seis campos con tipo y semantica propia, y una tabla de pares los
+    volveria strings sueltos sin validacion.
+
+    **`password_cifrada` NO guarda la contrasena en claro** — guarda el blob
+    de `crypto.cifrar()`, cuya clave vive en el entorno de la instancia. El
+    nombre de la columna lo dice a proposito: quien abra un backup con un
+    visor de SQLite tiene que ver de inmediato que ese valor no sirve tal
+    cual. Ver `crypto.py` para por que este cifrado es la mitigacion que la
+    decision de guardar el SMTP en base vuelve necesaria.
+
+    Vive en el mismo `Base` que `Usuario` por la misma razon que
+    `PasswordResetToken`: los consumidores corren
+    `Base.metadata.create_all(engine)` una sola vez, contra el engine donde
+    esta `usuarios`. Esta tabla no declara FK, asi que **podria** vivir en
+    otra base — pero separarla obligaria al producto a manejar dos engines
+    para este motor sin ninguna ganancia que lo justifique.
+    """
+
+    __tablename__ = "smtp_settings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    host: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    port: Mapped[int] = mapped_column(Integer, nullable=False, default=587)
+    user: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    # Texto y no String(n): el blob crece con el largo de la contrasena y no
+    # hay motivo para ponerle un techo arbitrario.
+    password_cifrada: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    from_email: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    from_name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )

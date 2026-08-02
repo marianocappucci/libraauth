@@ -28,6 +28,14 @@ class SmtpConfig:
     password: str = ""
     from_email: str = ""
     from_name: str = ""
+    # Solo lo pone `smtp_settings.SmtpSettingsRepository`, cuando hay una
+    # contrasena guardada que NO se puede descifrar con la clave actual
+    # (tipicamente, porque se roto el SECRET_KEY de la instancia). Se
+    # arrastra hasta aca en vez de resolverse alla para que `configurado`
+    # pueda dar False: si no, la config pareceria completa y el fallo
+    # aparecia recien como un error de login contra el servidor SMTP, mucho
+    # mas lejos de la causa. Ver `crypto.SecretoIndescifrable`.
+    password_indescifrable: bool = False
 
     @classmethod
     def from_env(cls) -> "SmtpConfig":
@@ -45,7 +53,14 @@ class SmtpConfig:
 
     @property
     def configurado(self) -> bool:
-        """Minimo indispensable para poder mandar: servidor y remitente."""
+        """Minimo indispensable para poder mandar: servidor y remitente.
+
+        Una contrasena guardada que no se puede descifrar cuenta como **no
+        configurado**: mandar el mail fallaria igual, pero mucho mas tarde y
+        con un error del servidor SMTP que no dice nada de la causa real.
+        """
+        if self.password_indescifrable:
+            return False
         return bool(self.host and self.from_email)
 
 
