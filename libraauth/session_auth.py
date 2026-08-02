@@ -223,6 +223,67 @@ json_api_require_admin = json_api_require_role("admin")
 json_api_require_staff = json_api_require_role("admin", "staff")
 
 
+# ── Token de servicio (v0.7.0) ───────────────────────────────────────────────
+#
+# **Por que existe.** El backoffice de la suite (`admin.<producto>.com.ar`)
+# administra VARIAS instancias del mismo producto y necesita leer y escribir la
+# config de cada una. No es un usuario de ninguna: no tiene fila en la tabla
+# `usuarios` de ningun cliente, asi que `json_api_require_admin` lo rechaza
+# siempre. La alternativa —que el backoffice abriera la base de cada instancia—
+# no funciona: la contrasena SMTP se cifra con una clave derivada del
+# `SECRET_KEY` de la instancia, y un solo proceso no puede tener N secretos en
+# su entorno. Hablando por HTTP, cada instancia sigue cifrando con su propia
+# clave en su propio proceso.
+#
+# **Por que es seguro adoptarlo.** Es opt-in por ausencia: si la instancia no
+# define `LIBRA_SERVICE_TOKEN`, esta funcion devuelve False sin mirar el header
+# y el flujo cae exactamente en el de siempre. Una instancia que actualiza a
+# v0.7.0 y no toca su compose no cambia de comportamiento en nada.
+#
+# El patron ya existe en la familia: `libracore.admin.app` usa este mismo header
+# con `DOCS_AUTH_SECRET` para el login de `/docs/` de las landings.
+SERVICE_TOKEN_HEADER = "x-internal-auth"
+SERVICE_TOKEN_ENV = "LIBRA_SERVICE_TOKEN"
+
+# Identidad que se le atribuye a una request autenticada por token. No es un
+# usuario real y no tiene `id`: si algun dia un endpoint audita quien hizo un
+# cambio, tiene que poder distinguir "lo hizo el proveedor desde el backoffice"
+# de "lo hizo un admin del cliente".
+SERVICE_USER = {
+    "id": None,
+    "username": "@servicio",
+    "name": "Backoffice de la suite",
+    "role": "admin",
+    "active": True,
+    "es_servicio": True,
+}
+
+
+def token_de_servicio_valido(request: Request) -> bool:
+    esperado = os.environ.get(SERVICE_TOKEN_ENV, "")
+    if not esperado:
+        return False
+    recibido = request.headers.get(SERVICE_TOKEN_HEADER, "")
+    # `compare_digest` y no `==`: comparar tokens con el operador normal filtra
+    # su largo y su prefijo por el tiempo que tarda en devolver False.
+    return bool(recibido) and hmac.compare_digest(recibido, esperado)
+
+
+def json_api_require_admin_o_servicio(request: Request) -> dict:
+    """Rol admin del producto **o** token de servicio valido.
+
+    El token se chequea primero y a proposito: una request del backoffice no
+    trae cookie de sesion, asi que evaluar la sesion antes daria 401 y no
+    llegaria nunca a mirar el header.
+    """
+    if token_de_servicio_valido(request):
+        return dict(SERVICE_USER)
+    usuario = json_api_get_current_user(request, request.app.state.session_auth)
+    if usuario["role"] != "admin":
+        raise HTTPException(403, "forbidden")
+    return usuario
+
+
 def build_json_api_auth_router(
     *, incluir_verify: bool = False, incluir_password_reset: bool = False
 ) -> APIRouter:
@@ -350,14 +411,14 @@ def build_smtp_settings_router(*, prefix: str = "/admin/smtp") -> APIRouter:
     router = APIRouter(prefix=prefix, tags=["smtp"])
 
     @router.get("", response_model=_SmtpSettingsOut)
-    def leer(request: Request, _: dict = Depends(json_api_require_admin)):
+    def leer(request: Request, _: dict = Depends(json_api_require_admin_o_servicio)):
         return request.app.state.smtp_settings.estado()
 
     @router.put("", response_model=_SmtpSettingsOut)
     def guardar(
         data: _SmtpSettingsIn,
         request: Request,
-        _: dict = Depends(json_api_require_admin),
+        _: dict = Depends(json_api_require_admin_o_servicio),
     ):
         repo = request.app.state.smtp_settings
         # Omitir `password` = dejarla como esta. Mandarla en `null` o vacia =
@@ -383,7 +444,7 @@ def build_smtp_settings_router(*, prefix: str = "/admin/smtp") -> APIRouter:
         return repo.estado()
 
     @router.delete("", response_model=_SmtpSettingsOut)
-    def borrar(request: Request, _: dict = Depends(json_api_require_admin)):
+    def borrar(request: Request, _: dict = Depends(json_api_require_admin_o_servicio)):
         """Vuelve la instancia a leer el SMTP del entorno, que es como
         funcionaban todas antes de la v0.6.0."""
         repo = request.app.state.smtp_settings
