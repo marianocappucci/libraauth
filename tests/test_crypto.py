@@ -113,11 +113,47 @@ def test_base64_invalido_se_rechaza():
 
 def test_sin_ningun_secreto_en_el_entorno_falla_al_cifrar(monkeypatch):
     """Fail-closed: antes que guardar en claro "porque no habia clave",
-    lanza."""
+    lanza. Con `ENV` sin declarar el default es `production`."""
     monkeypatch.delenv("SECRET_KEY", raising=False)
     monkeypatch.delenv("LIBRAAUTH_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("ENV", raising=False)
     with pytest.raises(ClaveDeCifradoAusente):
         cifrar("algo")
+
+
+def test_en_desarrollo_sin_secret_key_hay_fallback(monkeypatch):
+    """Misma convencion que `session_auth._resolve_secret_key`.
+
+    Sin esto, cualquier entorno local o suite que no exporte `SECRET_KEY`
+    —que es el caso de los 6 productos, que corren con `ENV=development`—
+    recibe un 500 al guardar la config SMTP. Se encontro adoptando la v0.6.0
+    en Gestiolibra.
+    """
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    monkeypatch.delenv("LIBRAAUTH_ENCRYPTION_KEY", raising=False)
+    monkeypatch.setenv("ENV", "development")
+
+    assert descifrar(cifrar("clave-de-dev")) == "clave-de-dev"
+
+
+def test_el_fallback_de_dev_no_aplica_en_produccion(monkeypatch):
+    """El control del test de arriba: `ENV=production` sigue fallando."""
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    monkeypatch.delenv("LIBRAAUTH_ENCRYPTION_KEY", raising=False)
+    monkeypatch.setenv("ENV", "production")
+    with pytest.raises(ClaveDeCifradoAusente):
+        cifrar("algo")
+
+
+def test_el_secret_key_real_le_gana_al_fallback_de_dev(monkeypatch):
+    """Una instancia de dev CON secreto propio usa el suyo, no el generico —
+    si no, lo cifrado en dev seria descifrable por cualquiera que conozca la
+    constante."""
+    monkeypatch.setenv("ENV", "development")
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    con_fallback = clave_de_cifrado()
+    monkeypatch.setenv("SECRET_KEY", "propio" * 10)
+    assert clave_de_cifrado() != con_fallback
 
 
 def test_sin_secreto_pero_sin_nada_que_cifrar_no_falla(monkeypatch):

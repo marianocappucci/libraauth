@@ -69,14 +69,32 @@ class SecretoIndescifrable(Exception):
     """
 
 
+# Fallback SOLO para ENV=development, misma convencion que
+# `session_auth._resolve_secret_key`. Ver `_material_de_clave`.
+_DEV_FALLBACK = "libraauth-dev-encryption-key-no-usar-en-produccion"
+
+
 def _material_de_clave() -> bytes:
-    """El secreto crudo del entorno, sin derivar todavia."""
+    """El secreto crudo del entorno, sin derivar todavia.
+
+    **Por que hay un fallback de desarrollo y por que no debilita nada.** Sin
+    el, cualquier entorno local o suite de tests que no exporte `SECRET_KEY`
+    —que es el caso de los 6 productos de la familia, que corren con
+    `ENV=development`— recibia un 500 al guardar la config SMTP. Y no se puede
+    colar en produccion: `session_auth._resolve_secret_key` **no deja levantar
+    la app** sin `SECRET_KEY` salvo con `ENV=development`, asi que una
+    instancia productiva que llegue aca ya tiene un secreto propio. Si alguien
+    pusiera `ENV=development` en produccion, el problema grave seria que las
+    cookies de sesion se pueden falsificar, no esta clave.
+    """
     explicita = os.environ.get("LIBRAAUTH_ENCRYPTION_KEY", "")
     if explicita:
         return explicita.encode()
     secret = os.environ.get("SECRET_KEY", "")
     if secret:
         return secret.encode()
+    if os.environ.get("ENV", "production") == "development":
+        return _DEV_FALLBACK.encode()
     raise ClaveDeCifradoAusente(
         "No hay con que cifrar: falta LIBRAAUTH_ENCRYPTION_KEY o SECRET_KEY "
         "en el entorno de la instancia."
