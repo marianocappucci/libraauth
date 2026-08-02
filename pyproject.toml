@@ -17,6 +17,12 @@ dependencies = [
     "fastapi>=0.111.0",
     "sqlalchemy>=2.0",
     "itsdangerous>=2.2.0",
+    # Cifrado en reposo de la contrasena SMTP guardada en la base del cliente
+    # (v0.6.0, ver libraauth/crypto.py). NO suma peso real al ecosistema:
+    # libracore ya la declara y los 6 productos la tienen instalada. La stdlib
+    # no alcanza (no trae AES) e `itsdangerous`, que si es dependencia, FIRMA
+    # pero no cifra: su payload se lee en base64 sin ninguna clave.
+    "cryptography>=42.0.0",
 ]
 
 [project.optional-dependencies]

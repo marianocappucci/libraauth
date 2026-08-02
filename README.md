@@ -111,6 +111,69 @@ Queda **afuera a proposito**: limitar la cantidad de pedidos por usuario/IP
 (rate limiting). Hoy nada impide pedir muchos mails seguidos para la misma
 cuenta; si se vuelve un problema, el lugar natural es el proxy, no el motor.
 
+## Config SMTP por backoffice, cifrada en reposo (v0.6.0)
+
+Hasta la v0.5.0 el SMTP salia **solo** del entorno, asi que cambiarle el
+remitente a una instancia obligaba a editar su compose en el VPS y recrear el
+contenedor. Desde la v0.6.0 se puede guardar en la base y editar por pantalla.
+
+**Adoptarla no cambia nada por si sola.** Sin fila guardada, la config se
+sigue leyendo del entorno exactamente igual que antes.
+
+```python
+from libraauth.models import Base
+from libraauth.session_auth import build_smtp_settings_router
+from libraauth.smtp_settings import SmtpSettingsRepository, resolver_smtp_config
+
+Base.metadata.create_all(engine)          # crea tambien `smtp_settings`
+
+app.state.smtp_settings = SmtpSettingsRepository(session_factory)
+app.include_router(build_smtp_settings_router())        # prefijo configurable
+
+app.state.password_reset = PasswordResetService(
+    session_factory,
+    product_name="Gestiolibra",
+    reset_url_base="...",
+    # CALLABLE, no un valor: se resuelve en cada envio. Si se resolviera al
+    # arrancar, guardar el SMTP por pantalla no tendria efecto hasta recrear
+    # el contenedor — o sea, el problema que esta version viene a resolver.
+    smtp_config=lambda: resolver_smtp_config(session_factory),
+)
+```
+
+| Endpoint | Que hace |
+|---|---|
+| `GET /admin/smtp` | Estado actual. **Nunca devuelve la contrasena**, solo `password_definida` |
+| `PUT /admin/smtp` | Guarda. Omitir `password` la conserva; mandarla en `null` o vacia la borra |
+| `DELETE /admin/smtp` | Borra la config y vuelve a leer del entorno |
+
+Los tres exigen **rol admin**: quien pueda escribir aca puede redirigir a
+donde salen los enlaces de recuperacion de contrasena de todos los usuarios.
+
+### La contrasena se guarda cifrada
+
+Es la mitigacion que vuelve aceptable tener la credencial en la base del
+cliente: sin cifrar, el backup de esa instancia alcanzaria para mandar correo
+en su nombre.
+
+- **AES-GCM**, con la clave **derivada por HKDF** del `SECRET_KEY` que la
+  instancia ya tiene. Derivada y no reusada: la clave que cifra es distinta de
+  la que firma la cookie de sesion.
+- Se deriva del `SECRET_KEY` en vez de pedir una variable nueva **a
+  proposito** — las instancias ya lo tienen, mientras que una variable nueva
+  habria que agregarla a cada compose del VPS antes de que nada funcionara.
+  `LIBRAAUTH_ENCRYPTION_KEY` tiene prioridad si se quiere separar.
+- **Fail-closed**: sin ningun secreto en el entorno, guardar **falla** en vez
+  de persistir la contrasena en claro.
+- **Rotar el `SECRET_KEY`** deja lo guardado sin poder descifrarse. No
+  revienta: la config queda marcada `password_indescifrable` y `configurado`
+  da `False`, asi que el endpoint publico responde `503` ("no configurado",
+  que es la verdad) en vez de un 500 al intentar el login SMTP. Se vuelve a
+  cargar por pantalla.
+
+Lo que **no** hace: no hay un endpoint de "mandar un mail de prueba". Hoy la
+unica forma de comprobar que la config anda es pedir un reset de verdad.
+
 ## Desarrollo
 
 ```

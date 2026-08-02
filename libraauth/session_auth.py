@@ -18,7 +18,9 @@ from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.exceptions import HTTPException
 
+from .crypto import ClaveDeCifradoAusente
 from .password_reset import EmailNotConfigured, InvalidResetToken
+from .smtp_settings import SIN_CAMBIOS
 
 
 def _resolve_secret_key(dev_fallback: str, missing_error: str) -> str:
@@ -152,6 +154,38 @@ class _ForgotPasswordRequest(BaseModel):
 class _ResetPasswordRequest(BaseModel):
     token: str
     new_password: str
+
+
+# Solo para el router de configuracion SMTP (opt-in, ver
+# build_smtp_settings_router).
+class _SmtpSettingsOut(BaseModel):
+    """Lo que se le muestra a un admin. **No incluye la contrasena**, ni
+    siquiera enmascarada con su largo real — eso ya diria cuantos caracteres
+    tiene. Solo si hay una cargada."""
+
+    origen: str          # "base" | "entorno"
+    host: str
+    port: int
+    user: str
+    from_email: str
+    from_name: str
+    password_definida: bool
+    password_indescifrable: bool
+    configurado: bool
+
+
+class _SmtpSettingsIn(BaseModel):
+    host: str
+    port: int = 587
+    user: str = ""
+    # `None` explicito borra la contrasena; **omitir el campo** la deja como
+    # esta. Son dos intenciones distintas y las dos son legitimas: editar el
+    # remitente no tiene por que obligar a tipear la contrasena de nuevo, que
+    # es justo lo que lleva a que alguien la anote en un papel para poder
+    # repetirla. Se distinguen con `model_fields_set`, no por el valor.
+    password: str | None = None
+    from_email: str = ""
+    from_name: str = ""
 
 
 def json_api_get_session_auth(request: Request) -> "SessionAuth":
@@ -290,5 +324,70 @@ def build_json_api_auth_router(
             # bien.
             users = request.app.state.users
             return users.get_by_id(resultado["id"])
+
+    return router
+
+
+def build_smtp_settings_router(*, prefix: str = "/admin/smtp") -> APIRouter:
+    """Router de configuracion SMTP por backoffice (v0.6.0).
+
+    Espera `request.app.state.smtp_settings` con un
+    `SmtpSettingsRepository`. **Es opt-in y va aparte del router de `/auth`**
+    por dos razones: es de administracion y no de autenticacion, y montarlo
+    sin el repositorio configurado publicaria endpoints que fallan — el mismo
+    criterio que `incluir_password_reset`.
+
+    **Todo exige rol admin.** Un endpoint que devuelve el servidor y la
+    cuenta de correo de la instancia no es informacion publica, y el `PUT`
+    permite redirigir a donde salen los mails de recuperacion de contrasena
+    de todos los usuarios: quien pueda escribir aca puede hacerse mandar los
+    enlaces de reset ajenos.
+
+    `prefix` es configurable porque los consumidores no montan sus APIs
+    igual: los 4 FastAPI cuelgan de `/api`, y Contalibra/Restolibra tienen su
+    propio arbol.
+    """
+    router = APIRouter(prefix=prefix, tags=["smtp"])
+
+    @router.get("", response_model=_SmtpSettingsOut)
+    def leer(request: Request, _: dict = Depends(json_api_require_admin)):
+        return request.app.state.smtp_settings.estado()
+
+    @router.put("", response_model=_SmtpSettingsOut)
+    def guardar(
+        data: _SmtpSettingsIn,
+        request: Request,
+        _: dict = Depends(json_api_require_admin),
+    ):
+        repo = request.app.state.smtp_settings
+        # Omitir `password` = dejarla como esta. Mandarla en `null` o vacia =
+        # borrarla. Ver el comentario en `_SmtpSettingsIn`.
+        if "password" in data.model_fields_set:
+            password = data.password if data.password is not None else ""
+        else:
+            password = SIN_CAMBIOS
+        try:
+            repo.save(
+                host=data.host, port=data.port, user=data.user,
+                password=password,
+                from_email=data.from_email, from_name=data.from_name,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+        except ClaveDeCifradoAusente as exc:
+            # 500 y no 422: no es un error del que manda el formulario, es
+            # que a la instancia le falta el secreto del entorno. Y **no se
+            # guarda nada** — antes que persistir la contrasena en claro,
+            # falla.
+            raise HTTPException(500, str(exc))
+        return repo.estado()
+
+    @router.delete("", response_model=_SmtpSettingsOut)
+    def borrar(request: Request, _: dict = Depends(json_api_require_admin)):
+        """Vuelve la instancia a leer el SMTP del entorno, que es como
+        funcionaban todas antes de la v0.6.0."""
+        repo = request.app.state.smtp_settings
+        repo.delete()
+        return repo.estado()
 
     return router
