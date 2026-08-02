@@ -87,6 +87,14 @@ class SmtpSettingsRepository:
         `password_definida` dice si hay algo guardado; el valor no se
         devuelve nunca, ni enmascarado con su largo real (eso ya seria filtrar
         cuantos caracteres tiene).
+
+        **Esta es la superficie que importa, no el router.** Contalibra y
+        Restolibra no montan `build_smtp_settings_router()` —escriben sus
+        propios endpoints bajo `/api`, igual que hicieron con la recuperacion
+        de contrasena— y serializan este dict tal cual, sin ningun
+        `response_model` que filtre claves de mas. Agregar la contrasena aca
+        la publicaria en esos dos productos aunque el router del motor la
+        siga ocultando.
         """
         cfg = self.get()
         if cfg is None:

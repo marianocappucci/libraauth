@@ -84,6 +84,26 @@ def test_la_columna_se_llama_password_cifrada(session_factory):
     assert "password" not in SmtpSettings.__table__.columns
 
 
+def test_estado_no_incluye_la_contrasena(repo):
+    """`estado()` es la superficie publica de verdad, no el router.
+
+    Contalibra y Restolibra **no montan el router de este motor** — escriben
+    sus propios endpoints bajo `/api` y serializan lo que este metodo
+    devuelva, sin `response_model` que filtre nada. Este test existe porque
+    una mutacion lo demostro: filtrar la contrasena en `estado()` no ponia
+    roja la suite, porque el unico test que lo cubria pasaba por el router y
+    ahi el `response_model` la descartaba. O sea que se estaba probando
+    Pydantic, no el codigo propio.
+    """
+    repo.save(host="smtp.test", user="cuenta", password="hunter2",
+              from_email="a@b.com")
+    estado = repo.estado()
+
+    assert "password" not in estado
+    assert "hunter2" not in str(estado)
+    assert estado["password_definida"] is True
+
+
 def test_no_hay_dos_filas_por_mas_que_se_guarde_muchas_veces(repo, session_factory):
     repo.save(host="uno.test", from_email="a@b.com")
     repo.save(host="dos.test", from_email="a@b.com")
