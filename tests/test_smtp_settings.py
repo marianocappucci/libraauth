@@ -240,6 +240,43 @@ def test_password_reset_relee_la_config_en_cada_pedido(session_factory):
     assert servicio.smtp_config.host == "smtp.test"
 
 
+def test_smtp_config_sigue_siendo_asignable(session_factory):
+    """Hasta la v0.5.0 `smtp_config` era un atributo comun. Convertirlo en
+    property de solo lectura rompio a quien lo sobreescribia en runtime —
+    `monkeypatch.setattr(servicio, "smtp_config", ...)` con
+    `AttributeError: property has no setter`. Paso de verdad en las suites de
+    Contalibra y Restolibra al adoptar la v0.6.0, los dos productos con
+    clientes facturando. Este test fija el setter para que no vuelva.
+    """
+    from libraauth.email_sender import SmtpConfig
+    from libraauth.password_reset import PasswordResetService
+
+    servicio = PasswordResetService(
+        session_factory, product_name="Test",
+        reset_url_base="https://test/reset",
+        smtp_config=lambda: resolver_smtp_config(session_factory),
+    )
+    fija = SmtpConfig(host="inyectada.test", from_email="a@b.com")
+    servicio.smtp_config = fija          # <- esto es lo que rompia
+
+    assert servicio.smtp_config is fija
+    # Y se puede volver a un callable.
+    servicio.smtp_config = lambda: SmtpConfig(host="otra.test", from_email="a@b.com")
+    assert servicio.smtp_config.host == "otra.test"
+
+
+def test_smtp_config_se_puede_monkeypatchear(session_factory, monkeypatch):
+    """El caso exacto que rompio, con la herramienta que lo rompio."""
+    from libraauth.email_sender import SmtpConfig
+    from libraauth.password_reset import PasswordResetService
+
+    servicio = PasswordResetService(
+        session_factory, product_name="Test", reset_url_base="https://test/reset")
+    monkeypatch.setattr(servicio, "smtp_config",
+                        SmtpConfig(host="smtp.suite.test", from_email="noreply@suite.test"))
+    assert servicio.smtp_config.configurado is True
+
+
 def test_password_reset_sigue_aceptando_una_config_fija(session_factory):
     """Compatibilidad con lo que hacian los consumidores hasta la v0.5.0."""
     from libraauth.email_sender import SmtpConfig

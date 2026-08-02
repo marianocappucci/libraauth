@@ -103,6 +103,24 @@ class PasswordResetService:
         fuente = self._smtp_config_source
         return fuente() if callable(fuente) else fuente
 
+    @smtp_config.setter
+    def smtp_config(self, valor) -> None:
+        """Sigue siendo **asignable**, como cuando era un atributo comun.
+
+        No es un detalle de comodidad: hasta la v0.5.0 esto era un atributo, y
+        convertirlo en una property de solo lectura rompio a los consumidores
+        que lo sobreescribian en runtime — `monkeypatch.setattr(servicio,
+        "smtp_config", ...)` falla con `AttributeError: property has no
+        setter`. Paso de verdad en las suites de Contalibra y Restolibra al
+        adoptar la v0.6.0, o sea en los dos productos con clientes facturando,
+        y **no lo detecto el barrido previo** porque buscaba asignaciones
+        directas (`x.smtp_config = ...`) y no `setattr`.
+
+        Acepta lo mismo que el constructor: un `SmtpConfig` fijo o un callable
+        que lo devuelva.
+        """
+        self._smtp_config_source = valor
+
     # ── Paso 1: pedir el reset ──────────────────────────────────────────────
 
     def request_reset(self, identificador: str) -> int:
