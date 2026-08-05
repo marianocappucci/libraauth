@@ -52,6 +52,43 @@ app.state.session_auth = session_auth
 app.include_router(build_json_api_auth_router())
 ```
 
+## Log de accesos (v0.8.0)
+
+Quien entro, cuando, desde donde, y quien lo intento sin lograrlo. **Opt-in por
+ausencia**: alcanza con setear `app.state.auth_events` y el router empieza a
+anotar `login`, `logout` y `login_fallido`. Un consumidor que actualice el
+motor y no lo setee no cambia de comportamiento en nada.
+
+```python
+from libraauth.auth_events import AuthEventRepository
+
+app.state.auth_events = AuthEventRepository(session_factory)  # el mismo de siempre
+```
+
+La tabla es **`auth_log`**, con las mismas columnas que la que ya crea
+`libracore.db.schema` en Contalibra y Restolibra — no es una tabla nueva para
+esos dos, es la que ya tienen. La crea `AuthBase.metadata.create_all(engine)`
+junto al resto.
+
+Para leerlo desde el producto (una pantalla de logs, admin-only):
+
+```python
+repo = app.state.auth_events
+repo.listar(limit=100, offset=0)      # mas reciente primero
+repo.contar()
+repo.contar_fallidos_recientes(ip)    # ventana de 15 minutos
+```
+
+Dos cosas que conviene saber antes de apoyarse en esto:
+
+- **La IP sale de `X-Forwarded-For`**, porque los seis productos corren detras
+  de Nginx Proxy Manager y `request.client.host` seria siempre el proxy. Ese
+  header lo puede falsificar el cliente, asi que la IP **sirve para leer un
+  log, no para decidir un bloqueo**.
+- **Un error al registrar nunca tumba el login.** Se traga a proposito: la
+  alternativa es que nadie pueda entrar al sistema porque falla el que anota
+  que entraron.
+
 ## Recuperacion de contrasena por correo (v0.5.0)
 
 Opt-in: son dos endpoints mas en el router y un servicio propio, y **no se
