@@ -349,6 +349,74 @@ def test_lo_mas_reciente_primero_y_paginado(sessions, repo):
     assert [f["descripcion"][-1] for f in repo.listar(limit=2, offset=1)] == ["3", "2"]
 
 
+# ── El router ─────────────────────────────────────────────────────────────
+
+def _app_con_logs(sessions, auditables=None):
+    from fastapi import FastAPI
+    from starlette.testclient import TestClient
+
+    from libraauth.auditoria import build_logs_router
+
+    class AccesosFalsos:
+        def listar(self, limit=100, offset=0):
+            return [{"id": 1, "ts": "2026-08-06 09:00:00", "evento": "login",
+                     "username": "ana", "ip": "203.0.113.7", "detalle": ""}]
+
+    app = FastAPI()
+    app.state.auditoria = AuditoriaRepository(sessions)
+    app.state.auth_events = AccesosFalsos()
+    app.include_router(build_logs_router(auditables or AUDITABLES))
+    return TestClient(app)
+
+
+def test_el_router_devuelve_las_dos_fuentes(sessions):
+    _crear_cliente(sessions, nombre="Del router")
+    datos = _app_con_logs(sessions).get("/logs").json()
+
+    assert datos["actividad"][0]["descripcion"] == "Cliente — Del router"
+    assert datos["accesos"][0]["evento"] == "login"
+    assert datos["total"] == 1
+
+
+def test_las_entidades_salen_de_lo_declarado_y_no_del_log(sessions):
+    """Si salieran de un `SELECT DISTINCT`, el filtro no ofreceria una entidad
+    hasta que alguien la tocara por primera vez."""
+    datos = _app_con_logs(sessions).get("/logs").json()
+    assert datos["entidades"] == ["cliente", "turno"]
+    assert datos["actividad"] == []
+
+
+def test_el_router_filtra_y_pagina(sessions):
+    for n in range(3):
+        _crear_cliente(sessions, nombre=f"C{n}")
+    with sessions() as s:
+        s.add(Turno(title="Un turno"))
+        s.commit()
+
+    client = _app_con_logs(sessions)
+    assert client.get("/logs", params={"entidad": "turno"}).json()["total"] == 1
+    assert client.get("/logs", params={"accion": EDITAR}).json()["total"] == 0
+    # `page=0` no puede devolver un offset negativo.
+    assert client.get("/logs", params={"page": 0}).json()["page"] == 1
+
+
+def test_el_prefijo_es_parametrizable(sessions):
+    """LibraDesk monta su API bajo `/api`, los otros tres en la raiz."""
+    from fastapi import FastAPI
+    from starlette.testclient import TestClient
+
+    from libraauth.auditoria import build_logs_router
+
+    app = FastAPI()
+    app.state.auditoria = AuditoriaRepository(sessions)
+    app.state.auth_events = type("A", (), {"listar": lambda self, limit=100: []})()
+    app.include_router(build_logs_router(AUDITABLES, prefix="/api/logs"))
+    client = TestClient(app)
+
+    assert client.get("/api/logs").status_code == 200
+    assert client.get("/logs").status_code == 404
+
+
 # ── La tabla vive en la base del dominio ──────────────────────────────────
 
 def test_la_tabla_no_cuelga_del_base_de_usuarios(tmp_path):
