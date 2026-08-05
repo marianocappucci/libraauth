@@ -58,8 +58,15 @@ from contextvars import ContextVar
 from datetime import datetime
 from typing import Callable
 
+# FastAPI a nivel de modulo y NO dentro de `build_logs_router`: este archivo
+# tiene `from __future__ import annotations`, asi que todas las anotaciones son
+# strings y FastAPI las resuelve contra los globals del modulo. Con el import
+# adentro de la funcion, `Request` no existe ahi y FastAPI lo toma como un query
+# param obligatorio — el sintoma es un 422 pidiendo "request", no un ImportError.
+from fastapi import APIRouter, Depends
 from sqlalchemy import DateTime, Integer, String, Text, event, func, inspect, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+from starlette.requests import Request
 
 CREAR = "crear"
 EDITAR = "editar"
@@ -285,6 +292,76 @@ def agregar_middleware_de_usuario(app) -> None:
             # sesion.
             if token is not None:
                 usuario_actual.reset(token)
+
+
+PAGE_SIZE = 100
+
+# El color lo elige el backend, igual que en Contalibra: asi la pantalla no
+# tiene que conocer el vocabulario, y una accion nueva no obliga a tocar el
+# frontend para que se vea.
+ACCION_META = {
+    CREAR: {"label": "Creado", "color": "#198754"},
+    EDITAR: {"label": "Editado", "color": "#0d6efd"},
+    BORRAR: {"label": "Borrado", "color": "#dc3545"},
+}
+
+
+def build_logs_router(auditables: dict[str, str], *, prefix: str = "/logs") -> APIRouter:
+    """Router de lectura de los dos logs, para la pantalla compartida
+    (`libra-ui/Logs`).
+
+    **No se gatea a si mismo**: el producto lo monta con la dependencia de rol
+    que le corresponda —en los cuatro consumidores es `require_admin`—. Ponerle
+    el gate adentro obligaria a este paquete a conocer el vocabulario de roles
+    de cada producto, que no siempre es el mismo.
+
+    Espera `app.state.auditoria` (`AuditoriaRepository`) y `app.state.auth_events`
+    (`AuthEventRepository`).
+
+    Devuelve las dos fuentes por separado a proposito: la actividad del sistema
+    y los accesos son dos preguntas distintas ("quien borro esto" / "quien
+    entro"), se filtran distinto y se miran en momentos distintos.
+    """
+    router = APIRouter(prefix=prefix, tags=["logs"])
+
+    def _auditoria(request: Request) -> AuditoriaRepository:
+        return request.app.state.auditoria
+
+    def _accesos(request: Request):
+        return request.app.state.auth_events
+
+    @router.get("")
+    def listar(
+        entidad: str = "",
+        accion: str = "",
+        usuario: str = "",
+        desde: str = "",
+        hasta: str = "",
+        page: int = 1,
+        auditoria: AuditoriaRepository = Depends(_auditoria),
+        accesos=Depends(_accesos),
+    ):
+        page = max(1, page)
+        filtros = dict(entidad=entidad, accion=accion, usuario=usuario, desde=desde, hasta=hasta)
+        total = auditoria.contar(**filtros)
+        return {
+            "actividad": auditoria.listar(**filtros, limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE),
+            "total": total,
+            "total_pages": max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE),
+            "page": page,
+            # La lista sale de lo declarado por el producto y no de un `SELECT
+            # DISTINCT` sobre el log: asi el filtro ofrece las entidades
+            # auditables aunque todavia no haya actividad de alguna.
+            "entidades": sorted(set(auditables.values())),
+            "acciones": ACCION_META,
+            "usuarios": auditoria.usuarios(),
+            # Los accesos no se paginan ni se filtran: son la segunda mitad de
+            # la pantalla, no su contenido principal, y 100 filas cubren varios
+            # dias de una instancia con un puñado de usuarios.
+            "accesos": accesos.listar(limit=100),
+        }
+
+    return router
 
 
 class AuditoriaRepository:
