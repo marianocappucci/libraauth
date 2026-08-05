@@ -121,6 +121,20 @@ COLUMNAS_OCULTAS = frozenset({
     "secret", "secret_key", "access_token", "api_key",
 })
 
+# Lo que se escribe en lugar del valor de una columna oculta que SI cambio.
+#
+# 🔴 Hasta v0.11.0 una columna oculta se salteaba entera, y si era la unica que
+# habia cambiado el diff quedaba vacio — con lo cual la edicion **no se
+# registraba en absoluto**. O sea: cambiar solo la contrasena de un usuario no
+# dejaba ninguna fila en el log, en ninguno de los seis productos. Un log de
+# auditoria que no puede contestar "quien cambio esa contrasena y cuando" no
+# esta ocultando un secreto: esta ocultando el hecho.
+#
+# Desde v0.12.0 la fila se registra igual y lo unico que se tapa es el valor.
+# Se distingue de un `dirty` que no cambio nada, que sigue sin registrarse
+# porque eso si es ruido — ver `_diff`.
+OCULTO = "(oculto)"
+
 # En orden: el primero que exista y tenga valor es la etiqueta de la fila. Estan
 # los nombres en castellano (dominio propio de los productos) y en ingles (los
 # modelos de LibraGenda y LibraCommerce, que son los que auditan Gestiolibra,
@@ -166,18 +180,24 @@ def _diff(obj, ocultas: frozenset) -> dict:
 
     Solo columnas: las relaciones quedan afuera porque cargarlas aca dispararia
     un SELECT por atributo en medio del flush.
+
+    Una columna oculta que cambio entra como `[OCULTO, OCULTO]`, no se saltea:
+    el log tiene que poder decir que ese campo se toco. Lo que se descarta —y
+    por eso el chequeo de `antes == despues` va **antes** de tapar el valor— es
+    la columna que quedo igual, que es ruido en cualquier caso.
     """
     estado = inspect(obj)
     cambios = {}
     for columna in obj.__table__.columns.keys():
-        if columna in ocultas:
-            continue
         historial = estado.attrs[columna].history
         if not historial.has_changes():
             continue
         antes = historial.deleted[0] if historial.deleted else None
         despues = historial.added[0] if historial.added else None
         if antes == despues:
+            continue
+        if columna in ocultas:
+            cambios[columna] = [OCULTO, OCULTO]
             continue
         cambios[columna] = [_valor_legible(antes), _valor_legible(despues)]
     return cambios
