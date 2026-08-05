@@ -20,6 +20,7 @@ from libraauth.auditoria import (
     BORRAR,
     CREAR,
     EDITAR,
+    OCULTO,
     SISTEMA,
     ActividadLog,
     AuditoriaBase,
@@ -168,15 +169,57 @@ def test_una_columna_secreta_no_entra_al_diff(sessions, repo):
         c.ciudad = "Lujan"
         s.commit()
     edicion = [f for f in repo.listar() if f["accion"] == EDITAR][0]
-    # Igualdad exacta, no `not in`: fija que la columna secreta no esta **y**
-    # que la que si cambio se registro. Un `not in` solo pasaria igual con el
-    # diff vacio, que seria otro defecto.
-    assert edicion["cambios"] == {"ciudad": [None, "Lujan"]}
+    # Igualdad exacta, no `not in`: fija que el VALOR secreto no esta, que la
+    # columna secreta si figura como tocada, y que la otra se registro normal.
+    # Un `not in` solo pasaria igual con el diff vacio, que seria otro defecto.
+    assert edicion["cambios"] == {
+        "api_key": [OCULTO, OCULTO],
+        "ciudad": [None, "Lujan"],
+    }
     assert "secreto" not in str(edicion)
 
 
+def test_cambiar_solo_un_secreto_igual_deja_rastro(sessions, repo):
+    """🔴 Hasta v0.11.0 esto no registraba **nada**: la unica columna que habia
+    cambiado estaba oculta, el diff quedaba vacio y la edicion se descartaba
+    como si nadie hubiera tocado el objeto.
+
+    En la practica: cambiar la contrasena de un usuario era invisible para el
+    log de auditoria de los seis productos. Es justo el evento que un log de
+    auditoria existe para registrar.
+    """
+    cid = _crear_cliente(sessions, api_key="secreto-viejo")
+    with sessions() as s:
+        s.get(Cliente, cid).api_key = "secreto-nuevo"
+        s.commit()
+
+    ediciones = [f for f in repo.listar() if f["accion"] == EDITAR]
+    assert len(ediciones) == 1
+    assert ediciones[0]["cambios"] == {"api_key": [OCULTO, OCULTO]}
+    assert "secreto" not in str(ediciones[0])
+
+
+def test_tocar_un_secreto_y_dejarlo_igual_sigue_sin_registrarse(sessions, repo):
+    """La contracara: tapar el valor no puede convertirse en registrar ruido.
+    Un `dirty` que no cambio nada se descarta igual que antes, este oculta la
+    columna o no. Por eso el chequeo de `antes == despues` va antes de tapar."""
+    cid = _crear_cliente(sessions, api_key="misma-clave")
+    with sessions() as s:
+        s.get(Cliente, cid).api_key = "misma-clave"
+        s.commit()
+
+    assert [f for f in repo.listar() if f["accion"] == EDITAR] == []
+
+
 def test_el_producto_puede_ocultar_columnas_propias(tmp_path):
-    """MedLibra lo usa para que el contenido clinico no se copie al log."""
+    """MedLibra lo usa para que el contenido clinico no se copie al log.
+
+    ⚠️ **Este test cambio en v0.12.0.** Antes aseveraba `== []`: si la unica
+    columna que cambiaba estaba oculta, la edicion no se registraba. Para
+    MedLibra eso significaba que corregir una nota clinica no iba a dejar
+    ningun rastro — el caso opuesto al que el log tiene que cubrir en un
+    sistema de salud. Ahora se registra la fila y se tapa el valor.
+    """
     engine = create_engine(f"sqlite:///{tmp_path}/otro.db")
     DominioBase.metadata.create_all(engine)
     AuditoriaBase.metadata.create_all(engine)
@@ -193,7 +236,12 @@ def test_el_producto_puede_ocultar_columnas_propias(tmp_path):
         s.commit()
 
     repo = AuditoriaRepository(factory)
-    assert [f for f in repo.listar() if f["accion"] == EDITAR] == []
+    ediciones = [f for f in repo.listar() if f["accion"] == EDITAR]
+    assert len(ediciones) == 1
+    assert ediciones[0]["cambios"] == {"ciudad": [OCULTO, OCULTO]}
+    # Lo que importa: ni el valor viejo ni el nuevo quedaron escritos.
+    assert "Suipacha" not in str(ediciones[0])
+    assert "Mercedes" not in str(ediciones[0])
 
 
 def test_el_producto_puede_reemplazar_la_etiqueta(tmp_path):
