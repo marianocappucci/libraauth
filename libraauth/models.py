@@ -61,6 +61,43 @@ class PasswordResetToken(Base):
     used_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
+class AuthEvent(Base):
+    """Un evento de autenticacion: login, logout o intento fallido (v0.8.0).
+
+    **La tabla se llama `auth_log` y no `auth_events` a proposito.** Es la
+    misma tabla, con las mismas columnas, que `libracore.db.schema` ya crea en
+    Contalibra y Restolibra desde el sqlite3 crudo. Un nombre nuevo habria
+    dejado dos tablas con el mismo contenido en la misma base de esos dos
+    productos el dia que adopten este repositorio, y ninguna forma obvia de
+    saber cual mirar. Con este nombre, `create_all()` encuentra la tabla ya
+    creada, no la toca, y las filas viejas siguen siendo legibles.
+
+    **`ts` se calcula en Python (`datetime.now`) y no con `func.now()`**, que
+    es lo que usa el resto de este modulo. No es una inconsistencia por
+    descuido: `func.now()` en SQLite es `CURRENT_TIMESTAMP`, que devuelve
+    **UTC**, mientras la fila que escribe LibraCore usa
+    `datetime('now','localtime')`. Con `func.now()`, una base que recibiera
+    escrituras de los dos lados quedaria con la mitad de los eventos tres
+    horas corridos y ordenados mal entre si — y un log de accesos con la hora
+    mal es peor que no tenerlo, porque se lee justo cuando alguien esta
+    buscando quien entro y cuando. `datetime.now` da la hora local del
+    proceso, que es lo mismo que hace `localtime` en el mismo contenedor.
+
+    No declara FK a `usuarios`: un intento **fallido** trae un username que
+    puede no existir, y esa es justamente la fila que mas interesa guardar.
+    Por eso se guarda el texto del username y no un id.
+    """
+
+    __tablename__ = "auth_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now)
+    evento: Mapped[str] = mapped_column(String(50), nullable=False)
+    username: Mapped[str] = mapped_column(String(100), nullable=False)
+    ip: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    detalle: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+
+
 class SmtpSettings(Base):
     """Configuracion SMTP de la instancia, editable por backoffice (v0.6.0).
 
