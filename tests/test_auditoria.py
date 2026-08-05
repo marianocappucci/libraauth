@@ -196,6 +196,29 @@ def test_el_producto_puede_ocultar_columnas_propias(tmp_path):
     assert [f for f in repo.listar() if f["accion"] == EDITAR] == []
 
 
+def test_el_producto_puede_reemplazar_la_etiqueta(tmp_path):
+    """No alcanza con `columnas_ocultas`: la etiqueta se arma leyendo
+    atributos directamente, asi que ocultar una columna del diff no impide que
+    su valor termine en la descripcion. MedLibra lo necesita para que el
+    titulo de un documento clinico no quede escrito en el log."""
+    engine = create_engine(f"sqlite:///{tmp_path}/etiqueta.db")
+    DominioBase.metadata.create_all(engine)
+    AuditoriaBase.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    configurar_auditoria(
+        factory, {"Turno": "turno"},
+        etiqueta=lambda obj: "" if type(obj).__name__ == "Turno" else "x",
+    )
+
+    with factory() as s:
+        s.add(Turno(title="Interconsulta cardiologia"))
+        s.commit()
+
+    fila = AuditoriaRepository(factory).listar()[0]
+    assert fila["descripcion"] == "Turno"
+    assert "cardiologia" not in str(fila)
+
+
 def test_se_puede_apagar_por_sesion(sessions, repo):
     """`session.info['auditoria'] = False` — para un seed o una migracion de
     datos, que no son actividad de nadie."""

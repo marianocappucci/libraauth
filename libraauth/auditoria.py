@@ -145,6 +145,14 @@ def _etiqueta(obj) -> str:
     return armado[:200] if armado else ""
 
 
+# Nombre publico de `_etiqueta`, para el producto que quiera reusarla dentro de
+# su propio `etiqueta=`: MedLibra la usa para las entidades NO clinicas y
+# devuelve cadena vacia para el resto. Sin esto tendria que importar un nombre
+# privado de este modulo.
+def etiqueta_por_defecto(obj) -> str:
+    return _etiqueta(obj)
+
+
 def _valor_legible(valor):
     if isinstance(valor, datetime):
         return valor.strftime("%Y-%m-%d %H:%M:%S")
@@ -179,6 +187,7 @@ def configurar_auditoria(
     session_factory,
     auditables: dict[str, str],
     columnas_ocultas: frozenset | set | tuple = (),
+    etiqueta: Callable[[object], str] | None = None,
 ) -> None:
     """Engancha los listeners al `session_factory` del dominio.
 
@@ -194,17 +203,29 @@ def configurar_auditoria(
     equipo, la linea de tiempo de un ticket) tienen que quedar afuera, porque su
     ficha ya las muestra y auditarlas pondria el mismo hecho dos veces.
 
+    `columnas_ocultas` se SUMA a las que este modulo oculta siempre
+    (contrasenas, tokens, secretos). Es para lo que solo el producto sabe que
+    es sensible: MedLibra la usa para que el texto de una nota clinica o la
+    medicacion de una receta **no se copien al log**.
+
+    `etiqueta` reemplaza el armado del texto que describe la fila. Existe por
+    el mismo motivo, y no alcanza con `columnas_ocultas`: la etiqueta se arma
+    leyendo atributos directamente, asi que ocultar una columna del diff no
+    impide que su valor termine en la descripcion. El titulo de un documento
+    clinico ("Interconsulta cardiologia") ya dice algo del paciente.
+
     Idempotente: llamarla dos veces —los tests arman varias apps en el mismo
     proceso— no duplica filas.
     """
     ocultas = COLUMNAS_OCULTAS | frozenset(columnas_ocultas)
+    armar_etiqueta = etiqueta or _etiqueta
 
     def _auditable(obj) -> bool:
         return type(obj).__name__ in auditables
 
     def _fila(obj, accion: str, cambios: dict | None) -> dict:
         entidad = auditables[type(obj).__name__]
-        etiqueta = _etiqueta(obj)
+        etiqueta = armar_etiqueta(obj)
         titulo = entidad.replace("_", " ").capitalize()
         return {
             "ts": datetime.now(),
