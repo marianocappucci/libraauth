@@ -145,6 +145,14 @@ def _etiqueta(obj) -> str:
     return armado[:200] if armado else ""
 
 
+# Nombre publico de `_etiqueta`, para el producto que quiera reusarla dentro de
+# su propio `etiqueta=`: MedLibra la usa para las entidades NO clinicas y
+# devuelve cadena vacia para el resto. Sin esto tendria que importar un nombre
+# privado de este modulo.
+def etiqueta_por_defecto(obj) -> str:
+    return _etiqueta(obj)
+
+
 def _valor_legible(valor):
     if isinstance(valor, datetime):
         return valor.strftime("%Y-%m-%d %H:%M:%S")
