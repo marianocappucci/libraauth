@@ -89,6 +89,49 @@ Dos cosas que conviene saber antes de apoyarse en esto:
   alternativa es que nadie pueda entrar al sistema porque falla el que anota
   que entraron.
 
+## Log de actividad (v0.9.0)
+
+Quien creo, edito o borro que, y que cambio. **No se siembran llamadas en los
+repositorios**: el registro cuelga del `flush` de SQLAlchemy, asi que una
+escritura que no pase por ahi no existe y un metodo de escritura nuevo queda
+auditado sin que nadie se acuerde.
+
+```python
+from libraauth.auditoria import (
+    AuditoriaBase, AuditoriaRepository, agregar_middleware_de_usuario,
+    configurar_auditoria,
+)
+
+# La tabla va en la base del DOMINIO, no en la de `usuarios` -- ver abajo.
+AuditoriaBase.metadata.create_all(engine_del_dominio)
+
+configurar_auditoria(sessions, {
+    "Cliente": "cliente",          # {clase del modelo: nombre logico}
+    "Appointment": "turno",
+})
+app.state.auditoria = AuditoriaRepository(sessions)
+agregar_middleware_de_usuario(app)   # sella el usuario de la cookie
+```
+
+**`AuditoriaBase` es un `Base` propio, separado del de `models.py`.** La tabla
+tiene que quedar donde ocurren las escrituras que audita, y eso **no** siempre
+es donde vive `usuarios`: en Gestiolibra, MedLibra y VentaLibra `usuarios` esta
+en la base de LibraCore y el dominio en la de LibraGenda/LibraCommerce.
+
+**La lista es blanca, no negra.** Una tabla nueva no entra sola. Las que YA son
+historial de algo (los movimientos de un equipo, la linea de tiempo de un
+ticket) tienen que quedar afuera: su ficha ya las muestra, y auditarlas pondria
+el mismo hecho dos veces en la misma pantalla.
+
+Tres cosas mas que conviene saber:
+
+- **Un `UPDATE` que no cambia nada no deja fila.** Un log lleno de "editado"
+  vacios es un log que nadie lee.
+- **Las columnas secretas no entran al diff** (`password*`, `token*`, `secret*`,
+  `api_key`). El producto suma las suyas con `columnas_ocultas={...}`.
+- **Se puede apagar por sesion** con `session.info["auditoria"] = False`, para un
+  seed o una migracion de datos, que no son actividad de nadie.
+
 ## Recuperacion de contrasena por correo (v0.5.0)
 
 Opt-in: son dos endpoints mas en el router y un servicio propio, y **no se
