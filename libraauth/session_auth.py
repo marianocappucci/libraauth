@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.exceptions import HTTPException
 
+from .auth_events import LOGIN, LOGIN_FALLIDO, LOGOUT, registrar_seguro
 from .crypto import ClaveDeCifradoAusente
 from .password_reset import EmailNotConfigured, InvalidResetToken
 from .smtp_settings import SIN_CAMBIOS
@@ -317,13 +318,25 @@ def build_json_api_auth_router(
         users = request.app.state.users
         user = users.check_credentials(data.username, data.password)
         if user is None:
+            # Se anota el username TIPEADO, que puede no existir: un intento
+            # contra un usuario inexistente es la firma de un barrido, y es
+            # el dato que se pierde si solo se registran los logins que salen
+            # bien. No se anota nada de la contrasena, ni su largo.
+            registrar_seguro(request, LOGIN_FALLIDO, data.username)
             raise HTTPException(401, "invalid credentials")
         json_api_get_session_auth(request).create_session_cookie(response, user["username"])
+        registrar_seguro(request, LOGIN, user["username"])
         return user
 
     @router.post("/logout")
     def logout(request: Request, response: Response):
+        # El username sale de la cookie, no del cuerpo: `/logout` no recibe
+        # nada, y una sesion ya vencida cierra igual pero sin nombre que
+        # anotar. Se registra antes de borrar la cookie, obviamente.
+        username = json_api_get_session_auth(request).get_current_user(request) or ""
         json_api_get_session_auth(request).clear_session_cookie(response)
+        if username:
+            registrar_seguro(request, LOGOUT, username)
         return {"ok": True}
 
     @router.get("/me", response_model=_UserOut)
