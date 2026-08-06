@@ -8,7 +8,9 @@ propias tablas.
 """
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    Boolean, DateTime, ForeignKey, Integer, String, Text, func, text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -91,11 +93,36 @@ class AuthEvent(Base):
     __tablename__ = "auth_log"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    ts: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now)
+    # 🔴 `server_default` ADEMAS del default de Python, y no en su lugar.
+    #
+    # El default de Python solo aplica a las escrituras del ORM. Pero en
+    # Contalibra y Restolibra el otro escritor es `libracore.db.logs`, que hace
+    # un `INSERT INTO auth_log (evento, username, ip, detalle)` **crudo, sin
+    # `ts`**, contando con el DEFAULT de la tabla. Sin esta clausula, una tabla
+    # creada por `create_all()` sale sin DEFAULT y ese INSERT explota con
+    # `NOT NULL constraint failed: auth_log.ts`.
+    #
+    # No se nota en las instancias que ya existen —ahi la tabla la creo
+    # LibraCore, con su DEFAULT, y `create_all` no altera lo que ya esta—: se
+    # nota **solo en bases nuevas**, o sea en cada instancia que se cree de
+    # ahora en adelante, y recien cuando alguien intenta entrar. Lo encontro el
+    # bump de Contalibra el 2026-08-06: 148 tests verdes pasaron a 101 errores.
+    #
+    # El literal es identico al de `libracore.db.schema` a proposito, incluido
+    # el `localtime`: con `func.now()` (que en SQLite es UTC) una base escrita
+    # desde los dos lados quedaria con la mitad de los eventos tres horas
+    # corridos.
+    ts: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.now,
+        server_default=text("(datetime('now','localtime'))"),
+    )
     evento: Mapped[str] = mapped_column(String(50), nullable=False)
     username: Mapped[str] = mapped_column(String(100), nullable=False)
-    ip: Mapped[str] = mapped_column(String(64), nullable=False, default="")
-    detalle: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    # Nulables, como la tabla de LibraCore: las filas de esos dos productos
+    # vienen de ahi y una constraint mas estricta del lado del modelo haria que
+    # `create_all` cree una tabla incompatible con el mismo INSERT crudo.
+    ip: Mapped[str] = mapped_column(String(64), nullable=True, default="")
+    detalle: Mapped[str] = mapped_column(String(500), nullable=True, default="")
 
 
 class SmtpSettings(Base):
