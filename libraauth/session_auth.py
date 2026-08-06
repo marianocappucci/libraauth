@@ -285,8 +285,39 @@ def json_api_require_admin_o_servicio(request: Request) -> dict:
     return usuario
 
 
+#: Variable de entorno que enciende `POST /auth/demo`.
+DEMO_MODE = "DEMO_MODE"
+
+#: Con que usuario entra el visitante de la demo.
+DEMO_USERNAME = "DEMO_USERNAME"
+
+#: Roles que el auto-login **nunca** entrega, por mas que el usuario nombrado
+#: en `DEMO_USERNAME` los tenga. Ver `_demo_username`.
+ROLES_PROHIBIDOS_EN_DEMO = ("admin",)
+
+
+def _demo_username() -> str | None:
+    """El usuario del auto-login, o `None` si la demo no esta encendida.
+
+    🔴 **Son DOS cerrojos y es a proposito**: hace falta `DEMO_MODE` encendido
+    *y* `DEMO_USERNAME` con un nombre. Un solo flag booleano se prende por
+    accidente al copiar un `.env` de una instancia a otra; que ademas haya que
+    nombrar al usuario obliga a que alguien haya pensado en ese usuario para
+    esa instancia.
+
+    Cuando devuelve `None` la ruta **ni se registra**: en produccion
+    `POST /auth/demo` es un 404 de "no existe", no un 403 de "existe pero no
+    podes". La diferencia importa — un 403 le confirma a quien barre que el
+    endpoint esta ahi.
+    """
+    if os.environ.get(DEMO_MODE, "").strip().lower() not in ("1", "true", "yes", "si"):
+        return None
+    return os.environ.get(DEMO_USERNAME, "").strip() or None
+
+
 def build_json_api_auth_router(
-    *, incluir_verify: bool = False, incluir_password_reset: bool = False
+    *, incluir_verify: bool = False, incluir_password_reset: bool = False,
+    incluir_demo: bool = False,
 ) -> APIRouter:
     """Router `/auth` (login/logout/me) para SPAs sin backoffice
     server-rendered propio. Espera `request.app.state.users`/
@@ -342,6 +373,41 @@ def build_json_api_auth_router(
     @router.get("/me", response_model=_UserOut)
     def me(user: dict = Depends(json_api_get_current_user)):
         return user
+
+    # `POST /auth/demo` — el boton "Entrar a la demo" de la landing.
+    #
+    # Se registra **solo si el consumidor lo pidio Y las dos variables de
+    # entorno estan puestas**. En cualquier otra instancia la ruta no existe:
+    # es un 404, no un 403 (ver `_demo_username`).
+    if incluir_demo and _demo_username():
+        @router.post("/demo", response_model=_UserOut)
+        def demo(request: Request, response: Response):
+            """Entra a la demo publica sin credenciales.
+
+            No recibe cuerpo y no hay contrasena que adivinar: el usuario sale
+            de `DEMO_USERNAME`, que lo fija quien despliega la instancia.
+
+            🔴 **Nunca entrega un rol de la lista prohibida.** El chequeo esta
+            aca y no en el despliegue porque el rol del usuario puede cambiar
+            despues —alguien lo promueve desde el ABM de la propia demo— y
+            entonces el auto-login empezaria a repartir admin sin que nadie
+            haya tocado el `.env`. Es la clase de cambio que no deja rastro
+            hasta que ya paso.
+            """
+            username = _demo_username()
+            users = request.app.state.users
+            user = users.get_by_username(username)
+            if user is None or not user.get("active"):
+                # 503 y no 404: la ruta existe y esta bien configurada, lo que
+                # falta es el usuario en la base — o sea, la instancia todavia
+                # no termino de sembrarse. Un 404 diria "no hay demo aca", que
+                # es falso y manda a mirar el lugar equivocado.
+                raise HTTPException(503, "demo user not provisioned")
+            if user["role"] in ROLES_PROHIBIDOS_EN_DEMO:
+                raise HTTPException(503, "demo user has a forbidden role")
+            json_api_get_session_auth(request).create_session_cookie(response, user["username"])
+            registrar_seguro(request, LOGIN, user["username"])
+            return user
 
     if incluir_verify:
         @router.post("/verify", response_model=_VerifyResponse)
