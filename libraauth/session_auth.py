@@ -292,11 +292,11 @@ DEMO_MODE = "DEMO_MODE"
 DEMO_USERNAME = "DEMO_USERNAME"
 
 #: Roles que el auto-login **nunca** entrega, por mas que el usuario nombrado
-#: en `DEMO_USERNAME` los tenga. Ver `_demo_username`.
+#: en `DEMO_USERNAME` los tenga. Ver `demo_username`.
 ROLES_PROHIBIDOS_EN_DEMO = ("admin",)
 
 
-def _demo_username() -> str | None:
+def demo_username() -> str | None:
     """El usuario del auto-login, o `None` si la demo no esta encendida.
 
     🔴 **Son DOS cerrojos y es a proposito**: hace falta `DEMO_MODE` encendido
@@ -378,8 +378,8 @@ def build_json_api_auth_router(
     #
     # Se registra **solo si el consumidor lo pidio Y las dos variables de
     # entorno estan puestas**. En cualquier otra instancia la ruta no existe:
-    # es un 404, no un 403 (ver `_demo_username`).
-    if incluir_demo and _demo_username():
+    # es un 404, no un 403 (ver `demo_username`).
+    if incluir_demo and demo_username():
         @router.post("/demo", response_model=_UserOut)
         def demo(request: Request, response: Response):
             """Entra a la demo publica sin credenciales.
@@ -394,7 +394,7 @@ def build_json_api_auth_router(
             haya tocado el `.env`. Es la clase de cambio que no deja rastro
             hasta que ya paso.
             """
-            username = _demo_username()
+            username = demo_username()
             users = request.app.state.users
             user = users.get_by_username(username)
             if user is None or not user.get("active"):
