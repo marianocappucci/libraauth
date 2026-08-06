@@ -1,0 +1,216 @@
+"""El auto-login de las demos publicas — item 8 de los pendientes de Libra.
+
+> *"...para que la gente pueda entrar por la pagina web y ver una muestra del
+> sistema semi funcional."*
+
+Un boton en cada landing tiene que dejar entrar **sin credenciales**. Eso es,
+por definicion, un agujero de autenticacion: todo el trabajo esta en que exista
+unicamente donde debe.
+
+Lo que fijan estos tests, en orden de lo que se rompe sin que se note:
+
+1. 🔴 **Que en una instancia normal la ruta NO exista.** Es lo unico que separa
+   "demo publica" de "cualquiera entra al sistema del cliente". Y el 404 solo
+   prueba algo si el mismo test sabe que con la configuracion puesta la ruta
+   **si** responde — un 404 contra una ruta que nunca existio no distingue
+   nada.
+2. 🔴 **Que hagan falta las DOS variables.** Un flag booleano solo se prende al
+   copiar un `.env`; que ademas haya que nombrar al usuario obliga a que
+   alguien haya pensado en ese usuario para esa instancia.
+3. 🔴 **Que nunca entregue admin**, aunque el usuario nombrado lo sea. El rol
+   puede cambiar despues de desplegar, desde el ABM de la propia demo.
+4. Que el consumidor tenga que pedirlo (`incluir_demo=True`).
+"""
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from libraauth.session_auth import SessionAuth, build_json_api_auth_router
+
+
+class _Usuarios:
+    def __init__(self, extra=None):
+        self._users = {
+            "admin": {"id": "1", "username": "admin", "name": "Admin",
+                      "role": "admin", "active": True, "_password": "adminpw"},
+            "visitante": {"id": "2", "username": "visitante", "name": "Visitante",
+                          "role": "staff", "active": True, "_password": "x"},
+            "de-baja": {"id": "3", "username": "de-baja", "name": "De baja",
+                        "role": "staff", "active": False, "_password": "x"},
+        }
+        self._users.update(extra or {})
+
+    def _publico(self, u):
+        return {k: v for k, v in u.items() if k != "_password"}
+
+    def get_by_username(self, username):
+        u = self._users.get(username)
+        return self._publico(u) if u else None
+
+    def check_credentials(self, username, password):
+        u = self._users.get(username)
+        return self._publico(u) if u and u["_password"] == password else None
+
+
+@pytest.fixture(autouse=True)
+def _entorno_de_test(monkeypatch):
+    """`SessionAuth` se niega a arrancar sin `SECRET_KEY` fuera de desarrollo,
+    y con razón. Acá alcanza con declarar el entorno."""
+    monkeypatch.setenv("ENV", "development")
+
+
+def _app(*, incluir_demo=True, usuarios=None):
+    app = FastAPI()
+    usuarios = usuarios or _Usuarios()
+    app.state.users = usuarios
+    app.state.session_auth = SessionAuth(
+        dev_secret_fallback="test-secret",
+        get_user_by_username=usuarios.get_by_username,
+        check_credentials=usuarios.check_credentials,
+        cookie_name="test_demo_session",
+    )
+    app.include_router(build_json_api_auth_router(incluir_demo=incluir_demo))
+    return TestClient(app, base_url="https://testserver")
+
+
+@pytest.fixture
+def demo_encendida(monkeypatch):
+    monkeypatch.setenv("DEMO_MODE", "1")
+    monkeypatch.setenv("DEMO_USERNAME", "visitante")
+
+
+# ── 🔴 Que exista SOLO donde debe ─────────────────────────────────────────
+
+def test_con_la_demo_encendida_el_boton_entra(demo_encendida):
+    """La mitad util del par: sin esto, el 404 del test de abajo no prueba
+    nada — podria ser el 404 de una ruta que nunca existio."""
+    cliente = _app()
+    r = cliente.post("/auth/demo")
+
+    assert r.status_code == 200, r.text
+    assert r.json()["username"] == "visitante"
+    assert cliente.get("/auth/me").json()["username"] == "visitante"
+
+
+def test_sin_las_variables_la_ruta_no_existe(monkeypatch):
+    """🔴 Es lo unico que separa "demo publica" de "cualquiera entra al sistema
+    del cliente"."""
+    monkeypatch.delenv("DEMO_MODE", raising=False)
+    monkeypatch.delenv("DEMO_USERNAME", raising=False)
+
+    assert _app().post("/auth/demo").status_code == 404
+
+
+def test_con_DEMO_MODE_pero_sin_usuario_la_ruta_no_existe(monkeypatch):
+    """Dos cerrojos, no uno: un flag booleano se prende solo al copiar un
+    `.env` de una instancia a otra."""
+    monkeypatch.setenv("DEMO_MODE", "1")
+    monkeypatch.delenv("DEMO_USERNAME", raising=False)
+
+    assert _app().post("/auth/demo").status_code == 404
+
+
+def test_con_usuario_pero_sin_DEMO_MODE_la_ruta_no_existe(monkeypatch):
+    monkeypatch.delenv("DEMO_MODE", raising=False)
+    monkeypatch.setenv("DEMO_USERNAME", "visitante")
+
+    assert _app().post("/auth/demo").status_code == 404
+
+
+def test_DEMO_MODE_apagado_explicitamente_tampoco_alcanza(monkeypatch):
+    """`DEMO_MODE=0` es lo que va a quedar escrito en los `.env` de las
+    instancias reales cuando alguien copie el de la demo."""
+    monkeypatch.setenv("DEMO_MODE", "0")
+    monkeypatch.setenv("DEMO_USERNAME", "visitante")
+
+    assert _app().post("/auth/demo").status_code == 404
+
+
+def test_el_consumidor_tiene_que_pedirlo(demo_encendida):
+    """Con las variables puestas pero sin `incluir_demo`, tampoco. Asi un
+    producto que nunca va a tener demo no depende de que nadie se equivoque
+    con el entorno."""
+    assert _app(incluir_demo=False).post("/auth/demo").status_code == 404
+
+
+def test_es_404_y_no_403(monkeypatch):
+    """Un 403 le confirma a quien barre que el endpoint esta ahi y que la
+    instancia lo soporta. El 404 no dice nada."""
+    monkeypatch.delenv("DEMO_MODE", raising=False)
+    r = _app().post("/auth/demo")
+
+    assert r.status_code == 404
+    assert "demo" not in r.text.lower()
+
+
+# ── 🔴 Que nunca reparta admin ────────────────────────────────────────────
+
+def test_no_entrega_admin_aunque_el_usuario_nombrado_lo_sea(monkeypatch):
+    """🔴 El rol puede cambiar **despues** de desplegar: alguien promueve al
+    usuario desde el ABM de la propia demo y el auto-login empezaria a repartir
+    admin sin que nadie haya tocado el `.env`. Por eso el chequeo esta en el
+    endpoint y no en el despliegue."""
+    monkeypatch.setenv("DEMO_MODE", "1")
+    monkeypatch.setenv("DEMO_USERNAME", "admin")
+
+    r = _app().post("/auth/demo")
+
+    assert r.status_code == 503
+    assert "forbidden role" in r.text
+
+
+def test_un_usuario_promovido_a_admin_deja_de_entrar(monkeypatch):
+    """El mismo caso pero visto desde el otro lado: el usuario de la demo
+    empieza siendo staff y alguien lo promueve."""
+    monkeypatch.setenv("DEMO_MODE", "1")
+    monkeypatch.setenv("DEMO_USERNAME", "visitante")
+    usuarios = _Usuarios()
+    cliente = _app(usuarios=usuarios)
+    assert cliente.post("/auth/demo").status_code == 200
+
+    usuarios._users["visitante"]["role"] = "admin"
+
+    assert _app(usuarios=usuarios).post("/auth/demo").status_code == 503
+
+
+# ── El usuario tiene que estar ────────────────────────────────────────────
+
+def test_si_el_usuario_no_existe_avisa_que_falta_sembrar(monkeypatch):
+    """503 y no 404: la ruta existe y esta bien configurada, lo que falta es
+    el usuario. Un 404 diria "no hay demo aca", que manda a mirar el lugar
+    equivocado."""
+    monkeypatch.setenv("DEMO_MODE", "1")
+    monkeypatch.setenv("DEMO_USERNAME", "no-existe")
+
+    r = _app().post("/auth/demo")
+
+    assert r.status_code == 503
+    assert "not provisioned" in r.text
+
+
+def test_un_usuario_desactivado_no_entra(monkeypatch):
+    """Desactivar al usuario de la demo es la forma de apagarla sin redesplegar."""
+    monkeypatch.setenv("DEMO_MODE", "1")
+    monkeypatch.setenv("DEMO_USERNAME", "de-baja")
+
+    assert _app().post("/auth/demo").status_code == 503
+
+
+# ── Lo que no cambia ──────────────────────────────────────────────────────
+
+def test_el_login_normal_sigue_funcionando_con_la_demo_encendida(demo_encendida):
+    cliente = _app()
+    r = cliente.post("/auth/login", json={"username": "admin", "password": "adminpw"})
+
+    assert r.status_code == 200, r.text
+    assert r.json()["role"] == "admin"
+
+
+def test_el_auto_login_no_recibe_cuerpo(demo_encendida):
+    """No hay contrasena que adivinar ni usuario que elegir desde afuera: el
+    usuario sale del entorno."""
+    cliente = _app()
+    r = cliente.post("/auth/demo", json={"username": "admin", "password": "adminpw"})
+
+    assert r.status_code == 200, r.text
+    assert r.json()["username"] == "visitante"
