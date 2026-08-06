@@ -17,7 +17,7 @@ import os
 import secrets
 
 from .repository import UserRepository
-from .session_auth import ROLES_PROHIBIDOS_EN_DEMO, demo_username
+from .session_auth import ROLES_PROHIBIDOS_EN_DEMO, demo_password, demo_username
 
 #: Rol por defecto del usuario de la demo publica. Es el vocabulario de cuatro
 #: de los seis productos (`("admin", "staff")`), pero **no de todos**:
@@ -52,14 +52,29 @@ def ensure_demo_user(repo: "UserRepository", *, rol: str = ROL_DEMO) -> str | No
     nombra los validos**, en vez de dejar la instancia sin usuario de demo y
     que el 503 aparezca recien cuando alguien toque el boton.
 
-    La contrasena es aleatoria y **no se imprime**: nadie la necesita: al
-    usuario de la demo se entra por `POST /auth/demo`, no tipeandola. Que sea
-    inadivinable importa igual, porque el login normal sigue existiendo.
+    **La contrasena depende de si se declaro `DEMO_PASSWORD`** (agregado el
+    2026-08-06, ver `session_auth.demo_password`):
 
-    Idempotente: si el usuario ya esta, no lo toca — ni siquiera le corrige el
-    rol. Corregirlo en silencio taparia el caso que `POST /auth/demo` tiene que
-    seguir rechazando (alguien lo promovio a admin desde el ABM), y ese caso se
-    quiere ruidoso, no arreglado por atras.
+    - Sin ella, aleatoria y sin imprimir, como siempre: al usuario de la demo
+      se entra por `POST /auth/demo` y no hay nada que tipear.
+    - Con ella, esa: es el pedido de poder decirle a un cliente potencial
+      "entra con usuario demo y contrasena demo". Sigue sin filtrarse a
+      ninguna instancia de cliente, porque `demo_password()` devuelve `None`
+      si la instancia no es una demo.
+
+    Idempotente en lo que importa: si el usuario ya esta **no le corrige el
+    rol**. Corregirlo en silencio taparia el caso que `POST /auth/demo` tiene
+    que seguir rechazando (alguien lo promovio a admin desde el ABM), y ese
+    caso se quiere ruidoso, no arreglado por atras.
+
+    🔴 **Lo unico que si le reescribe a un usuario existente es la contrasena,
+    y solo cuando `DEMO_PASSWORD` esta puesta.** Sin eso, cambiar la
+    contrasena de la demo en el `.env` no haria nada en una instancia ya
+    creada y el dato que se le pasa al cliente seria falso — el modo de falla
+    silencioso de siempre. Y antes de reescribirla se chequea el rol: poner
+    una contrasena **conocida** sobre un usuario que quedo admin es abrirle la
+    instancia a cualquiera por el login normal, donde el cerrojo de
+    `POST /auth/demo` no llega. Ese caso corta el arranque.
     """
     username = demo_username()
     if not username:
@@ -75,12 +90,25 @@ def ensure_demo_user(repo: "UserRepository", *, rol: str = ROL_DEMO) -> str | No
             f"rol={rol!r} no existe en este producto. Los validos son "
             f"{validos}. Pasar `rol=` a ensure_demo_user()."
         )
-    if repo.get_by_username(username):
+    conocida = demo_password()
+    existente = repo.get_by_username(username)
+    if existente:
+        if conocida:
+            if existente["role"] in ROLES_PROHIBIDOS_EN_DEMO:
+                raise RuntimeError(
+                    f"el usuario de demo {username!r} tiene rol "
+                    f"{existente['role']!r}, que esta en "
+                    "ROLES_PROHIBIDOS_EN_DEMO. Con DEMO_PASSWORD puesta eso "
+                    "seria una contrasena conocida sobre una cuenta "
+                    "privilegiada: cualquiera entraria como admin por el "
+                    "login normal. Bajarle el rol o sacar DEMO_PASSWORD."
+                )
+            repo.update_password(existente["id"], conocida)
         return username
     repo.create(
         username=username,
         name=os.environ.get("DEMO_NAME", "Visitante de la demo"),
-        password=secrets.token_urlsafe(24),
+        password=conocida or secrets.token_urlsafe(24),
         role=rol,
     )
     print(f"[INFO] Usuario de demo '{username}' creado con rol {rol}.")
