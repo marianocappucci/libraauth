@@ -17,6 +17,55 @@ import os
 import secrets
 
 from .repository import UserRepository
+from .session_auth import ROLES_PROHIBIDOS_EN_DEMO, demo_username
+
+#: Rol con el que se crea el usuario de la demo publica. Ver `ensure_demo_user`.
+ROL_DEMO = "staff"
+
+
+def ensure_demo_user(repo: "UserRepository") -> str | None:
+    """Crea el usuario del auto-login de la demo, si la instancia es una demo.
+
+    Devuelve el username creado o ya existente, o `None` si esta instancia no
+    es una demo (o sea: casi siempre). **Se guia por las mismas dos variables
+    de entorno que registran `POST /auth/demo`**, y eso es a proposito — si el
+    usuario y la ruta se decidieran por separado, existiria el par
+    "ruta encendida sin usuario" y el par "usuario suelto en la base de un
+    cliente", que son las dos formas de que esto salga mal.
+
+    🔴 **Siempre `staff`, nunca admin.** El visitante no tiene que poder entrar
+    a Configuracion, al ABM de usuarios ni al backup: ahi es donde rompe cosas
+    que no se notan hasta el reset, y donde ve partes de la instancia que no
+    son la muestra. El rol esta fijo en el codigo y no sale del entorno para
+    que no haya un `.env` que pueda pedir admin.
+
+    La contrasena es aleatoria y **no se imprime**: nadie la necesita: al
+    usuario de la demo se entra por `POST /auth/demo`, no tipeandola. Que sea
+    inadivinable importa igual, porque el login normal sigue existiendo.
+
+    Idempotente: si el usuario ya esta, no lo toca — ni siquiera le corrige el
+    rol. Corregirlo en silencio taparia el caso que `POST /auth/demo` tiene que
+    seguir rechazando (alguien lo promovio a admin desde el ABM), y ese caso se
+    quiere ruidoso, no arreglado por atras.
+    """
+    username = demo_username()
+    if not username:
+        return None
+    if repo.get_by_username(username):
+        return username
+    if ROL_DEMO in ROLES_PROHIBIDOS_EN_DEMO:  # pragma: no cover - contradiccion interna
+        raise RuntimeError(
+            f"ROL_DEMO={ROL_DEMO!r} esta en ROLES_PROHIBIDOS_EN_DEMO: "
+            "el usuario que se crearia no podria entrar nunca."
+        )
+    repo.create(
+        username=username,
+        name=os.environ.get("DEMO_NAME", "Visitante de la demo"),
+        password=secrets.token_urlsafe(24),
+        role=ROL_DEMO,
+    )
+    print(f"[INFO] Usuario de demo '{username}' creado con rol {ROL_DEMO}.")
+    return username
 
 
 def ensure_default_admin(repo: "UserRepository", *, env_prefix: str) -> None:
