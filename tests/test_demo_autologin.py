@@ -214,3 +214,45 @@ def test_el_auto_login_no_recibe_cuerpo(demo_encendida):
 
     assert r.status_code == 200, r.text
     assert r.json()["username"] == "visitante"
+
+
+# ── La sonda `GET /auth/demo` (2026-08-06) ────────────────────────────────
+#
+# El boton "Entrar a la demo" no se puede decidir en tiempo de build: la
+# imagen de la demo y la del cliente salen del mismo codigo. La pantalla de
+# login le pregunta a la instancia, y esta es la respuesta.
+
+def test_la_sonda_dice_que_es_una_demo(demo_encendida):
+    r = _app().get("/auth/demo")
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"enabled": True, "username": "visitante"}
+
+
+def test_la_sonda_no_existe_fuera_de_una_demo(monkeypatch):
+    """La mitad que hace util al test de arriba: la misma ruta, sin las
+    variables, no esta."""
+    monkeypatch.delenv("DEMO_MODE", raising=False)
+    monkeypatch.delenv("DEMO_USERNAME", raising=False)
+
+    assert _app().get("/auth/demo").status_code == 404
+
+
+def test_la_sonda_tampoco_existe_si_el_consumidor_no_la_pidio(demo_encendida):
+    assert _app(incluir_demo=False).get("/auth/demo").status_code == 404
+
+
+def test_la_sonda_no_devuelve_la_contrasena(demo_encendida, monkeypatch):
+    """🔴 `DEMO_PASSWORD` es publica por diseno, pero un endpoint **sin
+    autenticar** que reparte contrasenas es un patron que despues alguien
+    copia a un lugar donde no da lo mismo.
+
+    El test busca el valor concreto en el cuerpo entero, no la ausencia de una
+    clave llamada `password`: si manana la contrasena viajara dentro de otro
+    campo —o del `username`— un `"password" not in json` pasaria igual."""
+    monkeypatch.setenv("DEMO_PASSWORD", "una-clave-muy-reconocible")
+
+    r = _app().get("/auth/demo")
+
+    assert r.status_code == 200
+    assert "una-clave-muy-reconocible" not in r.text

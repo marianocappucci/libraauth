@@ -143,6 +143,15 @@ class _VerifyResponse(BaseModel):
     valid: bool
 
 
+class _DemoInfo(BaseModel):
+    """Respuesta de `GET /auth/demo`. `enabled` es siempre `True`: la ruta no
+    se registra fuera de una demo, asi que un `False` no puede existir. Esta
+    igual porque el frontend valida **la forma**, y una clave booleana
+    explicita es lo que distingue este JSON de cualquier otro `200`."""
+    enabled: bool
+    username: str
+
+
 # Solo para el par de endpoints de recuperacion (opt-in, ver
 # build_json_api_auth_router).
 class _ForgotPasswordRequest(BaseModel):
@@ -291,6 +300,12 @@ DEMO_MODE = "DEMO_MODE"
 #: Con que usuario entra el visitante de la demo.
 DEMO_USERNAME = "DEMO_USERNAME"
 
+#: Contrasena **conocida** del usuario de la demo, para poder decirle a un
+#: cliente potencial "entra con demo/demo". Opcional: sin esto el usuario se
+#: crea con una contrasena aleatoria y solo se entra por `POST /auth/demo`.
+#: Ver `demo_password()` y `bootstrap.ensure_demo_user`.
+DEMO_PASSWORD = "DEMO_PASSWORD"
+
 #: Roles que el auto-login **nunca** entrega, por mas que el usuario nombrado
 #: en `DEMO_USERNAME` los tenga. Ver `demo_username`.
 ROLES_PROHIBIDOS_EN_DEMO = ("admin",)
@@ -306,13 +321,40 @@ def demo_username() -> str | None:
     esa instancia.
 
     Cuando devuelve `None` la ruta **ni se registra**: en produccion
-    `POST /auth/demo` es un 404 de "no existe", no un 403 de "existe pero no
-    podes". La diferencia importa — un 403 le confirma a quien barre que el
-    endpoint esta ahi.
+    `POST /auth/demo` no existe, y lo que contesta es lo que conteste esa app
+    para una ruta que no tiene — nunca un 403, que le confirmaria a quien barre
+    que el endpoint esta ahi.
+
+    > ⚠️ **Medido el 2026-08-06, y no es lo que decia esta docstring.** En los
+    > productos que sirven la SPA con un catch-all (LibraDesk y compania), una
+    > instancia normal contesta **405**, no 404: el catch-all matchea la ruta
+    > por GET, asi que el POST cae en "metodo no permitido". Da igual para la
+    > seguridad, pero **no** para escribir un chequeo: un 405 es tambien lo que
+    > da una ruta de demo apagada, asi que ese codigo por si solo no distingue
+    > "no hay demo" de "hay demo mal configurada".
     """
     if os.environ.get(DEMO_MODE, "").strip().lower() not in ("1", "true", "yes", "si"):
         return None
     return os.environ.get(DEMO_USERNAME, "").strip() or None
+
+
+def demo_password() -> str | None:
+    """La contrasena conocida del usuario de la demo, si se declaro una.
+
+    Devuelve `None` si esta instancia no es una demo, **aunque
+    `DEMO_PASSWORD` este puesta**. Es el mismo cerrojo que `demo_username()`
+    y por la misma razon: la contrasena debil no puede filtrarse a la
+    instancia de un cliente por copiar un `.env`, porque sin `DEMO_MODE` +
+    `DEMO_USERNAME` esta funcion no la mira.
+
+    Que exista una contrasena tipeable es un pedido explicito del negocio
+    (2026-08-06): pasarle a un cliente potencial `demo.<producto>.com.ar` y
+    decirle "entra con usuario demo y contrasena demo". El boton de auto-login
+    cubre a quien llega solo; esto cubre a quien recibe el dato por telefono.
+    """
+    if not demo_username():
+        return None
+    return os.environ.get(DEMO_PASSWORD, "") or None
 
 
 def build_json_api_auth_router(
@@ -374,12 +416,35 @@ def build_json_api_auth_router(
     def me(user: dict = Depends(json_api_get_current_user)):
         return user
 
-    # `POST /auth/demo` — el boton "Entrar a la demo" de la landing.
+    # `POST /auth/demo` — el boton "Entrar a la demo" de la pantalla de login.
     #
     # Se registra **solo si el consumidor lo pidio Y las dos variables de
-    # entorno estan puestas**. En cualquier otra instancia la ruta no existe:
-    # es un 404, no un 403 (ver `demo_username`).
+    # entorno estan puestas**. En cualquier otra instancia la ruta no existe
+    # (ver `demo_username` para que contesta realmente una app con catch-all).
     if incluir_demo and demo_username():
+        @router.get("/demo", response_model=_DemoInfo)
+        def demo_info():
+            """Le dice al frontend si esta instancia es una demo publica.
+
+            Existe porque el boton **no se puede decidir en tiempo de build**:
+            la imagen de la demo y la del cliente salen del mismo codigo, asi
+            que la pantalla de login tiene que preguntarselo a la instancia.
+
+            🔴 **Devuelve JSON y el frontend tiene que exigir JSON**, no un
+            `200`. En los productos que sirven la SPA con un catch-all, un GET
+            a una ruta inexistente contesta `200` con el `index.html` — o sea
+            que "me contesto 200" es cierto tambien en la instancia de un
+            cliente, y un boton condicionado a eso aparece en todas. Medido el
+            2026-08-06 contra `demo.libradesk.com.ar/auth/inexistente`.
+
+            **No devuelve la contrasena**, aunque `DEMO_PASSWORD` exista y sea
+            publica por diseno: un endpoint sin autenticar que reparte
+            contrasenas es un patron que despues alguien copia a un lugar
+            donde no da lo mismo. El `username` si, porque es lo que el boton
+            necesita mostrar.
+            """
+            return {"enabled": True, "username": demo_username()}
+
         @router.post("/demo", response_model=_UserOut)
         def demo(request: Request, response: Response):
             """Entra a la demo publica sin credenciales.

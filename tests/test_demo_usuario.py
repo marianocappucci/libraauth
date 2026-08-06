@@ -38,6 +38,17 @@ class _Repo:
         self.creados.append(u)
         return u
 
+    def update_password(self, user_id, new_password):
+        # Busca **por id**, como el repositorio real. Si el codigo le pasara el
+        # username —que es el error facil, porque este dict esta indexado
+        # asi— esto revienta en vez de "funcionar" contra una clave
+        # equivocada.
+        for u in self.usuarios.values():
+            if u["id"] == user_id:
+                u["_password"] = new_password
+                return
+        raise AssertionError(f"update_password con un id inexistente: {user_id!r}")
+
 
 @pytest.fixture
 def demo_encendida(monkeypatch):
@@ -193,3 +204,75 @@ def test_no_le_corrige_el_rol_a_un_usuario_que_ya_existe(demo_encendida):
     assert ensure_demo_user(repo) == "visitante"
     assert repo.creados == []
     assert repo.usuarios["visitante"]["role"] == "admin"
+
+
+# ── La contrasena tipeable (`DEMO_PASSWORD`, 2026-08-06) ──────────────────
+#
+# Pedido del negocio: poder decirle a un cliente potencial "entra a
+# demo.<producto>.com.ar con usuario demo y contrasena demo". El boton de
+# auto-login cubre a quien llega solo por la landing; esto cubre a quien
+# recibe el dato por telefono.
+
+def test_con_DEMO_PASSWORD_el_usuario_nuevo_la_usa(demo_encendida, monkeypatch):
+    monkeypatch.setenv("DEMO_PASSWORD", "demo")
+    repo = _Repo()
+    ensure_demo_user(repo)
+
+    assert repo.creados[0]["_password"] == "demo"
+
+
+def test_le_reescribe_la_contrasena_a_un_usuario_que_ya_existe(demo_encendida, monkeypatch):
+    """🔴 El caso real de las seis demos: el usuario ya estaba creado con una
+    contrasena aleatoria cuando se decidio que tenia que ser tipeable. Sin
+    esto, cambiar `DEMO_PASSWORD` en el `.env` no haria nada sobre una
+    instancia ya sembrada y el dato que se le pasa al cliente seria falso —
+    sin ningun error que lo delate."""
+    repo = _Repo({"visitante": {"id": "7", "username": "visitante", "role": "staff",
+                                "active": True, "_password": "aleatoria-vieja"}})
+    monkeypatch.setenv("DEMO_PASSWORD", "demo")
+
+    assert ensure_demo_user(repo) == "visitante"
+    assert repo.usuarios["visitante"]["_password"] == "demo"
+    assert repo.creados == []
+
+
+def test_sin_DEMO_PASSWORD_no_le_toca_la_contrasena_al_que_ya_existe(demo_encendida):
+    """La idempotencia de siempre: sin contrasena declarada no hay nada que
+    converger, y reescribirla con una aleatoria nueva en cada arranque dejaria
+    fuera a cualquiera que ya estuviera adentro."""
+    repo = _Repo({"visitante": {"id": "7", "username": "visitante", "role": "staff",
+                                "active": True, "_password": "aleatoria-vieja"}})
+
+    ensure_demo_user(repo)
+
+    assert repo.usuarios["visitante"]["_password"] == "aleatoria-vieja"
+
+
+def test_DEMO_PASSWORD_sin_DEMO_MODE_no_crea_ni_toca_nada(monkeypatch):
+    """🔴 El mismo cerrojo que las otras dos variables. Es el caso de copiar el
+    `.env` de la demo a la instancia de un cliente: sin `DEMO_MODE` la
+    contrasena debil no llega a ningun usuario."""
+    monkeypatch.delenv("DEMO_MODE", raising=False)
+    monkeypatch.setenv("DEMO_USERNAME", "visitante")
+    monkeypatch.setenv("DEMO_PASSWORD", "demo")
+    repo = _Repo({"visitante": {"id": "7", "username": "visitante", "role": "staff",
+                                "active": True, "_password": "aleatoria-vieja"}})
+
+    assert ensure_demo_user(repo) is None
+    assert repo.usuarios["visitante"]["_password"] == "aleatoria-vieja"
+
+
+def test_una_contrasena_conocida_sobre_un_admin_corta_el_arranque(demo_encendida, monkeypatch):
+    """🔴 El agujero que abre esta feature si no se lo tapa: `POST /auth/demo`
+    se niega a entregar admin, pero **el login normal no tiene ese cerrojo**.
+    Un usuario de demo promovido a admin desde el ABM + una contrasena que
+    esta publicada = cualquiera entra como admin. Se corta el arranque, que es
+    la unica forma de que alguien se entere."""
+    repo = _Repo({"visitante": {"id": "7", "username": "visitante", "role": "admin",
+                                "active": True, "_password": "aleatoria-vieja"}})
+    monkeypatch.setenv("DEMO_PASSWORD", "demo")
+
+    with pytest.raises(RuntimeError, match="ROLES_PROHIBIDOS_EN_DEMO"):
+        ensure_demo_user(repo)
+
+    assert repo.usuarios["visitante"]["_password"] == "aleatoria-vieja"
