@@ -19,11 +19,14 @@ import secrets
 from .repository import UserRepository
 from .session_auth import ROLES_PROHIBIDOS_EN_DEMO, demo_username
 
-#: Rol con el que se crea el usuario de la demo publica. Ver `ensure_demo_user`.
+#: Rol por defecto del usuario de la demo publica. Es el vocabulario de cuatro
+#: de los seis productos (`("admin", "staff")`), pero **no de todos**:
+#: Contalibra usa `("admin", "operador", "cajero")` y Restolibra agrega
+#: `"mozo"`. Por eso `ensure_demo_user` acepta `rol=` — ver su docstring.
 ROL_DEMO = "staff"
 
 
-def ensure_demo_user(repo: "UserRepository") -> str | None:
+def ensure_demo_user(repo: "UserRepository", *, rol: str = ROL_DEMO) -> str | None:
     """Crea el usuario del auto-login de la demo, si la instancia es una demo.
 
     Devuelve el username creado o ya existente, o `None` si esta instancia no
@@ -33,11 +36,21 @@ def ensure_demo_user(repo: "UserRepository") -> str | None:
     "ruta encendida sin usuario" y el par "usuario suelto en la base de un
     cliente", que son las dos formas de que esto salga mal.
 
-    🔴 **Siempre `staff`, nunca admin.** El visitante no tiene que poder entrar
-    a Configuracion, al ABM de usuarios ni al backup: ahi es donde rompe cosas
-    que no se notan hasta el reset, y donde ve partes de la instancia que no
-    son la muestra. El rol esta fijo en el codigo y no sale del entorno para
-    que no haya un `.env` que pueda pedir admin.
+    🔴 **Nunca admin.** El visitante no tiene que poder entrar a Configuracion,
+    al ABM de usuarios ni al backup: ahi es donde rompe cosas que no se notan
+    hasta el reset, y donde ve partes de la instancia que no son la muestra.
+
+    **El rol lo elige el producto, pero NO sale del entorno**, asi que no hay
+    `.env` que pueda pedir admin. Es un parametro y no una constante porque el
+    vocabulario de roles no es el mismo en toda la familia: cuatro productos
+    usan `("admin", "staff")`, pero Contalibra usa
+    `("admin", "operador", "cajero")` y Restolibra agrega `"mozo"`. Con
+    `"staff"` fijo, en esos dos el alta explotaba con
+    `ValueError: invalid role: 'staff'` — lo encontro el bump del 2026-08-06.
+
+    Un rol que el producto no conoce **corta el arranque con un mensaje que
+    nombra los validos**, en vez de dejar la instancia sin usuario de demo y
+    que el 503 aparezca recien cuando alguien toque el boton.
 
     La contrasena es aleatoria y **no se imprime**: nadie la necesita: al
     usuario de la demo se entra por `POST /auth/demo`, no tipeandola. Que sea
@@ -51,20 +64,26 @@ def ensure_demo_user(repo: "UserRepository") -> str | None:
     username = demo_username()
     if not username:
         return None
+    if rol in ROLES_PROHIBIDOS_EN_DEMO:
+        raise RuntimeError(
+            f"rol={rol!r} esta en ROLES_PROHIBIDOS_EN_DEMO: el usuario que se "
+            "crearia no podria entrar nunca por POST /auth/demo."
+        )
+    validos = getattr(repo, "roles", ())
+    if validos and rol not in validos:
+        raise RuntimeError(
+            f"rol={rol!r} no existe en este producto. Los validos son "
+            f"{validos}. Pasar `rol=` a ensure_demo_user()."
+        )
     if repo.get_by_username(username):
         return username
-    if ROL_DEMO in ROLES_PROHIBIDOS_EN_DEMO:  # pragma: no cover - contradiccion interna
-        raise RuntimeError(
-            f"ROL_DEMO={ROL_DEMO!r} esta en ROLES_PROHIBIDOS_EN_DEMO: "
-            "el usuario que se crearia no podria entrar nunca."
-        )
     repo.create(
         username=username,
         name=os.environ.get("DEMO_NAME", "Visitante de la demo"),
         password=secrets.token_urlsafe(24),
-        role=ROL_DEMO,
+        role=rol,
     )
-    print(f"[INFO] Usuario de demo '{username}' creado con rol {ROL_DEMO}.")
+    print(f"[INFO] Usuario de demo '{username}' creado con rol {rol}.")
     return username
 
 
