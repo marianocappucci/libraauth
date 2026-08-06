@@ -132,6 +132,58 @@ def test_correrlo_dos_veces_no_duplica(demo_encendida):
     assert len(repo.creados) == 1
 
 
+# ── 🔴 El rol lo elige el producto, y se valida ───────────────────────────
+
+class _RepoConRoles(_Repo):
+    """Como el de Contalibra: `("admin", "operador", "cajero")`. **No tiene
+    `staff`** — que era el default fijo del motor hasta el 2026-08-06."""
+
+    roles = ("admin", "operador", "cajero")
+
+
+def test_un_producto_con_otro_vocabulario_pasa_su_rol(demo_encendida):
+    repo = _RepoConRoles()
+
+    assert ensure_demo_user(repo, rol="operador") == "visitante"
+    assert repo.creados[0]["role"] == "operador"
+
+
+def test_un_rol_que_el_producto_no_conoce_corta_el_arranque(demo_encendida):
+    """🔴 Ruidoso a propósito. Con el `staff` fijo, en Contalibra el alta moría
+    con `ValueError: invalid role: 'staff'` desde adentro del repositorio; el
+    mensaje no decía qué hacer. Y si en cambio se hubiera tragado el error, la
+    instancia habría quedado sin usuario de demo y el 503 habría aparecido
+    recién cuando alguien tocara el botón."""
+    with pytest.raises(RuntimeError, match="no existe en este producto"):
+        ensure_demo_user(_RepoConRoles())
+
+
+def test_el_mensaje_nombra_los_roles_validos(demo_encendida):
+    """Sin eso hay que ir a buscar el vocabulario al código del producto."""
+    with pytest.raises(RuntimeError) as e:
+        ensure_demo_user(_RepoConRoles())
+
+    assert "operador" in str(e.value)
+    assert "cajero" in str(e.value)
+
+
+def test_pedir_un_rol_prohibido_corta_el_arranque(demo_encendida):
+    """La otra mitad: pedir admin explícitamente tampoco pasa."""
+    with pytest.raises(RuntimeError, match="ROLES_PROHIBIDOS_EN_DEMO"):
+        ensure_demo_user(_RepoConRoles(), rol="admin")
+
+
+def test_el_rol_se_valida_aunque_el_usuario_ya_exista(demo_encendida):
+    """La validación va **antes** del corte por idempotencia. Si fuera después,
+    una instancia mal configurada arrancaría en silencio a partir del segundo
+    arranque y el error se volvería intermitente."""
+    repo = _RepoConRoles({"visitante": {"username": "visitante", "role": "operador",
+                                        "active": True}})
+
+    with pytest.raises(RuntimeError, match="no existe en este producto"):
+        ensure_demo_user(repo)
+
+
 def test_no_le_corrige_el_rol_a_un_usuario_que_ya_existe(demo_encendida):
     """🔴 Si alguien promovio al usuario de la demo a admin desde el ABM,
     corregirlo acá en silencio taparia el caso que `POST /auth/demo` tiene que
