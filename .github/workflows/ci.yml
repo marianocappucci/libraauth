@@ -7,6 +7,14 @@ on:
   pull_request:
     branches: [develop, main]
 
+# Una sola corrida viva por rama. Si entra un push nuevo mientras esta
+# corriendo, se cancela la anterior en vez de pagar las dos: su resultado ya
+# no le sirve a nadie, porque reporta sobre un codigo que no es el que quedo
+# en la rama.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
