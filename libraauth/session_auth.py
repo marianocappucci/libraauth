@@ -84,13 +84,22 @@ class SessionAuth:
         return user
 
     def require_admin(self, request: Request) -> dict:
+        """Rol admin en las rutas HTML (redirige, no devuelve 403).
+
+        Misma excepción de lectura que los guards JSON: el visitante de una
+        demo pública pasa **sólo** con métodos de lectura. Sin esto la demo
+        quedaba incoherente — veía la pantalla de Libros de IVA, que su API ya
+        le permite, y el botón de exportar lo mandaba al dashboard.
+        """
         username = self.get_current_user(request)
         if not username:
             raise HTTPException(status_code=307, headers={"Location": "/login"})
         user = self._get_user_by_username(username)
-        if not user or user.get("role") != "admin":
-            raise HTTPException(status_code=307, headers={"Location": "/dashboard"})
-        return user
+        if user and user.get("role") == "admin":
+            return user
+        if user and permite_lectura_de_demo(request, user):
+            return user
+        raise HTTPException(status_code=307, headers={"Location": "/dashboard"})
 
     def require_role(self, *roles: str):
         """Factory de dependencia: exige que el usuario logueado tenga uno
@@ -101,9 +110,13 @@ class SessionAuth:
             if not username:
                 raise HTTPException(status_code=307, headers={"Location": "/login"})
             user = self._get_user_by_username(username)
-            if not user or user.get("role") not in roles:
-                raise HTTPException(status_code=307, headers={"Location": "/dashboard"})
-            return user
+            if user and user.get("role") in roles:
+                return user
+            # Misma excepción de lectura que los guards JSON: sin ella el
+            # visitante ve la pantalla y el botón de exportar lo expulsa.
+            if user and permite_lectura_de_demo(request, user):
+                return user
+            raise HTTPException(status_code=307, headers={"Location": "/dashboard"})
 
         return _dep
 

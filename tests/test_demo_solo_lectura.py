@@ -226,3 +226,70 @@ def test_el_auto_login_devuelve_la_bandera(demo_encendida):
     cliente = _app()
 
     assert cliente.post("/auth/demo").json()["demo_readonly"] is True
+
+
+# ── Los guards HTML (rutas server-rendered de Contalibra/Restolibra) ───────
+#
+# 🔴 Son un camino aparte: `SessionAuth.require_role` **redirige** (307) en vez
+# de contestar 403, y de él cuelgan los exports CSV y los PDF que esos dos
+# productos todavía sirven como HTML. Con la excepción sólo en los guards JSON,
+# el visitante veía la pantalla de Libros de IVA y el botón de exportar lo
+# mandaba al dashboard. Medido contra la demo, no supuesto.
+
+def _app_html(cookie_de=None):
+    """App con rutas gateadas por los guards HTML de `SessionAuth`."""
+    app = FastAPI()
+    usuarios = _Usuarios()
+    auth = SessionAuth(
+        dev_secret_fallback="test-secret",
+        get_user_by_username=usuarios.get_by_username,
+        check_credentials=usuarios.check_credentials,
+        cookie_name="test_session",
+    )
+
+    @app.get("/export", dependencies=[Depends(auth.require_role("admin"))])
+    def exportar():
+        return {"csv": "ok"}
+
+    @app.post("/export", dependencies=[Depends(auth.require_role("admin"))])
+    def regenerar():
+        return {"regenerado": True}
+
+    @app.get("/panel", dependencies=[Depends(auth.require_admin)])
+    def panel():
+        return {"panel": "ok"}
+
+    cliente = TestClient(app, base_url="https://testserver", follow_redirects=False)
+    if cookie_de:
+        # La cookie se firma con el mismo secreto que valida el guard.
+        cliente.cookies.set("test_session", auth._signer.dumps(cookie_de))
+    return cliente
+
+
+def test_el_visitante_puede_exportar(demo_encendida):
+    assert _app_html("demo").get("/export").status_code == 200
+
+
+def test_el_visitante_ve_el_panel_html(demo_encendida):
+    assert _app_html("demo").get("/panel").status_code == 200
+
+
+def test_el_visitante_no_puede_escribir_en_una_ruta_html(demo_encendida):
+    """La mitad que sostiene todo: la excepción es de LECTURA. Un POST sigue
+    yéndose al dashboard."""
+    r = _app_html("demo").post("/export")
+    assert r.status_code == 307
+    assert r.headers["Location"] == "/dashboard"
+
+
+def test_otro_staff_no_exporta(demo_encendida):
+    """Se abre para el visitante, no para el rol."""
+    r = _app_html("ana").get("/export")
+    assert r.status_code == 307
+
+
+def test_fuera_de_una_demo_el_visitante_tampoco_exporta(monkeypatch):
+    monkeypatch.delenv("DEMO_MODE", raising=False)
+    monkeypatch.delenv("DEMO_USERNAME", raising=False)
+    r = _app_html("demo").get("/export")
+    assert r.status_code == 307
