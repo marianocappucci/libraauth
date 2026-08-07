@@ -131,6 +131,12 @@ class _UserOut(BaseModel):
     name: str
     role: str
     active: bool
+    #: `True` sólo para el visitante de una demo publica. Es lo que le permite
+    #: al frontend mostrarle **todos** los menus —incluidos los de
+    #: administracion— sin mentir sobre su rol: el rol sigue siendo el que es,
+    #: y los botones de escritura se siguen gateando por rol. Ver
+    #: `json_api_require_role`.
+    demo_readonly: bool = False
 
 
 # Solo para `POST /auth/verify` (opt-in, ver build_json_api_auth_router).
@@ -217,14 +223,59 @@ def json_api_get_current_user(
     return user
 
 
+#: Metodos HTTP que sólo leen. El visitante de la demo pasa los cerrojos de rol
+#: unicamente con estos: puede **ver** todo el sistema, no tocarlo.
+_METODOS_DE_LECTURA = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _con_bandera_demo(user: dict) -> dict:
+    """El usuario, más `demo_readonly` si es el visitante de una demo.
+
+    Va en la respuesta y no en la base: la bandera **depende del entorno de la
+    instancia**, no de la fila. La misma fila copiada a la base de un cliente
+    —por un restore, por ejemplo— no la lleva puesta.
+    """
+    return {**user, "demo_readonly": es_visitante_de_demo(user)}
+
+
+def es_visitante_de_demo(user: dict | None) -> bool:
+    """Si este usuario es el visitante de una demo publica.
+
+    Devuelve `False` en cualquier instancia que no sea una demo, porque
+    `demo_username()` ya devuelve `None` ahi — no alcanza con que el usuario se
+    llame igual.
+    """
+    nombre = demo_username()
+    return bool(nombre and user and user.get("username") == nombre)
+
+
 def json_api_require_role(*roles: str):
     """Dependency factory: 403 JSON a menos que el usuario logueado tenga
-    uno de esos roles."""
+    uno de esos roles.
 
-    def _dependency(user: dict = Depends(json_api_get_current_user)) -> dict:
-        if user["role"] not in roles:
-            raise HTTPException(403, "forbidden")
-        return user
+    **Excepcion: el visitante de la demo pasa, pero sólo para leer**
+    (2026-08-06, pedido del humano: *"que muestre todos los menus y todas las
+    opciones como si fuera admin aunque no deje modificar esas cosas"*).
+
+    🔴 **Por que no alcanzaba con darle un rol mas alto.** El auto-login se
+    niega a entregar `admin` —y con `DEMO_PASSWORD` puesta, el arranque corta si
+    el usuario de demo quedo admin—, asi que la unica forma de que vea las
+    pantallas de administracion sin volverse administrador es esta: el rol
+    sigue siendo el que es, y lo que se abre es la **lectura**.
+
+    Lo que esto NO abre: cualquier POST/PUT/PATCH/DELETE sigue exigiendo el
+    rol. El visitante ve Configuracion, usuarios y logs; no puede guardar,
+    borrar ni crear en ninguno.
+    """
+
+    def _dependency(
+        request: Request, user: dict = Depends(json_api_get_current_user),
+    ) -> dict:
+        if user["role"] in roles:
+            return user
+        if request.method in _METODOS_DE_LECTURA and es_visitante_de_demo(user):
+            return user
+        raise HTTPException(403, "forbidden")
 
     return _dependency
 
@@ -399,7 +450,7 @@ def build_json_api_auth_router(
             raise HTTPException(401, "invalid credentials")
         json_api_get_session_auth(request).create_session_cookie(response, user["username"])
         registrar_seguro(request, LOGIN, user["username"])
-        return user
+        return _con_bandera_demo(user)
 
     @router.post("/logout")
     def logout(request: Request, response: Response):
@@ -414,7 +465,7 @@ def build_json_api_auth_router(
 
     @router.get("/me", response_model=_UserOut)
     def me(user: dict = Depends(json_api_get_current_user)):
-        return user
+        return _con_bandera_demo(user)
 
     # `POST /auth/demo` — el boton "Entrar a la demo" de la pantalla de login.
     #
@@ -472,7 +523,7 @@ def build_json_api_auth_router(
                 raise HTTPException(503, "demo user has a forbidden role")
             json_api_get_session_auth(request).create_session_cookie(response, user["username"])
             registrar_seguro(request, LOGIN, user["username"])
-            return user
+            return _con_bandera_demo(user)
 
     if incluir_verify:
         @router.post("/verify", response_model=_VerifyResponse)
