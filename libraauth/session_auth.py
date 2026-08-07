@@ -228,6 +228,19 @@ def json_api_get_current_user(
 _METODOS_DE_LECTURA = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
+def permite_lectura_de_demo(request: Request, user: dict | None) -> bool:
+    """Si este pedido es "el visitante de la demo mirando", y por lo tanto
+    puede pasar un cerrojo de rol.
+
+    Existe como funcion publica porque **hay productos con su propio guard**:
+    Contalibra y Restolibra tienen `require_role_json` en su `api_auth.py` y no
+    pasan por `json_api_require_role`. Que la regla viva acá evita que la
+    copien —y que dentro de un mes uno de los dos tenga una version distinta de
+    "que puede ver un visitante".
+    """
+    return request.method in _METODOS_DE_LECTURA and es_visitante_de_demo(user)
+
+
 def _con_bandera_demo(user: dict) -> dict:
     """El usuario, más `demo_readonly` si es el visitante de una demo.
 
@@ -340,9 +353,16 @@ def json_api_require_admin_o_servicio(request: Request) -> dict:
     if token_de_servicio_valido(request):
         return dict(SERVICE_USER)
     usuario = json_api_get_current_user(request, request.app.state.session_auth)
-    if usuario["role"] != "admin":
-        raise HTTPException(403, "forbidden")
-    return usuario
+    if usuario["role"] == "admin":
+        return usuario
+    # Misma excepción de lectura que `json_api_require_role`. Hace falta acá
+    # aparte porque este guard **no pasa por aquél**: el router de usuarios de
+    # los seis productos cuelga de éste, y con la excepción sólo en el otro el
+    # visitante veía `403` justo en la pantalla de Usuarios. Lo encontró
+    # probarlo contra la demo desplegada, no la suite.
+    if request.method in _METODOS_DE_LECTURA and es_visitante_de_demo(usuario):
+        return usuario
+    raise HTTPException(403, "forbidden")
 
 
 #: Variable de entorno que enciende `POST /auth/demo`.

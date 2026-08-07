@@ -28,6 +28,7 @@ from libraauth.session_auth import (
     SessionAuth,
     build_json_api_auth_router,
     json_api_require_admin,
+    json_api_require_admin_o_servicio,
 )
 
 
@@ -91,6 +92,18 @@ def _app():
     def borrar_config():
         return {"borrado": True}
 
+    # El router de usuarios de los seis productos NO cuelga de `require_admin`
+    # sino de éste, que acepta además el token de servicio del backoffice. Es
+    # un camino distinto y por eso se prueba aparte: con la excepción sólo en
+    # el otro guard, el visitante veía 403 justo en la pantalla de Usuarios.
+    @app.get("/usuarios", dependencies=[Depends(json_api_require_admin_o_servicio)])
+    def listar_usuarios():
+        return [{"username": "admin"}]
+
+    @app.post("/usuarios", dependencies=[Depends(json_api_require_admin_o_servicio)])
+    def crear_usuario():
+        return {"creado": True}
+
     return TestClient(app, base_url="https://testserver")
 
 
@@ -126,6 +139,26 @@ def test_el_visitante_no_puede_borrar(demo_encendida):
     _entrar(cliente, "demo", "demo")
 
     assert cliente.delete("/config").status_code == 403
+
+
+def test_el_visitante_ve_la_pantalla_de_usuarios(demo_encendida):
+    """🔴 Camino distinto: el router de usuarios cuelga de
+    `require_admin_o_servicio`, no de `require_admin`. Con la excepción sólo en
+    el otro guard, el visitante veía 403 justo en esa pantalla — y lo encontró
+    probarlo contra la demo desplegada, no la suite."""
+    cliente = _app()
+    _entrar(cliente, "demo", "demo")
+
+    assert cliente.get("/usuarios").status_code == 200
+
+
+def test_el_visitante_no_puede_crear_usuarios(demo_encendida):
+    """La otra mitad, y la que importa: ver la lista de usuarios de una demo es
+    inocuo; poder darse de alta uno, no."""
+    cliente = _app()
+    _entrar(cliente, "demo", "demo")
+
+    assert cliente.post("/usuarios").status_code == 403
 
 
 # ── 🔴 Sólo en una demo, y sólo ese usuario ────────────────────────────────
