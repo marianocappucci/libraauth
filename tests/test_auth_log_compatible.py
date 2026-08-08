@@ -30,7 +30,9 @@ from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.schema import CreateTable
 
 from libraauth.models import AuthEvent, Base
 
@@ -244,3 +246,45 @@ def test_una_fila_vieja_sigue_siendo_legible_por_el_ORM(tmp_path):
     assert evento.evento == "login"
     assert evento.username == "de-antes"
     assert evento.ip == "1.1.1.1"
+
+
+# --- el mismo DEFAULT, en los dos motores ------------------------------------
+
+def _ddl_de_ts(dialecto) -> str:
+    """La linea de `ts` del CREATE TABLE, tal como la veria ese motor."""
+    ddl = str(CreateTable(AuthEvent.__table__).compile(dialect=dialecto))
+    lineas = [l.strip() for l in ddl.splitlines() if l.strip().startswith("ts ")]
+    assert len(lineas) == 1, f"se esperaba una sola linea de `ts`, salieron {lineas}"
+    return lineas[0]
+
+
+def test_en_sqlite_el_default_sigue_siendo_el_literal_de_libracore():
+    """Lo que NO puede cambiar.
+
+    `libracore.db.schema` crea esta misma tabla con
+    `DEFAULT (datetime('now','localtime'))`. Si el DDL de este paquete dejara
+    de emitir exactamente eso, las bases donde escriben los dos lados podrian
+    quedar con la mitad de los eventos en otro huso — el punto 2 del docstring
+    de arriba. Por eso se compara la linea entera y no un `in`.
+    """
+    assert _ddl_de_ts(sqlite.dialect()) == \
+        "ts DATETIME DEFAULT (datetime('now','localtime')) NOT NULL,"
+
+
+def test_en_postgres_el_default_es_localtimestamp_y_no_la_funcion_de_sqlite():
+    """🔴 `datetime('now','localtime')` no existe en PostgreSQL.
+
+    Estaba escrito como `text(...)`, o sea SQLite puro, y contra PostgreSQL el
+    `CREATE TABLE` moria con *"function datetime(unknown, unknown) does not
+    exist"* — la instancia no arrancaba. Lo encontro el gate PostgreSQL del
+    piloto LibraDesk el 2026-08-08, despues de que la cadena de migraciones del
+    producto ya pasara entera.
+
+    `LOCALTIMESTAMP` es el equivalente: timestamp sin zona, en hora local. Se
+    exige ademas que no quede rastro de la funcion de SQLite, que es la forma
+    concreta en que esto se rompio.
+    """
+    linea = _ddl_de_ts(postgresql.dialect())
+
+    assert linea == "ts TIMESTAMP WITHOUT TIME ZONE DEFAULT LOCALTIMESTAMP NOT NULL,"
+    assert "datetime(" not in linea

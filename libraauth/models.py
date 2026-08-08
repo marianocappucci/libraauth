@@ -9,13 +9,67 @@ propias tablas.
 from datetime import datetime
 
 from sqlalchemy import (
-    Boolean, DateTime, ForeignKey, Integer, String, Text, func, text,
+    Boolean, DateTime, ForeignKey, Integer, String, Text, func,
 )
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.sql.functions import FunctionElement
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class ahora_local(FunctionElement):
+    """La hora **local** como DEFAULT de tabla, en el dialecto que sea.
+
+    Existe por una sola columna, `auth_log.ts`, pero el motivo es fuerte: esa
+    tabla la escriben DOS lados —el ORM de este paquete y un `INSERT` crudo sin
+    `ts` de `libracore.db.logs`, que se apoya en el DEFAULT—, y las dos mitades
+    tienen que quedar en la misma zona horaria o el log de accesos sale con
+    parte de los eventos corridos tres horas y mal ordenados entre si. Ver el
+    comentario largo en `AuthLog.ts`.
+
+    Estaba escrito como `text("(datetime('now','localtime'))")`, que es SQLite
+    puro: contra PostgreSQL el `CREATE TABLE` falla con *"function
+    datetime(unknown, unknown) does not exist"* y la instancia no arranca. Lo
+    encontro el gate PostgreSQL del piloto LibraDesk el 2026-08-08.
+
+    Como funcion compilada por dialecto, cada motor recibe su forma:
+
+    - **SQLite** — `(datetime('now','localtime'))`, byte por byte lo que se
+      emitia antes. Las bases que ya existen no ven ninguna diferencia.
+    - **PostgreSQL** — `LOCALTIMESTAMP`, el equivalente directo: timestamp sin
+      zona, en hora local.
+
+    > ⚠️ En PostgreSQL "local" es la zona **de la sesion del servidor**
+    > (`TimeZone`), no la del contenedor de la aplicacion. Con un sidecar por
+    > instancia son el mismo host y coinciden si el contenedor de la base tiene
+    > su `TZ` puesto; si algun dia no lo tuviera, los DEFAULT saldrian en UTC y
+    > los `default=datetime.now` de Python en local — que es exactamente la
+    > mezcla que esta clase existe para evitar. **Verificarlo al armar el
+    > sidecar**, no asumirlo.
+    """
+
+    type = DateTime()
+    inherit_cache = True
+
+
+@compiles(ahora_local, "sqlite")
+def _ahora_local_sqlite(element, compiler, **kw) -> str:
+    return "(datetime('now','localtime'))"
+
+
+@compiles(ahora_local, "postgresql")
+def _ahora_local_postgresql(element, compiler, **kw) -> str:
+    return "LOCALTIMESTAMP"
+
+
+@compiles(ahora_local)
+def _ahora_local_default(element, compiler, **kw) -> str:
+    # Cualquier otro motor: el estandar SQL. Ningun producto de la familia usa
+    # uno hoy, y fallar aca por no tener rama seria peor que emitir esto.
+    return "LOCALTIMESTAMP"
 
 
 class Usuario(Base):
@@ -112,9 +166,13 @@ class AuthEvent(Base):
     # el `localtime`: con `func.now()` (que en SQLite es UTC) una base escrita
     # desde los dos lados quedaria con la mitad de los eventos tres horas
     # corridos.
+    #
+    # Se emite via `ahora_local()` y no como `text(...)` para que el mismo
+    # DEFAULT exista tambien en PostgreSQL — en SQLite el DDL resultante no
+    # cambia. Ver el docstring de esa clase, arriba.
     ts: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.now,
-        server_default=text("(datetime('now','localtime'))"),
+        server_default=ahora_local(),
     )
     evento: Mapped[str] = mapped_column(String(50), nullable=False)
     username: Mapped[str] = mapped_column(String(100), nullable=False)
