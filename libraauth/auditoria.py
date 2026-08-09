@@ -105,9 +105,42 @@ class ActividadLog(AuditoriaBase):
     usuario: Mapped[str] = mapped_column(String(100), nullable=False, default=SISTEMA)
     accion: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     entidad: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
-    entidad_id: Mapped[int | None] = mapped_column(Integer)
+    #: 🔴 **Texto, no entero.** Se llena con el id de la entidad auditada, y en
+    #: esta familia los ids son heterogeneos: enteros en LibraDesk y VentaLibra,
+    #: cadenas en MedLibra (`patient-1`), Gestiolibra y LibraGenda.
+    #:
+    #: Estuvo declarada `Integer` hasta el 2026-08-09 y **SQLite lo venia
+    #: tapando**: por tipado dinamico guarda texto en una columna INTEGER sin
+    #: decir nada. Medido ese dia en produccion, la columna ya tenia mas texto
+    #: que enteros -- 48 de 86 filas en la demo de Gestiolibra, 58 de 95 en la
+    #: de MedLibra. El tipo declarado nunca describio lo que habia adentro.
+    #:
+    #: Contra PostgreSQL no hay tipado dinamico: `invalid input syntax for type
+    #: integer`. Y como el log se escribe en la MISMA transaccion que la
+    #: operacion auditada, no se perdia una fila de auditoria -- **el alta
+    #: entera devolvia 500**.
+    #:
+    #: Se puede cambiar sin consecuencias porque la columna se usa en un solo
+    #: lugar, serializada para mostrarla: ni filtros, ni joins, ni orden.
+    entidad_id: Mapped[str | None] = mapped_column(String(100))
     descripcion: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     cambios: Mapped[str | None] = mapped_column(Text)
+
+
+def _id_como_texto(obj: object) -> str | None:
+    """El id de la entidad auditada, como texto.
+
+    La conversion es explicita y no implicita a proposito. `entidad_id` es una
+    columna de texto y los ids de LibraDesk y VentaLibra son enteros: dejar que
+    el driver los adapte solo funciona hasta que deja de funcionar, y falla en
+    el momento mas caro -- dentro de la transaccion de una escritura real.
+
+    Un `0` es un id valido, asi que la guarda mira `is None` y no la verdad del
+    valor: con un `if not id` se perderia el id de la primera fila de cualquier
+    tabla que empiece en cero.
+    """
+    valor = getattr(obj, "id", None)
+    return None if valor is None else str(valor)
 
 
 # Columnas que nunca entran al diff, en cualquier producto. Un log de auditoria
@@ -279,7 +312,7 @@ def configurar_auditoria(
                 fila = _fila(obj, BORRAR, None)
                 # El id se lee ACA y no despues: tras el flush el objeto queda
                 # desatachado y `obj.id` puede venir vacio.
-                fila["entidad_id"] = getattr(obj, "id", None)
+                fila["entidad_id"] = _id_como_texto(obj)
                 fila["_obj"] = None
                 pendientes.append(fila)
         if pendientes:
@@ -293,7 +326,7 @@ def configurar_auditoria(
         for fila in pendientes:
             obj = fila.pop("_obj", None)
             if obj is not None:
-                fila["entidad_id"] = getattr(obj, "id", None)
+                fila["entidad_id"] = _id_como_texto(obj)
             filas.append(fila)
         # Core y no ORM: `session.add()` aca no entraria en este flush, y
         # volveria a disparar estos mismos listeners.
