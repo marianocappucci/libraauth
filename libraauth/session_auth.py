@@ -84,13 +84,22 @@ class SessionAuth:
         return user
 
     def require_admin(self, request: Request) -> dict:
+        """Rol admin en las rutas HTML (redirige, no devuelve 403).
+
+        Misma excepción de lectura que los guards JSON: el visitante de una
+        demo pública pasa **sólo** con métodos de lectura. Sin esto la demo
+        quedaba incoherente — veía la pantalla de Libros de IVA, que su API ya
+        le permite, y el botón de exportar lo mandaba al dashboard.
+        """
         username = self.get_current_user(request)
         if not username:
             raise HTTPException(status_code=307, headers={"Location": "/login"})
         user = self._get_user_by_username(username)
-        if not user or user.get("role") != "admin":
-            raise HTTPException(status_code=307, headers={"Location": "/dashboard"})
-        return user
+        if user and user.get("role") == "admin":
+            return user
+        if user and permite_lectura_de_demo(request, user):
+            return user
+        raise HTTPException(status_code=307, headers={"Location": "/dashboard"})
 
     def require_role(self, *roles: str):
         """Factory de dependencia: exige que el usuario logueado tenga uno
@@ -101,9 +110,13 @@ class SessionAuth:
             if not username:
                 raise HTTPException(status_code=307, headers={"Location": "/login"})
             user = self._get_user_by_username(username)
-            if not user or user.get("role") not in roles:
-                raise HTTPException(status_code=307, headers={"Location": "/dashboard"})
-            return user
+            if user and user.get("role") in roles:
+                return user
+            # Misma excepción de lectura que los guards JSON: sin ella el
+            # visitante ve la pantalla y el botón de exportar lo expulsa.
+            if user and permite_lectura_de_demo(request, user):
+                return user
+            raise HTTPException(status_code=307, headers={"Location": "/dashboard"})
 
         return _dep
 
@@ -131,6 +144,12 @@ class _UserOut(BaseModel):
     name: str
     role: str
     active: bool
+    #: `True` sólo para el visitante de una demo publica. Es lo que le permite
+    #: al frontend mostrarle **todos** los menus —incluidos los de
+    #: administracion— sin mentir sobre su rol: el rol sigue siendo el que es,
+    #: y los botones de escritura se siguen gateando por rol. Ver
+    #: `json_api_require_role`.
+    demo_readonly: bool = False
 
 
 # Solo para `POST /auth/verify` (opt-in, ver build_json_api_auth_router).
@@ -141,6 +160,15 @@ class _VerifyRequest(BaseModel):
 
 class _VerifyResponse(BaseModel):
     valid: bool
+
+
+class _DemoInfo(BaseModel):
+    """Respuesta de `GET /auth/demo`. `enabled` es siempre `True`: la ruta no
+    se registra fuera de una demo, asi que un `False` no puede existir. Esta
+    igual porque el frontend valida **la forma**, y una clave booleana
+    explicita es lo que distingue este JSON de cualquier otro `200`."""
+    enabled: bool
+    username: str
 
 
 # Solo para el par de endpoints de recuperacion (opt-in, ver
@@ -208,14 +236,72 @@ def json_api_get_current_user(
     return user
 
 
+#: Metodos HTTP que sólo leen. El visitante de la demo pasa los cerrojos de rol
+#: unicamente con estos: puede **ver** todo el sistema, no tocarlo.
+_METODOS_DE_LECTURA = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def permite_lectura_de_demo(request: Request, user: dict | None) -> bool:
+    """Si este pedido es "el visitante de la demo mirando", y por lo tanto
+    puede pasar un cerrojo de rol.
+
+    Existe como funcion publica porque **hay productos con su propio guard**:
+    Contalibra y Restolibra tienen `require_role_json` en su `api_auth.py` y no
+    pasan por `json_api_require_role`. Que la regla viva acá evita que la
+    copien —y que dentro de un mes uno de los dos tenga una version distinta de
+    "que puede ver un visitante".
+    """
+    return request.method in _METODOS_DE_LECTURA and es_visitante_de_demo(user)
+
+
+def _con_bandera_demo(user: dict) -> dict:
+    """El usuario, más `demo_readonly` si es el visitante de una demo.
+
+    Va en la respuesta y no en la base: la bandera **depende del entorno de la
+    instancia**, no de la fila. La misma fila copiada a la base de un cliente
+    —por un restore, por ejemplo— no la lleva puesta.
+    """
+    return {**user, "demo_readonly": es_visitante_de_demo(user)}
+
+
+def es_visitante_de_demo(user: dict | None) -> bool:
+    """Si este usuario es el visitante de una demo publica.
+
+    Devuelve `False` en cualquier instancia que no sea una demo, porque
+    `demo_username()` ya devuelve `None` ahi — no alcanza con que el usuario se
+    llame igual.
+    """
+    nombre = demo_username()
+    return bool(nombre and user and user.get("username") == nombre)
+
+
 def json_api_require_role(*roles: str):
     """Dependency factory: 403 JSON a menos que el usuario logueado tenga
-    uno de esos roles."""
+    uno de esos roles.
 
-    def _dependency(user: dict = Depends(json_api_get_current_user)) -> dict:
-        if user["role"] not in roles:
-            raise HTTPException(403, "forbidden")
-        return user
+    **Excepcion: el visitante de la demo pasa, pero sólo para leer**
+    (2026-08-06, pedido del humano: *"que muestre todos los menus y todas las
+    opciones como si fuera admin aunque no deje modificar esas cosas"*).
+
+    🔴 **Por que no alcanzaba con darle un rol mas alto.** El auto-login se
+    niega a entregar `admin` —y con `DEMO_PASSWORD` puesta, el arranque corta si
+    el usuario de demo quedo admin—, asi que la unica forma de que vea las
+    pantallas de administracion sin volverse administrador es esta: el rol
+    sigue siendo el que es, y lo que se abre es la **lectura**.
+
+    Lo que esto NO abre: cualquier POST/PUT/PATCH/DELETE sigue exigiendo el
+    rol. El visitante ve Configuracion, usuarios y logs; no puede guardar,
+    borrar ni crear en ninguno.
+    """
+
+    def _dependency(
+        request: Request, user: dict = Depends(json_api_get_current_user),
+    ) -> dict:
+        if user["role"] in roles:
+            return user
+        if request.method in _METODOS_DE_LECTURA and es_visitante_de_demo(user):
+            return user
+        raise HTTPException(403, "forbidden")
 
     return _dependency
 
@@ -280,13 +366,84 @@ def json_api_require_admin_o_servicio(request: Request) -> dict:
     if token_de_servicio_valido(request):
         return dict(SERVICE_USER)
     usuario = json_api_get_current_user(request, request.app.state.session_auth)
-    if usuario["role"] != "admin":
-        raise HTTPException(403, "forbidden")
-    return usuario
+    if usuario["role"] == "admin":
+        return usuario
+    # Misma excepción de lectura que `json_api_require_role`. Hace falta acá
+    # aparte porque este guard **no pasa por aquél**: el router de usuarios de
+    # los seis productos cuelga de éste, y con la excepción sólo en el otro el
+    # visitante veía `403` justo en la pantalla de Usuarios. Lo encontró
+    # probarlo contra la demo desplegada, no la suite.
+    if request.method in _METODOS_DE_LECTURA and es_visitante_de_demo(usuario):
+        return usuario
+    raise HTTPException(403, "forbidden")
+
+
+#: Variable de entorno que enciende `POST /auth/demo`.
+DEMO_MODE = "DEMO_MODE"
+
+#: Con que usuario entra el visitante de la demo.
+DEMO_USERNAME = "DEMO_USERNAME"
+
+#: Contrasena **conocida** del usuario de la demo, para poder decirle a un
+#: cliente potencial "entra con demo/demo". Opcional: sin esto el usuario se
+#: crea con una contrasena aleatoria y solo se entra por `POST /auth/demo`.
+#: Ver `demo_password()` y `bootstrap.ensure_demo_user`.
+DEMO_PASSWORD = "DEMO_PASSWORD"
+
+#: Roles que el auto-login **nunca** entrega, por mas que el usuario nombrado
+#: en `DEMO_USERNAME` los tenga. Ver `demo_username`.
+ROLES_PROHIBIDOS_EN_DEMO = ("admin",)
+
+
+def demo_username() -> str | None:
+    """El usuario del auto-login, o `None` si la demo no esta encendida.
+
+    🔴 **Son DOS cerrojos y es a proposito**: hace falta `DEMO_MODE` encendido
+    *y* `DEMO_USERNAME` con un nombre. Un solo flag booleano se prende por
+    accidente al copiar un `.env` de una instancia a otra; que ademas haya que
+    nombrar al usuario obliga a que alguien haya pensado en ese usuario para
+    esa instancia.
+
+    Cuando devuelve `None` la ruta **ni se registra**: en produccion
+    `POST /auth/demo` no existe, y lo que contesta es lo que conteste esa app
+    para una ruta que no tiene — nunca un 403, que le confirmaria a quien barre
+    que el endpoint esta ahi.
+
+    > ⚠️ **Medido el 2026-08-06, y no es lo que decia esta docstring.** En los
+    > productos que sirven la SPA con un catch-all (LibraDesk y compania), una
+    > instancia normal contesta **405**, no 404: el catch-all matchea la ruta
+    > por GET, asi que el POST cae en "metodo no permitido". Da igual para la
+    > seguridad, pero **no** para escribir un chequeo: un 405 es tambien lo que
+    > da una ruta de demo apagada, asi que ese codigo por si solo no distingue
+    > "no hay demo" de "hay demo mal configurada".
+    """
+    if os.environ.get(DEMO_MODE, "").strip().lower() not in ("1", "true", "yes", "si"):
+        return None
+    return os.environ.get(DEMO_USERNAME, "").strip() or None
+
+
+def demo_password() -> str | None:
+    """La contrasena conocida del usuario de la demo, si se declaro una.
+
+    Devuelve `None` si esta instancia no es una demo, **aunque
+    `DEMO_PASSWORD` este puesta**. Es el mismo cerrojo que `demo_username()`
+    y por la misma razon: la contrasena debil no puede filtrarse a la
+    instancia de un cliente por copiar un `.env`, porque sin `DEMO_MODE` +
+    `DEMO_USERNAME` esta funcion no la mira.
+
+    Que exista una contrasena tipeable es un pedido explicito del negocio
+    (2026-08-06): pasarle a un cliente potencial `demo.<producto>.com.ar` y
+    decirle "entra con usuario demo y contrasena demo". El boton de auto-login
+    cubre a quien llega solo; esto cubre a quien recibe el dato por telefono.
+    """
+    if not demo_username():
+        return None
+    return os.environ.get(DEMO_PASSWORD, "") or None
 
 
 def build_json_api_auth_router(
-    *, incluir_verify: bool = False, incluir_password_reset: bool = False
+    *, incluir_verify: bool = False, incluir_password_reset: bool = False,
+    incluir_demo: bool = False,
 ) -> APIRouter:
     """Router `/auth` (login/logout/me) para SPAs sin backoffice
     server-rendered propio. Espera `request.app.state.users`/
@@ -326,7 +483,7 @@ def build_json_api_auth_router(
             raise HTTPException(401, "invalid credentials")
         json_api_get_session_auth(request).create_session_cookie(response, user["username"])
         registrar_seguro(request, LOGIN, user["username"])
-        return user
+        return _con_bandera_demo(user)
 
     @router.post("/logout")
     def logout(request: Request, response: Response):
@@ -341,7 +498,65 @@ def build_json_api_auth_router(
 
     @router.get("/me", response_model=_UserOut)
     def me(user: dict = Depends(json_api_get_current_user)):
-        return user
+        return _con_bandera_demo(user)
+
+    # `POST /auth/demo` — el boton "Entrar a la demo" de la pantalla de login.
+    #
+    # Se registra **solo si el consumidor lo pidio Y las dos variables de
+    # entorno estan puestas**. En cualquier otra instancia la ruta no existe
+    # (ver `demo_username` para que contesta realmente una app con catch-all).
+    if incluir_demo and demo_username():
+        @router.get("/demo", response_model=_DemoInfo)
+        def demo_info():
+            """Le dice al frontend si esta instancia es una demo publica.
+
+            Existe porque el boton **no se puede decidir en tiempo de build**:
+            la imagen de la demo y la del cliente salen del mismo codigo, asi
+            que la pantalla de login tiene que preguntarselo a la instancia.
+
+            🔴 **Devuelve JSON y el frontend tiene que exigir JSON**, no un
+            `200`. En los productos que sirven la SPA con un catch-all, un GET
+            a una ruta inexistente contesta `200` con el `index.html` — o sea
+            que "me contesto 200" es cierto tambien en la instancia de un
+            cliente, y un boton condicionado a eso aparece en todas. Medido el
+            2026-08-06 contra `demo.libradesk.com.ar/auth/inexistente`.
+
+            **No devuelve la contrasena**, aunque `DEMO_PASSWORD` exista y sea
+            publica por diseno: un endpoint sin autenticar que reparte
+            contrasenas es un patron que despues alguien copia a un lugar
+            donde no da lo mismo. El `username` si, porque es lo que el boton
+            necesita mostrar.
+            """
+            return {"enabled": True, "username": demo_username()}
+
+        @router.post("/demo", response_model=_UserOut)
+        def demo(request: Request, response: Response):
+            """Entra a la demo publica sin credenciales.
+
+            No recibe cuerpo y no hay contrasena que adivinar: el usuario sale
+            de `DEMO_USERNAME`, que lo fija quien despliega la instancia.
+
+            🔴 **Nunca entrega un rol de la lista prohibida.** El chequeo esta
+            aca y no en el despliegue porque el rol del usuario puede cambiar
+            despues —alguien lo promueve desde el ABM de la propia demo— y
+            entonces el auto-login empezaria a repartir admin sin que nadie
+            haya tocado el `.env`. Es la clase de cambio que no deja rastro
+            hasta que ya paso.
+            """
+            username = demo_username()
+            users = request.app.state.users
+            user = users.get_by_username(username)
+            if user is None or not user.get("active"):
+                # 503 y no 404: la ruta existe y esta bien configurada, lo que
+                # falta es el usuario en la base — o sea, la instancia todavia
+                # no termino de sembrarse. Un 404 diria "no hay demo aca", que
+                # es falso y manda a mirar el lugar equivocado.
+                raise HTTPException(503, "demo user not provisioned")
+            if user["role"] in ROLES_PROHIBIDOS_EN_DEMO:
+                raise HTTPException(503, "demo user has a forbidden role")
+            json_api_get_session_auth(request).create_session_cookie(response, user["username"])
+            registrar_seguro(request, LOGIN, user["username"])
+            return _con_bandera_demo(user)
 
     if incluir_verify:
         @router.post("/verify", response_model=_VerifyResponse)

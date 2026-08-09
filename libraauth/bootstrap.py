@@ -17,6 +17,102 @@ import os
 import secrets
 
 from .repository import UserRepository
+from .session_auth import ROLES_PROHIBIDOS_EN_DEMO, demo_password, demo_username
+
+#: Rol por defecto del usuario de la demo publica. Es el vocabulario de cuatro
+#: de los seis productos (`("admin", "staff")`), pero **no de todos**:
+#: Contalibra usa `("admin", "operador", "cajero")` y Restolibra agrega
+#: `"mozo"`. Por eso `ensure_demo_user` acepta `rol=` — ver su docstring.
+ROL_DEMO = "staff"
+
+
+def ensure_demo_user(repo: "UserRepository", *, rol: str = ROL_DEMO) -> str | None:
+    """Crea el usuario del auto-login de la demo, si la instancia es una demo.
+
+    Devuelve el username creado o ya existente, o `None` si esta instancia no
+    es una demo (o sea: casi siempre). **Se guia por las mismas dos variables
+    de entorno que registran `POST /auth/demo`**, y eso es a proposito — si el
+    usuario y la ruta se decidieran por separado, existiria el par
+    "ruta encendida sin usuario" y el par "usuario suelto en la base de un
+    cliente", que son las dos formas de que esto salga mal.
+
+    🔴 **Nunca admin.** El visitante no tiene que poder entrar a Configuracion,
+    al ABM de usuarios ni al backup: ahi es donde rompe cosas que no se notan
+    hasta el reset, y donde ve partes de la instancia que no son la muestra.
+
+    **El rol lo elige el producto, pero NO sale del entorno**, asi que no hay
+    `.env` que pueda pedir admin. Es un parametro y no una constante porque el
+    vocabulario de roles no es el mismo en toda la familia: cuatro productos
+    usan `("admin", "staff")`, pero Contalibra usa
+    `("admin", "operador", "cajero")` y Restolibra agrega `"mozo"`. Con
+    `"staff"` fijo, en esos dos el alta explotaba con
+    `ValueError: invalid role: 'staff'` — lo encontro el bump del 2026-08-06.
+
+    Un rol que el producto no conoce **corta el arranque con un mensaje que
+    nombra los validos**, en vez de dejar la instancia sin usuario de demo y
+    que el 503 aparezca recien cuando alguien toque el boton.
+
+    **La contrasena depende de si se declaro `DEMO_PASSWORD`** (agregado el
+    2026-08-06, ver `session_auth.demo_password`):
+
+    - Sin ella, aleatoria y sin imprimir, como siempre: al usuario de la demo
+      se entra por `POST /auth/demo` y no hay nada que tipear.
+    - Con ella, esa: es el pedido de poder decirle a un cliente potencial
+      "entra con usuario demo y contrasena demo". Sigue sin filtrarse a
+      ninguna instancia de cliente, porque `demo_password()` devuelve `None`
+      si la instancia no es una demo.
+
+    Idempotente en lo que importa: si el usuario ya esta **no le corrige el
+    rol**. Corregirlo en silencio taparia el caso que `POST /auth/demo` tiene
+    que seguir rechazando (alguien lo promovio a admin desde el ABM), y ese
+    caso se quiere ruidoso, no arreglado por atras.
+
+    🔴 **Lo unico que si le reescribe a un usuario existente es la contrasena,
+    y solo cuando `DEMO_PASSWORD` esta puesta.** Sin eso, cambiar la
+    contrasena de la demo en el `.env` no haria nada en una instancia ya
+    creada y el dato que se le pasa al cliente seria falso — el modo de falla
+    silencioso de siempre. Y antes de reescribirla se chequea el rol: poner
+    una contrasena **conocida** sobre un usuario que quedo admin es abrirle la
+    instancia a cualquiera por el login normal, donde el cerrojo de
+    `POST /auth/demo` no llega. Ese caso corta el arranque.
+    """
+    username = demo_username()
+    if not username:
+        return None
+    if rol in ROLES_PROHIBIDOS_EN_DEMO:
+        raise RuntimeError(
+            f"rol={rol!r} esta en ROLES_PROHIBIDOS_EN_DEMO: el usuario que se "
+            "crearia no podria entrar nunca por POST /auth/demo."
+        )
+    validos = getattr(repo, "roles", ())
+    if validos and rol not in validos:
+        raise RuntimeError(
+            f"rol={rol!r} no existe en este producto. Los validos son "
+            f"{validos}. Pasar `rol=` a ensure_demo_user()."
+        )
+    conocida = demo_password()
+    existente = repo.get_by_username(username)
+    if existente:
+        if conocida:
+            if existente["role"] in ROLES_PROHIBIDOS_EN_DEMO:
+                raise RuntimeError(
+                    f"el usuario de demo {username!r} tiene rol "
+                    f"{existente['role']!r}, que esta en "
+                    "ROLES_PROHIBIDOS_EN_DEMO. Con DEMO_PASSWORD puesta eso "
+                    "seria una contrasena conocida sobre una cuenta "
+                    "privilegiada: cualquiera entraria como admin por el "
+                    "login normal. Bajarle el rol o sacar DEMO_PASSWORD."
+                )
+            repo.update_password(existente["id"], conocida)
+        return username
+    repo.create(
+        username=username,
+        name=os.environ.get("DEMO_NAME", "Visitante de la demo"),
+        password=conocida or secrets.token_urlsafe(24),
+        role=rol,
+    )
+    print(f"[INFO] Usuario de demo '{username}' creado con rol {rol}.")
+    return username
 
 
 def ensure_default_admin(repo: "UserRepository", *, env_prefix: str) -> None:
