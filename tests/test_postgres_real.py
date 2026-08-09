@@ -26,8 +26,8 @@ Se saltea si no hay `LIBRAAUTH_POSTGRES_URL`. En CI la pone el workflow.
 import os
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import String, create_engine
+from sqlalchemy.orm import Mapped, Session, mapped_column, sessionmaker
 
 from libraauth.models import Base
 from libraauth.repository import UserRepository, UsernameTaken
@@ -231,6 +231,60 @@ def test_username_repetido_levanta_UsernameTaken_tambien_en_postgres(dos_motores
         pg.create(username="beto", name="Otro Beto", password=CLAVE, role="staff")
     with pytest.raises(UsernameTaken):
         lite.create(username="beto", name="Otro Beto", password=CLAVE, role="staff")
+
+
+def test_el_log_de_actividad_acepta_un_id_de_texto_contra_postgres(tmp_path):
+    """🔴 El defecto de mas alcance de la F3, y el unico lugar donde se prueba.
+
+    `actividad_log.entidad_id` estuvo declarada `Integer` hasta el 2026-08-09.
+    Los ids de MedLibra (`patient-1`), Gestiolibra y LibraGenda son de texto, y
+    **SQLite los aceptaba por tipado dinamico**: guarda texto en una columna
+    INTEGER sin decir nada. Por eso `test_auditoria.py` -- que corre sobre
+    SQLite-- no podia ver nada, ni siquiera despues del arreglo: ahi el test
+    pasa con la columna declarada de cualquiera de las dos formas.
+
+    Contra PostgreSQL no hay tipado dinamico:
+
+        psycopg.errors.InvalidTextRepresentation:
+        invalid input syntax for type integer: "patient-1"
+
+    Y como el log se escribe en la MISMA transaccion que la operacion auditada,
+    no se perdia una fila de auditoria: **el alta entera devolvia 500**. El
+    producto no podia escribir.
+
+    Este test es el que decide si el arreglo sirve, porque es el unico que
+    ejecuta el INSERT contra un motor con tipos de verdad.
+    """
+    from sqlalchemy.orm import DeclarativeBase
+
+    from libraauth.auditoria import (
+        AuditoriaBase, AuditoriaRepository, configurar_auditoria,
+    )
+
+    class DominioBase(DeclarativeBase):
+        pass
+
+    class Paciente(DominioBase):
+        __tablename__ = "pacientes_pg_demo"
+        id: Mapped[str] = mapped_column(String(100), primary_key=True)
+        nombre: Mapped[str] = mapped_column(String(100))
+
+    engine = create_engine(POSTGRES_URL)
+    DominioBase.metadata.drop_all(engine)
+    AuditoriaBase.metadata.drop_all(engine)
+    DominioBase.metadata.create_all(engine)
+    AuditoriaBase.metadata.create_all(engine)
+
+    sessions = sessionmaker(bind=engine)
+    configurar_auditoria(sessions, {"Paciente": "paciente"})
+
+    with sessions.begin() as s:
+        s.add(Paciente(id="patient-1", nombre="Ana"))
+
+    filas = AuditoriaRepository(sessions).listar()
+    # Contraprueba: sin filas, cualquier asercion sobre el contenido pasa sola.
+    assert len(filas) == 1, filas
+    assert filas[0]["entidad_id"] == "patient-1"
 
 
 def test_created_at_lo_escribe_la_base_en_los_dos_motores(dos_motores):
