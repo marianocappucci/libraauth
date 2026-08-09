@@ -31,6 +31,11 @@ dev = [
     "ruff>=0.13",
     "pytest>=8.0",
     "httpx>=0.27",
+    # Solo para tests. El paquete NO declara driver a proposito: el engine lo
+    # arma el producto consumidor y este motor no elige el backend. Pero
+    # `test_postgres_real.py` necesita hablar con un PostgreSQL de verdad, que
+    # es la unica forma de ver los defectos que una comparacion de DDL no ve.
+    "psycopg[binary]>=3.2",
 ]
 
 [tool.hatch.version]
