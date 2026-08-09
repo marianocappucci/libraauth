@@ -62,7 +62,22 @@ class Turno(DominioBase):
     starts_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
-AUDITABLES = {"Cliente": "cliente", "Turno": "turno"}
+class Paciente(DominioBase):
+    """Modelo con id de TEXTO, como los de MedLibra (`patient-1`), Gestiolibra
+    y LibraGenda.
+
+    Ningun modelo de este archivo lo era, y por eso el defecto que tumbaba a
+    esos tres productos contra PostgreSQL no se veia aca: todos los ids de este
+    test eran enteros, igual que los de LibraDesk. Ver el comentario de
+    `ActividadLog.entidad_id`.
+    """
+
+    __tablename__ = "pacientes_demo"
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    nombre: Mapped[str] = mapped_column(String(100))
+
+
+AUDITABLES = {"Cliente": "cliente", "Turno": "turno", "Paciente": "paciente"}
 
 
 @pytest.fixture
@@ -100,7 +115,7 @@ def _crear_cliente(sessions, nombre="Compulibra", **extra) -> int:
 def test_crear_deja_fila_sin_que_nadie_la_pida(sessions, repo):
     cid = _crear_cliente(sessions)
     fila = repo.listar()[0]
-    assert (fila["accion"], fila["entidad"], fila["entidad_id"]) == (CREAR, "cliente", cid)
+    assert (fila["accion"], fila["entidad"], fila["entidad_id"]) == (CREAR, "cliente", str(cid))
     assert fila["descripcion"] == "Cliente — Compulibra"
 
 
@@ -108,7 +123,56 @@ def test_el_id_de_una_creacion_no_queda_vacio(sessions, repo):
     """En `before_flush` el objeto nuevo todavia no tiene id: si la fila se
     escribiera ahi, el log no serviria para buscar nada."""
     cid = _crear_cliente(sessions)
-    assert repo.listar()[0]["entidad_id"] == cid
+    # Como TEXTO: `entidad_id` dejo de ser `Integer` el 2026-08-09 porque los
+    # ids de esta familia son heterogeneos. Esta asercion pedia el entero.
+    assert repo.listar()[0]["entidad_id"] == str(cid)
+
+
+def test_una_entidad_con_id_de_texto_queda_registrada(sessions, repo):
+    """🔴 El caso que rompia MedLibra, Gestiolibra y LibraGenda.
+
+    `entidad_id` estuvo declarada `Integer` hasta el 2026-08-09, y esos tres
+    productos usan ids de texto (`patient-1`). SQLite lo aceptaba por tipado
+    dinamico -- guarda texto en una columna INTEGER sin decir nada-- asi que el
+    defecto era **invisible en toda la suite**. Contra PostgreSQL el INSERT
+    muere con `invalid input syntax for type integer`, y como el log se escribe
+    en la misma transaccion que la operacion auditada, **el alta entera devuelve
+    500**.
+
+    Medido en produccion el 2026-08-09: la columna ya tenia mas texto que
+    enteros (48 de 86 filas en la demo de Gestiolibra, 58 de 95 en la de
+    MedLibra).
+    """
+    with sessions.begin() as s:
+        s.add(Paciente(id="patient-1", nombre="Ana"))
+
+    filas = repo.listar()
+    assert len(filas) == 1, filas
+    assert filas[0]["entidad"] == "paciente"
+    # Lo que vale es que el id llegue INTACTO: si algo intentara coaccionarlo a
+    # numero, un `patient-1` quedaria en None y el log no diria a que paciente
+    # se refiere.
+    assert filas[0]["entidad_id"] == "patient-1"
+
+
+def test_un_id_entero_se_guarda_como_texto_y_no_se_pierde(sessions, repo):
+    """La otra mitad: LibraDesk y VentaLibra tienen ids enteros y tienen que
+    seguir andando. La conversion es explicita (`str(valor)`) y no delegada al
+    driver, que es lo que fallaba recien dentro de una escritura real."""
+    cid = _crear_cliente(sessions)
+    guardado = repo.listar()[0]["entidad_id"]
+    assert guardado == str(cid)
+    assert isinstance(guardado, str)
+
+
+def test_un_id_cero_no_se_confunde_con_ausente(sessions, repo):
+    """`0` es un id valido. Con una guarda escrita como `if not valor` se
+    perderia el id de la primera fila de cualquier tabla que empiece en cero,
+    y el log diria que no se supo a que entidad se refiere."""
+    with sessions.begin() as s:
+        s.add(Paciente(id="0", nombre="Cero"))
+
+    assert repo.listar()[0]["entidad_id"] == "0"
 
 
 def test_editar_guarda_antes_y_despues(sessions, repo):
@@ -136,7 +200,7 @@ def test_borrar_conserva_id_y_etiqueta(sessions, repo):
         s.delete(s.get(Cliente, cid))
         s.commit()
     borrado = [f for f in repo.listar() if f["accion"] == BORRAR][0]
-    assert borrado["entidad_id"] == cid
+    assert borrado["entidad_id"] == str(cid)
     assert "Cliente que se va" in borrado["descripcion"]
 
 
@@ -453,7 +517,7 @@ def test_las_entidades_salen_de_lo_declarado_y_no_del_log(sessions):
     """Si salieran de un `SELECT DISTINCT`, el filtro no ofreceria una entidad
     hasta que alguien la tocara por primera vez."""
     datos = _app_con_logs(sessions).get("/logs").json()
-    assert datos["entidades"] == ["cliente", "turno"]
+    assert datos["entidades"] == ["cliente", "paciente", "turno"]
     assert datos["actividad"] == []
 
 
