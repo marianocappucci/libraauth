@@ -208,6 +208,33 @@ def _valor_legible(valor):
     return str(valor)
 
 
+def ts_legible(valor) -> str:
+    """El `ts` de una fila de log como texto, venga como venga.
+
+    🔴 **Puede venir de las dos formas, y no es un descuido de quien lee.** El
+    modelo de aca declara `ts` como `DateTime`, pero en los productos que crean
+    la tabla con **DDL crudo** la columna es `TEXT` -- en esta familia los
+    timestamps de la capa cruda son texto a proposito, porque las fechas se
+    filtran comparando lexicograficamente.
+
+    Contra SQLite el desacuerdo no se ve: el dialecto de SQLAlchemy parsea el
+    texto y devuelve un `datetime`. Contra PostgreSQL **no** lo hace -- da por
+    hecho que el driver ya devuelve `datetime` -- y llega el `str` crudo. Medido
+    en VentaLibra el 2026-08-10: 19 apariciones de *'str' object has no
+    attribute 'strftime'*, todas por esto.
+
+    Se tolera en la lectura en vez de unificar el tipo de la columna porque
+    unificarlo significaria romper el filtrado lexicografico de la capa cruda,
+    que es mucho mas que estas dos lineas. El texto que sale es el mismo en los
+    dos casos.
+    """
+    if valor is None or valor == "":
+        return ""
+    if isinstance(valor, datetime):
+        return valor.strftime("%Y-%m-%d %H:%M:%S")
+    return str(valor)
+
+
 def _diff(obj, ocultas: frozenset) -> dict:
     """`{columna: [antes, despues]}` de lo que realmente cambio.
 
@@ -454,7 +481,7 @@ class AuditoriaRepository:
             ).scalars()
             return [{
                 "id": f.id,
-                "ts": f.ts.strftime("%Y-%m-%d %H:%M:%S") if f.ts else "",
+                "ts": ts_legible(f.ts),
                 "usuario": f.usuario,
                 "accion": f.accion,
                 "entidad": f.entidad,
