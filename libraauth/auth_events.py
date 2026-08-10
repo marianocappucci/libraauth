@@ -24,6 +24,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from starlette.requests import Request
 
+from .auditoria import ts_legible
 from .models import AuthEvent
 
 # Los tres eventos que registra el router de este paquete. Son strings y no un
@@ -68,7 +69,11 @@ def _to_dict(e: AuthEvent) -> dict:
         # ISO con espacio en vez de "T": es como se ve la columna en las filas
         # que escribe LibraCore, y la pantalla de logs de Contalibra ya parte
         # ese formato.
-        "ts": e.ts.strftime("%Y-%m-%d %H:%M:%S"),
+        #
+        # Por `ts_legible` y no `.strftime()` directo: `auth_log` la crea el DDL
+        # crudo de LibraCore como TEXT, asi que contra PostgreSQL este valor
+        # llega como `str` -- ver el docstring de esa funcion.
+        "ts": ts_legible(e.ts),
         "evento": e.evento,
         "username": e.username,
         "ip": e.ip or "",
