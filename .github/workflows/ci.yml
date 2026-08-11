@@ -1,9 +1,13 @@
 name: CI
 
 on:
+  # Sin `push` a ramas: `develop` y `main` estan protegidas (2026-08-11,
+  # `enforce_admins: true`), asi que todo entra por PR y el run del PR verifica
+  # el MERGE -- que es exactamente lo que queda en la rama. El push repetia esa
+  # misma verificacion sobre un arbol identico: medido, tres commits distintos
+  # con el mismo tree hash y hasta cuatro corridas por cambio.
   push:
-    branches: [develop, main, "feature/**"]
-    tags: ["v*"]
+    tags: ["v*"]   # dispara el release, no la verificacion
   pull_request:
     branches: [develop, main]
 
