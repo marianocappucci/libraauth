@@ -77,7 +77,32 @@ class Paciente(DominioBase):
     nombre: Mapped[str] = mapped_column(String(100))
 
 
-AUDITABLES = {"Cliente": "cliente", "Turno": "turno", "Paciente": "paciente"}
+class ClienteDeMotor(DominioBase):
+    """Modelo cuyos ATRIBUTOS no se llaman igual que sus COLUMNAS.
+
+    Es la forma que estrena el modelo de clientes de LibraDesk al adoptar la
+    tabla `clients` de LibraCore (revision `0017` de ese producto): el producto
+    sigue diciendo `nombre` y `telefono`, y la columna real es `name` y `phone`.
+
+    Ningun modelo de este archivo lo era —en los seis productos los dos nombres
+    coincidieron siempre— y por eso `_diff` podia recorrer `__table__.columns`
+    y buscar esos nombres en `estado.attrs`, que va por atributo, sin que se
+    notara. Con este modelo tira `KeyError: 'name'`; y como el log se escribe
+    en la misma transaccion que la operacion auditada, **la operacion entera
+    devuelve 404** en vez de perder una linea de log.
+    """
+
+    __tablename__ = "clientes_motor_demo"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    nombre: Mapped[str] = mapped_column("name", String(100))
+    telefono: Mapped[str | None] = mapped_column("phone", String(100))
+    api_key: Mapped[str | None] = mapped_column("secreto", String(100))
+
+
+AUDITABLES = {
+    "Cliente": "cliente", "Turno": "turno", "Paciente": "paciente",
+    "ClienteDeMotor": "cliente_motor",
+}
 
 
 @pytest.fixture
@@ -182,6 +207,50 @@ def test_editar_guarda_antes_y_despues(sessions, repo):
         s.commit()
     edicion = [f for f in repo.listar() if f["accion"] == EDITAR][0]
     assert edicion["cambios"] == {"ciudad": ["Suipacha", "Mercedes"]}
+
+
+def test_un_atributo_que_no_se_llama_como_su_columna_no_tumba_la_operacion(sessions, repo):
+    """El caso que rompia: `nombre` mapeado a la columna `name`.
+
+    Lo que se verifica primero es que la ESCRITURA sobreviva. El log corre en
+    la misma transaccion, asi que un `KeyError` aca no perdia una linea de
+    auditoria: se llevaba puesta la edicion entera.
+    """
+    with sessions.begin() as s:
+        s.add(ClienteDeMotor(nombre="Compulibra", telefono="221-555"))
+    with sessions() as s:
+        fila = s.get(ClienteDeMotor, 1)
+        fila.telefono = "221-999"
+        s.commit()
+
+    with sessions() as s:
+        assert s.get(ClienteDeMotor, 1).telefono == "221-999", "la edicion no persistio"
+
+    edicion = [f for f in repo.listar() if f["accion"] == EDITAR][0]
+    # La clave es el ATRIBUTO (`telefono`), no la columna (`phone`): es el
+    # vocabulario del producto y lo que la pantalla de logs sabe mostrar.
+    assert edicion["cambios"] == {"telefono": ["221-555", "221-999"]}
+
+
+def test_una_columna_oculta_se_tapa_aunque_se_configure_por_su_nombre_de_columna(sessions, repo):
+    """`ocultas` la escribe cada producto, y cual de los dos nombres eligio no
+    esta escrito en ningun lado — hasta ahora eran el mismo. Se compara contra
+    los dos para que ninguna configuracion existente cambie de comportamiento.
+
+    Acá `api_key` es el atributo y `secreto` la columna, y la configuración de
+    la fixture oculta **el nombre de columna**.
+    """
+    factory = sessions
+    configurar_auditoria(factory, AUDITABLES, columnas_ocultas=frozenset({"secreto"}))
+
+    with factory.begin() as s:
+        s.add(ClienteDeMotor(nombre="Con secreto", api_key="antes"))
+    with factory() as s:
+        s.get(ClienteDeMotor, 1).api_key = "despues"
+        s.commit()
+
+    edicion = [f for f in repo.listar() if f["accion"] == EDITAR][0]
+    assert edicion["cambios"] == {"api_key": [OCULTO, OCULTO]}
 
 
 def test_editar_sin_cambios_reales_no_deja_fila(sessions, repo):
@@ -517,7 +586,7 @@ def test_las_entidades_salen_de_lo_declarado_y_no_del_log(sessions):
     """Si salieran de un `SELECT DISTINCT`, el filtro no ofreceria una entidad
     hasta que alguien la tocara por primera vez."""
     datos = _app_con_logs(sessions).get("/logs").json()
-    assert datos["entidades"] == ["cliente", "paciente", "turno"]
+    assert datos["entidades"] == ["cliente", "cliente_motor", "paciente", "turno"]
     assert datos["actividad"] == []
 
 
