@@ -236,7 +236,7 @@ def ts_legible(valor) -> str:
 
 
 def _diff(obj, ocultas: frozenset) -> dict:
-    """`{columna: [antes, despues]}` de lo que realmente cambio.
+    """`{atributo: [antes, despues]}` de lo que realmente cambio.
 
     Solo columnas: las relaciones quedan afuera porque cargarlas aca dispararia
     un SELECT por atributo en medio del flush.
@@ -245,21 +245,41 @@ def _diff(obj, ocultas: frozenset) -> dict:
     el log tiene que poder decir que ese campo se toco. Lo que se descarta —y
     por eso el chequeo de `antes == despues` va **antes** de tapar el valor— es
     la columna que quedo igual, que es ruido en cualquier caso.
+
+    🔴 **Se recorre `column_attrs`, no `__table__.columns`** (2026-08-12).
+    `estado.attrs` esta indexado por **nombre de atributo**; `__table__.columns`
+    devuelve **nombres de columna**. En los seis productos de la familia esos
+    dos nombres coincidieron siempre, asi que la version anterior —que iteraba
+    columnas y las buscaba en `attrs`— funcionaba por casualidad.
+
+    El primer modelo donde difieren es el de clientes de LibraDesk, que mapea
+    `nombre` a la columna `name` del motor: ahi `attrs["name"]` tira
+    `KeyError: 'name'`. Y como el log se escribe en la MISMA transaccion que la
+    operacion auditada, no se pierde una linea de auditoria: **la operacion
+    entera devuelve 404**. Un PUT que falla mientras el GET del mismo recurso
+    anda, que no se parece en nada a su causa.
+
+    **La clave del diff pasa a ser el atributo**, que es el vocabulario del
+    producto y lo que la pantalla de logs sabe mostrar. `ocultas` se compara
+    contra **las dos** formas para que ninguna configuracion existente cambie
+    de comportamiento: hoy los productos la escriben con nombres que son los
+    dos a la vez, y cual eligieron no esta escrito en ningun lado.
     """
     estado = inspect(obj)
     cambios = {}
-    for columna in obj.__table__.columns.keys():
-        historial = estado.attrs[columna].history
+    for attr in inspect(type(obj)).column_attrs:
+        historial = estado.attrs[attr.key].history
         if not historial.has_changes():
             continue
         antes = historial.deleted[0] if historial.deleted else None
         despues = historial.added[0] if historial.added else None
         if antes == despues:
             continue
-        if columna in ocultas:
-            cambios[columna] = [OCULTO, OCULTO]
+        nombres_de_columna = {c.name for c in attr.columns}
+        if attr.key in ocultas or nombres_de_columna & set(ocultas):
+            cambios[attr.key] = [OCULTO, OCULTO]
             continue
-        cambios[columna] = [_valor_legible(antes), _valor_legible(despues)]
+        cambios[attr.key] = [_valor_legible(antes), _valor_legible(despues)]
     return cambios
 
 
