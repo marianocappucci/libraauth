@@ -207,11 +207,24 @@ class _FakeJsonApiUsers:
         u = self._users.get(username)
         return self._public(u) if u else None
 
+    def get_by_id(self, user_id):
+        for u in self._users.values():
+            if u["id"] == user_id:
+                return self._public(u)
+        return None
+
     def check_credentials(self, username, password):
         u = self._users.get(username)
         if u and u["_password"] == password:
             return self._public(u)
         return None
+
+    def update_password(self, user_id, new_password):
+        for u in self._users.values():
+            if u["id"] == user_id:
+                u["_password"] = new_password
+                return
+        raise KeyError(user_id)
 
     def deactivate(self, username):
         self._users[username]["active"] = False
@@ -388,3 +401,194 @@ def test_verify_no_crea_cookie_de_sesion(monkeypatch):
     assert r.json() == {"valid": True}
     assert "test_json_session" not in client.cookies
     assert client.get("/auth/me").status_code == 401
+
+
+# --- POST /auth/change-password -------------------------------------------
+#
+# La unica forma de cambiar la propia clave estando adentro. Antes habia que
+# salir de la aplicacion y esperar el mail de `/auth/forgot-password`, o sea
+# depender del SMTP para algo que no lo necesita.
+#
+# Lo que estos tests tienen que sostener, en orden de gravedad:
+#   1. Que el cambio SIRVA -- que la nueva loguee y la vieja deje de loguear.
+#      Un 200 no prueba nada: el endpoint podria no haber tocado nada.
+#   2. Que no se le pueda cambiar la clave a OTRO.
+#   3. Que cada rechazo deje la contrasena como estaba.
+
+
+def _logueado(client, username, password):
+    r = client.post("/auth/login", json={"username": username, "password": password})
+    assert r.status_code == 200, r.text
+    return client
+
+
+def _puede_entrar(app, username, password):
+    """Login en un cliente NUEVO, sin la cookie del anterior."""
+    otro = FastAPITestClient(app, base_url="https://testserver")
+    return otro.post(
+        "/auth/login", json={"username": username, "password": password}
+    ).status_code == 200
+
+
+def test_cambiar_la_propia_password_deja_entrar_con_la_nueva():
+    app = _make_json_api_app()
+    client = _logueado(FastAPITestClient(app, base_url="https://testserver"), "admin", "adminpw")
+
+    r = client.post("/auth/change-password",
+                    json={"current_password": "adminpw", "new_password": "clave-nueva"})
+    assert r.status_code == 200, r.text
+    assert r.json()["username"] == "admin"
+
+    # 🔑 Las dos mitades. Sin la segunda, un endpoint que agrega una clave sin
+    # sacar la vieja pasaria igual.
+    assert _puede_entrar(app, "admin", "clave-nueva")
+    assert not _puede_entrar(app, "admin", "adminpw")
+
+
+def test_cambiar_la_password_no_cierra_la_sesion_en_curso():
+    """Quien acaba de cambiarla sigue trabajando: dejarlo afuera justo despues
+    de un cambio exitoso se lee como un error."""
+    app = _make_json_api_app()
+    client = _logueado(FastAPITestClient(app, base_url="https://testserver"), "admin", "adminpw")
+    client.post("/auth/change-password",
+                json={"current_password": "adminpw", "new_password": "clave-nueva"})
+    assert client.get("/auth/me").status_code == 200
+
+
+def test_sin_sesion_no_se_puede_cambiar_nada():
+    app = _make_json_api_app()
+    client = FastAPITestClient(app, base_url="https://testserver")
+    r = client.post("/auth/change-password",
+                    json={"current_password": "adminpw", "new_password": "clave-nueva"})
+    assert r.status_code == 401
+    assert _puede_entrar(app, "admin", "adminpw")
+
+
+def test_con_la_actual_equivocada_no_cambia_nada():
+    """Es lo que hace que una sesion robada no alcance para apropiarse de la
+    cuenta: sin pedir la actual, una cookie olvidada seria una toma definitiva."""
+    app = _make_json_api_app()
+    client = _logueado(FastAPITestClient(app, base_url="https://testserver"), "admin", "adminpw")
+
+    r = client.post("/auth/change-password",
+                    json={"current_password": "la-que-no-es", "new_password": "clave-nueva"})
+    assert r.status_code == 400
+    # La afirmacion que importa no es el codigo: es que la clave siga siendo la
+    # de antes y la propuesta no sirva.
+    assert _puede_entrar(app, "admin", "adminpw")
+    assert not _puede_entrar(app, "admin", "clave-nueva")
+
+
+def test_no_se_le_puede_cambiar_la_password_a_otro():
+    """El usuario sale de la cookie, nunca del cuerpo. Se mandan `username`,
+    `user_id` y `id` a proposito: si alguno se leyera, un staff cualquiera
+    podria quedarse con la cuenta del admin."""
+    app = _make_json_api_app()
+    client = _logueado(FastAPITestClient(app, base_url="https://testserver"), "staffer", "staffpw")
+
+    r = client.post("/auth/change-password", json={
+        "current_password": "staffpw", "new_password": "clave-nueva",
+        "username": "admin", "user_id": "1", "id": "1",
+    })
+    assert r.status_code == 200
+    assert r.json()["username"] == "staffer"
+
+    assert _puede_entrar(app, "admin", "adminpw")          # el admin, intacto
+    assert not _puede_entrar(app, "admin", "clave-nueva")
+    assert _puede_entrar(app, "staffer", "clave-nueva")    # el suyo si cambio
+
+
+def test_la_password_nueva_tiene_un_minimo():
+    app = _make_json_api_app()
+    client = _logueado(FastAPITestClient(app, base_url="https://testserver"), "admin", "adminpw")
+
+    r = client.post("/auth/change-password",
+                    json={"current_password": "adminpw", "new_password": "abc"})
+    assert r.status_code == 422
+    assert _puede_entrar(app, "admin", "adminpw")
+    assert not _puede_entrar(app, "admin", "abc")
+
+
+def test_la_password_nueva_tiene_que_ser_distinta():
+    """Aceptar la misma devolveria "listo" sin haber cambiado nada, y quien la
+    cambio por sospecha de filtracion se quedaria creyendo que la roto."""
+    app = _make_json_api_app()
+    client = _logueado(FastAPITestClient(app, base_url="https://testserver"), "admin", "adminpw")
+
+    r = client.post("/auth/change-password",
+                    json={"current_password": "adminpw", "new_password": "adminpw"})
+    assert r.status_code == 422
+
+
+# --- empresa_nombre en el usuario ------------------------------------------
+#
+# El sidebar de libra-ui muestra `getUserSubtitle(user)` debajo del nombre del
+# producto, y Contalibra/Restolibra lo vienen usando para el nombre de la
+# empresa. Los cuatro productos que usan ESTE router no tenian de donde sacarlo
+# -- y eran exactamente los cuatro que no lo mostraban.
+
+
+def _app_con_empresa(nombre="Lagrace Comunicaciones"):
+    app = FastAPI()
+    users = _FakeJsonApiUsers()
+    app.state.users = users
+    app.state.session_auth = SessionAuth(
+        dev_secret_fallback="test-secret",
+        get_user_by_username=users.get_by_username,
+        check_credentials=users.check_credentials,
+        cookie_name="test_json_session",
+    )
+    app.include_router(
+        build_json_api_auth_router(get_empresa_nombre=lambda request: nombre)
+    )
+    return app
+
+
+def test_el_login_y_el_me_traen_el_nombre_de_la_empresa():
+    """Los DOS, no solo `/me`. Si estuviera unicamente en `/me`, el sidebar
+    aparecería sin subtitulo al loguearse y con subtitulo despues de recargar:
+    cambiaria de forma sin que nadie tocara nada."""
+    client = FastAPITestClient(_app_con_empresa(), base_url="https://testserver")
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "adminpw"})
+    assert login.json()["empresa_nombre"] == "Lagrace Comunicaciones"
+    assert client.get("/auth/me").json()["empresa_nombre"] == "Lagrace Comunicaciones"
+
+
+def test_el_cambio_de_password_tambien_lo_devuelve():
+    """Devuelve un usuario completo, asi que tiene que ser el mismo usuario que
+    devuelven los otros dos: si le faltara el campo, el frontend que refresca su
+    estado con esta respuesta se quedaria sin subtitulo despues de cambiar la
+    clave."""
+    client = FastAPITestClient(_app_con_empresa(), base_url="https://testserver")
+    client.post("/auth/login", json={"username": "admin", "password": "adminpw"})
+    r = client.post("/auth/change-password",
+                    json={"current_password": "adminpw", "new_password": "clave-nueva"})
+    assert r.json()["empresa_nombre"] == "Lagrace Comunicaciones"
+
+
+def test_sin_get_empresa_nombre_el_campo_va_en_none():
+    """El comportamiento de siempre: un producto que no lo configura sigue
+    andando y el sidebar no dibuja subtitulo. Es lo que permite que esto entre
+    sin tocar a los productos que todavia no lo usan."""
+    app = _make_json_api_app()
+    client = FastAPITestClient(app, base_url="https://testserver")
+    r = client.post("/auth/login", json={"username": "admin", "password": "adminpw"})
+    assert r.json()["empresa_nombre"] is None
+
+
+def test_la_empresa_sale_de_la_instancia_y_no_de_la_fila_del_usuario():
+    """Dos usuarios distintos de la misma instancia ven la misma empresa.
+
+    ⚠️ **Este test no puede fallar mientras la firma sea `(Request) -> str`**:
+    la funcion no recibe el usuario, asi que no tiene con que depender de el.
+    Se intento romperlo a proposito y siguio verde. Queda igual porque documenta
+    la decision y **si** se pondria rojo el dia que alguien cambie la firma a
+    una que reciba el usuario — que es exactamente el cambio que haria que la
+    empresa pasara a depender de la persona en vez de la instalacion.
+    """
+    app = _app_con_empresa("Estudio Sur")
+    for usuario, clave in (("admin", "adminpw"), ("staffer", "staffpw")):
+        client = FastAPITestClient(app, base_url="https://testserver")
+        r = client.post("/auth/login", json={"username": usuario, "password": clave})
+        assert r.json()["empresa_nombre"] == "Estudio Sur", usuario
