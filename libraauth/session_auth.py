@@ -185,6 +185,15 @@ class _ResetPasswordRequest(BaseModel):
     new_password: str
 
 
+class _CambioPasswordRequest(BaseModel):
+    # La actual **es obligatoria y no es un tramite**: sin ella, una sesion
+    # robada —una cookie que quedo abierta en una maquina compartida— alcanza
+    # para apropiarse de la cuenta para siempre. Pidiendola, el robo de sesion
+    # sigue siendo grave pero es temporal.
+    current_password: str
+    new_password: str
+
+
 # Solo para el router de configuracion SMTP (opt-in, ver
 # build_smtp_settings_router).
 class _SmtpSettingsOut(BaseModel):
@@ -443,7 +452,7 @@ def demo_password() -> str | None:
 
 def build_json_api_auth_router(
     *, incluir_verify: bool = False, incluir_password_reset: bool = False,
-    incluir_demo: bool = False,
+    incluir_demo: bool = False, min_password_length: int = 6,
 ) -> APIRouter:
     """Router `/auth` (login/logout/me) para SPAs sin backoffice
     server-rendered propio. Espera `request.app.state.users`/
@@ -467,6 +476,17 @@ def build_json_api_auth_router(
     `PasswordResetService` (que a su vez necesita SMTP y una pantalla propia
     donde aterrice el link): prenderlo sin eso seria publicar dos endpoints
     que fallan.
+
+    `POST /auth/change-password` va **siempre**, sin flag, a diferencia de los
+    dos de arriba: no depende de SMTP ni de ninguna pantalla — solo del
+    repositorio de usuarios, que este router ya exige para poder loguear. Un
+    opt-in aca solo lograria que algunos productos se quedaran sin la unica
+    forma de cambiar la clave estando adentro.
+
+    `min_password_length` es el minimo que se le exige a la clave nueva. Por
+    defecto **6, el mismo que `PasswordResetService`**: dos caminos que cambian
+    la contrasena del mismo usuario no pueden pedir cosas distintas — el que
+    fuera mas laxo volveria decorativo al otro.
     """
     router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -499,6 +519,60 @@ def build_json_api_auth_router(
     @router.get("/me", response_model=_UserOut)
     def me(user: dict = Depends(json_api_get_current_user)):
         return _con_bandera_demo(user)
+
+    @router.post("/change-password", response_model=_UserOut)
+    def change_password(
+        data: _CambioPasswordRequest,
+        request: Request,
+        user: dict = Depends(json_api_get_current_user),
+    ):
+        """Cambia la contrasena del usuario **de la sesion**, pidiendo la actual.
+
+        Es la unica forma de cambiarla estando adentro: `/auth/reset-password`
+        necesita un token que llega por mail, o sea que alguien logueado tenia
+        que salir de la aplicacion —y depender del SMTP— para hacer algo que no
+        lo necesita.
+
+        **El usuario sale de la cookie, nunca del cuerpo.** Es lo que impide que
+        esto sea un cambiador de contrasenas ajenas: no hay ningun `user_id` que
+        mandar. Cambiarle la clave a otro es tarea del ABM de usuarios, que pide
+        rol admin.
+
+        > 🔑 Media defensa la pone **Pydantic**, que descarta los campos extra
+        > del cuerpo: mandar `user_id` no hace nada porque el modelo no lo tiene.
+        > Se verifico rompiendolo — un `getattr(data, "user_id", ...)` sobre el
+        > modelo actual es un no-op y el test sigue verde; hace falta **agregar
+        > el campo al modelo** para que se ponga rojo. O sea: el dia que alguien
+        > le sume un campo a `_CambioPasswordRequest` "porque el ABM lo
+        > necesita", ese es el momento en que esto se vuelve peligroso.
+
+        No se toca la sesion en curso: quien acaba de cambiar su clave sigue
+        trabajando. Cerrarla lo dejaria afuera justo despues de un cambio
+        exitoso, que se lee como un error.
+        """
+        users = request.app.state.users
+        # `check_credentials` y no una comparacion propia: es el unico lugar del
+        # paquete que sabe verificar un hash, y ademas corre en tiempo constante.
+        if users.check_credentials(user["username"], data.current_password) is None:
+            # Se registra como intento fallido igual que un login: alguien
+            # probando contrasenas contra una sesion abierta es exactamente la
+            # senal que este log tiene que dejar.
+            registrar_seguro(request, LOGIN_FALLIDO, user["username"])
+            raise HTTPException(400, "la contraseña actual no es correcta")
+
+        if len(data.new_password or "") < min_password_length:
+            raise HTTPException(
+                422,
+                f"la contraseña debe tener al menos {min_password_length} caracteres",
+            )
+        # Que la nueva sea distinta: un formulario que acepta la misma clave
+        # devuelve "listo" sin haber cambiado nada, y quien la cambio por
+        # sospecha de filtracion se queda creyendo que la roto.
+        if data.new_password == data.current_password:
+            raise HTTPException(422, "la contraseña nueva tiene que ser distinta")
+
+        users.update_password(user["id"], data.new_password)
+        return _con_bandera_demo(users.get_by_id(user["id"]))
 
     # `POST /auth/demo` — el boton "Entrar a la demo" de la pantalla de login.
     #
