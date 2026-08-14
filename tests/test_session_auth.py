@@ -518,3 +518,77 @@ def test_la_password_nueva_tiene_que_ser_distinta():
     r = client.post("/auth/change-password",
                     json={"current_password": "adminpw", "new_password": "adminpw"})
     assert r.status_code == 422
+
+
+# --- empresa_nombre en el usuario ------------------------------------------
+#
+# El sidebar de libra-ui muestra `getUserSubtitle(user)` debajo del nombre del
+# producto, y Contalibra/Restolibra lo vienen usando para el nombre de la
+# empresa. Los cuatro productos que usan ESTE router no tenian de donde sacarlo
+# -- y eran exactamente los cuatro que no lo mostraban.
+
+
+def _app_con_empresa(nombre="Lagrace Comunicaciones"):
+    app = FastAPI()
+    users = _FakeJsonApiUsers()
+    app.state.users = users
+    app.state.session_auth = SessionAuth(
+        dev_secret_fallback="test-secret",
+        get_user_by_username=users.get_by_username,
+        check_credentials=users.check_credentials,
+        cookie_name="test_json_session",
+    )
+    app.include_router(
+        build_json_api_auth_router(get_empresa_nombre=lambda request: nombre)
+    )
+    return app
+
+
+def test_el_login_y_el_me_traen_el_nombre_de_la_empresa():
+    """Los DOS, no solo `/me`. Si estuviera unicamente en `/me`, el sidebar
+    aparecería sin subtitulo al loguearse y con subtitulo despues de recargar:
+    cambiaria de forma sin que nadie tocara nada."""
+    client = FastAPITestClient(_app_con_empresa(), base_url="https://testserver")
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "adminpw"})
+    assert login.json()["empresa_nombre"] == "Lagrace Comunicaciones"
+    assert client.get("/auth/me").json()["empresa_nombre"] == "Lagrace Comunicaciones"
+
+
+def test_el_cambio_de_password_tambien_lo_devuelve():
+    """Devuelve un usuario completo, asi que tiene que ser el mismo usuario que
+    devuelven los otros dos: si le faltara el campo, el frontend que refresca su
+    estado con esta respuesta se quedaria sin subtitulo despues de cambiar la
+    clave."""
+    client = FastAPITestClient(_app_con_empresa(), base_url="https://testserver")
+    client.post("/auth/login", json={"username": "admin", "password": "adminpw"})
+    r = client.post("/auth/change-password",
+                    json={"current_password": "adminpw", "new_password": "clave-nueva"})
+    assert r.json()["empresa_nombre"] == "Lagrace Comunicaciones"
+
+
+def test_sin_get_empresa_nombre_el_campo_va_en_none():
+    """El comportamiento de siempre: un producto que no lo configura sigue
+    andando y el sidebar no dibuja subtitulo. Es lo que permite que esto entre
+    sin tocar a los productos que todavia no lo usan."""
+    app = _make_json_api_app()
+    client = FastAPITestClient(app, base_url="https://testserver")
+    r = client.post("/auth/login", json={"username": "admin", "password": "adminpw"})
+    assert r.json()["empresa_nombre"] is None
+
+
+def test_la_empresa_sale_de_la_instancia_y_no_de_la_fila_del_usuario():
+    """Dos usuarios distintos de la misma instancia ven la misma empresa.
+
+    ⚠️ **Este test no puede fallar mientras la firma sea `(Request) -> str`**:
+    la funcion no recibe el usuario, asi que no tiene con que depender de el.
+    Se intento romperlo a proposito y siguio verde. Queda igual porque documenta
+    la decision y **si** se pondria rojo el dia que alguien cambie la firma a
+    una que reciba el usuario — que es exactamente el cambio que haria que la
+    empresa pasara a depender de la persona en vez de la instalacion.
+    """
+    app = _app_con_empresa("Estudio Sur")
+    for usuario, clave in (("admin", "adminpw"), ("staffer", "staffpw")):
+        client = FastAPITestClient(app, base_url="https://testserver")
+        r = client.post("/auth/login", json={"username": usuario, "password": clave})
+        assert r.json()["empresa_nombre"] == "Estudio Sur", usuario

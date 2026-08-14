@@ -150,6 +150,17 @@ class _UserOut(BaseModel):
     #: y los botones de escritura se siguen gateando por rol. Ver
     #: `json_api_require_role`.
     demo_readonly: bool = False
+    #: El nombre de la empresa que usa la instancia, para mostrarlo debajo del
+    #: nombre del producto en el sidebar (`getUserSubtitle` de libra-ui).
+    #:
+    #: Va en el usuario y no en un endpoint aparte porque es lo que el Layout ya
+    #: sabe leer: Contalibra y Restolibra lo vienen mostrando asi desde siempre,
+    #: pero arman su propio `/auth/me`. Los cuatro que usan ESTE router no tenian
+    #: de donde sacarlo, y por eso eran los cuatro que no lo mostraban.
+    #:
+    #: `None` cuando el producto no configura `get_empresa_nombre`: el sidebar
+    #: simplemente no dibuja el subtitulo, que es lo que pasaba hasta ahora.
+    empresa_nombre: str | None = None
 
 
 # Solo para `POST /auth/verify` (opt-in, ver build_json_api_auth_router).
@@ -453,6 +464,7 @@ def demo_password() -> str | None:
 def build_json_api_auth_router(
     *, incluir_verify: bool = False, incluir_password_reset: bool = False,
     incluir_demo: bool = False, min_password_length: int = 6,
+    get_empresa_nombre: Callable[[Request], str | None] | None = None,
 ) -> APIRouter:
     """Router `/auth` (login/logout/me) para SPAs sin backoffice
     server-rendered propio. Espera `request.app.state.users`/
@@ -487,8 +499,34 @@ def build_json_api_auth_router(
     defecto **6, el mismo que `PasswordResetService`**: dos caminos que cambian
     la contrasena del mismo usuario no pueden pedir cosas distintas — el que
     fuera mas laxo volveria decorativo al otro.
+
+    `get_empresa_nombre` es la funcion que devuelve el nombre de la empresa de
+    la instancia, para que salga en el usuario y el sidebar lo muestre debajo
+    del nombre del producto. Recibe el `Request` porque el dato vive en la
+    configuracion del producto (una tabla, un env, `app.state`), no en el
+    usuario: la empresa es de la INSTANCIA, no de la fila. Es opcional; sin
+    ella el campo va en `None` y el sidebar no dibuja subtitulo, que es el
+    comportamiento de siempre.
+
+    > Contalibra y Restolibra ya mostraban el nombre de la empresa porque arman
+    > su propio `/auth/me`. Los cuatro que usan este router —Gestiolibra,
+    > MedLibra, VentaLibra, LibraDesk— no tenian de donde sacarlo, y por eso
+    > eran exactamente los cuatro que no lo mostraban.
     """
     router = APIRouter(prefix="/auth", tags=["auth"])
+
+    def _salida(user: dict, request: Request) -> dict:
+        """El usuario tal como sale por la API: bandera de demo + empresa.
+
+        Todas las respuestas que devuelven un usuario pasan por aca. Si el
+        nombre de la empresa se agregara solo en `/me`, el frontend lo tendria
+        despues de recargar y no despues de loguear — y el sidebar cambiaria de
+        forma sin que nadie tocara nada.
+        """
+        datos = _con_bandera_demo(user)
+        if get_empresa_nombre is not None:
+            datos["empresa_nombre"] = get_empresa_nombre(request)
+        return datos
 
     @router.post("/login", response_model=_UserOut)
     def login(data: _LoginRequest, request: Request, response: Response):
@@ -503,7 +541,7 @@ def build_json_api_auth_router(
             raise HTTPException(401, "invalid credentials")
         json_api_get_session_auth(request).create_session_cookie(response, user["username"])
         registrar_seguro(request, LOGIN, user["username"])
-        return _con_bandera_demo(user)
+        return _salida(user, request)
 
     @router.post("/logout")
     def logout(request: Request, response: Response):
@@ -517,8 +555,8 @@ def build_json_api_auth_router(
         return {"ok": True}
 
     @router.get("/me", response_model=_UserOut)
-    def me(user: dict = Depends(json_api_get_current_user)):
-        return _con_bandera_demo(user)
+    def me(request: Request, user: dict = Depends(json_api_get_current_user)):
+        return _salida(user, request)
 
     @router.post("/change-password", response_model=_UserOut)
     def change_password(
@@ -572,7 +610,7 @@ def build_json_api_auth_router(
             raise HTTPException(422, "la contraseña nueva tiene que ser distinta")
 
         users.update_password(user["id"], data.new_password)
-        return _con_bandera_demo(users.get_by_id(user["id"]))
+        return _salida(users.get_by_id(user["id"]), request)
 
     # `POST /auth/demo` — el boton "Entrar a la demo" de la pantalla de login.
     #
@@ -630,7 +668,7 @@ def build_json_api_auth_router(
                 raise HTTPException(503, "demo user has a forbidden role")
             json_api_get_session_auth(request).create_session_cookie(response, user["username"])
             registrar_seguro(request, LOGIN, user["username"])
-            return _con_bandera_demo(user)
+            return _salida(user, request)
 
     if incluir_verify:
         @router.post("/verify", response_model=_VerifyResponse)
