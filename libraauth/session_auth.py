@@ -14,7 +14,7 @@ from typing import Callable
 
 from fastapi import APIRouter, Depends, Header, Response
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from starlette.requests import Request
 from starlette.exceptions import HTTPException
 
@@ -143,6 +143,12 @@ class _LoginRequest(BaseModel):
 
 
 class _UserOut(BaseModel):
+    # 🔑 **Acepta campos de mas, y por eso `get_extras` puede existir.** Sin
+    # esto FastAPI valida contra este modelo y **descarta en silencio** lo que
+    # no este declarado: el producto devolveria sus campos y el navegador
+    # recibiria el usuario pelado, sin error en ningun lado.
+    model_config = ConfigDict(extra="allow")
+
     id: str
     username: str
     name: str
@@ -499,6 +505,7 @@ def build_json_api_auth_router(
     max_intentos_fallidos: int = 5,
     ventana_fallidos_minutos: int = VENTANA_FALLIDOS_MINUTOS,
     prefix: str = "/auth",
+    get_extras: Callable[[Request, dict], dict] | None = None,
 ) -> APIRouter:
     """Router `/auth` (login/logout/me) para SPAs sin backoffice
     server-rendered propio. Espera `request.app.state.users`/
@@ -569,6 +576,21 @@ def build_json_api_auth_router(
         datos = _con_bandera_demo(user)
         if get_empresa_nombre is not None:
             datos["empresa_nombre"] = get_empresa_nombre(request)
+        if get_extras is not None:
+            # Campos que solo el producto sabe calcular y que su frontend
+            # espera en el usuario: los modulos habilitados, el contador de un
+            # badge, el nombre en castellano. Generaliza lo que
+            # `get_empresa_nombre` ya hacia para un campo solo.
+            #
+            # 🔴 **Van DESPUES y pueden pisar**, a proposito: un producto que
+            # tenga que devolver `name` distinto del que guarda el motor no
+            # puede hacerlo si el motor gana. Lo que no puede pisarse es lo que
+            # sostiene el gateo por rol — `role`, `active` y `demo_readonly`—,
+            # asi que esos se reponen abajo.
+            datos.update(get_extras(request, user) or {})
+            for clave in ("role", "active", "demo_readonly"):
+                if clave in datos or clave in user:
+                    datos[clave] = _con_bandera_demo(user).get(clave, datos.get(clave))
         return datos
 
     @router.post("/login", response_model=_UserOut)
