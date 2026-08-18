@@ -220,3 +220,56 @@ class SmtpSettings(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
+
+
+class DemoCodigo(Base):
+    """Un codigo de acceso a la demo publica (v0.26.0).
+
+    **Se guarda solo el sha256 del codigo**, mismo criterio que
+    `PasswordResetToken`: quien lea la base no puede entrar con lo que
+    encuentre ahi. El `prefijo` si va en claro, y es a proposito — cuatro de
+    doce caracteres no acortan una fuerza bruta a nada util, y sin ellos la
+    lista del backoffice seria una grilla de filas indistinguibles.
+
+    Vive en el mismo `Base` que `Usuario` por la razon de siempre: los
+    consumidores corren `Base.metadata.create_all(engine)` una sola vez, contra
+    el engine donde esta `usuarios`.
+
+    > 🔑 **Y de eso sale que la tabla no necesita migracion.** En los seis
+    > productos las tablas de este paquete las crea `create_all()`, no la
+    > cadena de Alembic del producto (ver `migrations/env.py` de LibraDesk):
+    > al subir el pin, la tabla aparece sola en el proximo arranque. Lo que
+    > **si** cambia de comportamiento es que la demo deja de abrirse sin
+    > codigo — ver `session_auth`, seccion demo.
+
+    No declara FK a `usuarios`: el codigo autoriza a entrar *como el visitante
+    de la demo*, que es uno solo y sale de `DEMO_USERNAME`. Atarlo a un id de
+    usuario sugeriria que se pueden emitir codigos para entrar como cualquiera,
+    que es justo lo que no tiene que poder hacerse.
+    """
+
+    __tablename__ = "demo_codigos"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # sha256 hex: 64 caracteres. Unico e indexado — es la columna por la que se
+    # busca en cada intento de ingreso.
+    codigo_hash: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True
+    )
+    # Los primeros 4 caracteres en claro, para reconocerlo en la lista.
+    prefijo: Mapped[str] = mapped_column(String(8), nullable=False, default="")
+    # A quien se le dio. Libre y opcional: no lo mira ninguna validacion.
+    etiqueta: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    # Quien lo emitio. Lo llena el router con el usuario del backoffice.
+    emitido_por: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    creado_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # Tope de ingresos y cuantos van. El tope es una columna y no una constante
+    # porque no es lo mismo un codigo para una reunion con un cliente que uno
+    # para una feria.
+    usos_max: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    usos: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    ultimo_uso: Mapped[datetime | None] = mapped_column(DateTime)
+    # Baja logica. La fila no se borra: interesa saber que ese codigo existio y
+    # cuantas veces se uso antes de cortarlo.
+    revocado: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
