@@ -24,6 +24,12 @@ import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from libraauth.demo_codigos import DemoCodigoRepository
+from libraauth.models import Base
 from libraauth.session_auth import (
     SessionAuth,
     build_json_api_auth_router,
@@ -79,6 +85,17 @@ def _app():
         cookie_name="test_session",
     )
     app.include_router(build_json_api_auth_router(incluir_demo=True))
+    # Desde v0.10.0 `POST /auth/demo` pide codigo. Se cablea el repositorio
+    # real sobre SQLite en memoria —no un doble— porque estos tests entran de
+    # verdad por ahi: con un doble complaciente, un cambio que rompa el
+    # ingreso pasaria en verde justo en el archivo que prueba que el visitante
+    # puede leer.
+    _engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(_engine)
+    app.state.demo_codigos = DemoCodigoRepository(sessionmaker(bind=_engine))
 
     @app.get("/config", dependencies=[Depends(json_api_require_admin)])
     def leer_config():
@@ -225,7 +242,10 @@ def test_el_auto_login_devuelve_la_bandera(demo_encendida):
     respuesta el menú quedaría corto hasta el primer refresco."""
     cliente = _app()
 
-    assert cliente.post("/auth/demo").json()["demo_readonly"] is True
+    codigo = cliente.app.state.demo_codigos.crear()["codigo"]
+
+    assert cliente.post(
+        "/auth/demo", json={"codigo": codigo}).json()["demo_readonly"] is True
 
 
 # ── Los guards HTML (rutas server-rendered de Contalibra/Restolibra) ───────

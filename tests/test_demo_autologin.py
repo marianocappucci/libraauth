@@ -20,11 +20,23 @@ Lo que fijan estos tests, en orden de lo que se rompe sin que se note:
 3. 🔴 **Que nunca entregue admin**, aunque el usuario nombrado lo sea. El rol
    puede cambiar despues de desplegar, desde el ABM de la propia demo.
 4. Que el consumidor tenga que pedirlo (`incluir_demo=True`).
+
+> 🔑 **Desde v0.10.0 ya no entra sin credenciales: entra con un codigo.** El
+> titulo de este archivo quedo viejo a proposito —sigue siendo el auto-login,
+> en el sentido de que no hay usuario ni contrasena que elegir—, pero el
+> ingreso indiscriminado se cerro. Lo que un codigo agrega esta en
+> `test_demo_codigos.py`; lo de aca sigue siendo *donde existe la ruta* y
+> *con que rol deja entrar*, que son preguntas independientes del codigo.
 """
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
+from libraauth.demo_codigos import DemoCodigoRepository
+from libraauth.models import Base
 from libraauth.session_auth import SessionAuth, build_json_api_auth_router
 
 
@@ -59,7 +71,7 @@ def _entorno_de_test(monkeypatch):
     monkeypatch.setenv("ENV", "development")
 
 
-def _app(*, incluir_demo=True, usuarios=None):
+def _app(*, incluir_demo=True, usuarios=None, con_codigos=True):
     app = FastAPI()
     usuarios = usuarios or _Usuarios()
     app.state.users = usuarios
@@ -70,7 +82,26 @@ def _app(*, incluir_demo=True, usuarios=None):
         cookie_name="test_demo_session",
     )
     app.include_router(build_json_api_auth_router(incluir_demo=incluir_demo))
-    return TestClient(app, base_url="https://testserver")
+    cliente = TestClient(app, base_url="https://testserver")
+    # El repositorio va cableado como en una instancia demo real
+    # (`app.state.demo_codigos`), y es **el de verdad** sobre SQLite en
+    # memoria, no un doble. Un doble que conteste "codigo valido" no probaria
+    # lo unico que importa acá, que es que sin codigo no se entra.
+    if con_codigos:
+        engine = create_engine(
+            "sqlite://", connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(engine)
+        cliente.codigos = DemoCodigoRepository(sessionmaker(bind=engine))
+        app.state.demo_codigos = cliente.codigos
+    return cliente
+
+
+def _entrar(cliente, **kw):
+    """Emite un codigo y entra con el. `kw` va a `crear()`."""
+    codigo = cliente.codigos.crear(**kw)["codigo"]
+    return cliente.post("/auth/demo", json={"codigo": codigo})
 
 
 @pytest.fixture
@@ -81,11 +112,11 @@ def demo_encendida(monkeypatch):
 
 # ── 🔴 Que exista SOLO donde debe ─────────────────────────────────────────
 
-def test_con_la_demo_encendida_el_boton_entra(demo_encendida):
+def test_con_la_demo_encendida_y_un_codigo_valido_se_entra(demo_encendida):
     """La mitad util del par: sin esto, el 404 del test de abajo no prueba
     nada — podria ser el 404 de una ruta que nunca existio."""
     cliente = _app()
-    r = cliente.post("/auth/demo")
+    r = _entrar(cliente)
 
     assert r.status_code == 200, r.text
     assert r.json()["username"] == "visitante"
@@ -166,7 +197,7 @@ def test_un_usuario_promovido_a_admin_deja_de_entrar(monkeypatch):
     monkeypatch.setenv("DEMO_USERNAME", "visitante")
     usuarios = _Usuarios()
     cliente = _app(usuarios=usuarios)
-    assert cliente.post("/auth/demo").status_code == 200
+    assert _entrar(cliente).status_code == 200
 
     usuarios._users["visitante"]["role"] = "admin"
 
@@ -206,11 +237,14 @@ def test_el_login_normal_sigue_funcionando_con_la_demo_encendida(demo_encendida)
     assert r.json()["role"] == "admin"
 
 
-def test_el_auto_login_no_recibe_cuerpo(demo_encendida):
-    """No hay contrasena que adivinar ni usuario que elegir desde afuera: el
-    usuario sale del entorno."""
+def test_el_cuerpo_solo_lleva_el_codigo(demo_encendida):
+    """Sigue sin haber usuario que elegir desde afuera: el usuario sale del
+    entorno. Mandar `username` y `password` no cambia con quien se entra —
+    los campos de mas se ignoran, y el que decide es el codigo."""
     cliente = _app()
-    r = cliente.post("/auth/demo", json={"username": "admin", "password": "adminpw"})
+    codigo = cliente.codigos.crear()["codigo"]
+    r = cliente.post("/auth/demo", json={
+        "codigo": codigo, "username": "admin", "password": "adminpw"})
 
     assert r.status_code == 200, r.text
     assert r.json()["username"] == "visitante"
@@ -226,7 +260,8 @@ def test_la_sonda_dice_que_es_una_demo(demo_encendida):
     r = _app().get("/auth/demo")
 
     assert r.status_code == 200, r.text
-    assert r.json() == {"enabled": True, "username": "visitante"}
+    assert r.json() == {"enabled": True, "username": "visitante",
+                        "requiere_codigo": True}
 
 
 def test_la_sonda_no_existe_fuera_de_una_demo(monkeypatch):

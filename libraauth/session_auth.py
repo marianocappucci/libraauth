@@ -20,6 +20,7 @@ from starlette.exceptions import HTTPException
 
 from .auth_events import LOGIN, LOGIN_FALLIDO, LOGOUT, registrar_seguro
 from .crypto import ClaveDeCifradoAusente
+from .demo_codigos import CodigoInvalido, DIAS_DEFECTO, USOS_DEFECTO
 from .password_reset import EmailNotConfigured, InvalidResetToken
 from .smtp_settings import SIN_CAMBIOS
 
@@ -180,6 +181,24 @@ class _DemoInfo(BaseModel):
     explicita es lo que distingue este JSON de cualquier otro `200`."""
     enabled: bool
     username: str
+    #: Desde v0.10.0 es **siempre `True`**, y esta igual por lo mismo que
+    #: `enabled`: la pantalla de login tiene que decidir si dibuja un boton
+    #: suelto o un boton con campo de codigo, y eso no se puede resolver en
+    #: tiempo de build. Un frontend viejo que ignore la clave sigue viendo el
+    #: boton — y recibe un `401` con el mensaje que explica que falta.
+    requiere_codigo: bool = True
+
+
+class _DemoLoginRequest(BaseModel):
+    """Cuerpo de `POST /auth/demo`. Antes no recibia nada."""
+    codigo: str = ""
+
+
+class _DemoCodigoIn(BaseModel):
+    """Alta de un codigo, desde el backoffice."""
+    etiqueta: str = ""
+    dias: int = DIAS_DEFECTO
+    usos_max: int = USOS_DEFECTO
 
 
 # Solo para el par de endpoints de recuperacion (opt-in, ver
@@ -461,6 +480,15 @@ def demo_password() -> str | None:
     return os.environ.get(DEMO_PASSWORD, "") or None
 
 
+def _prefijo_tipeado(data) -> str:
+    """Los primeros 4 caracteres del codigo que llego, para el log de accesos.
+
+    **Nunca el codigo entero.** Alcanza para reconocer un barrido en el log y
+    no deja un codigo valido escrito en una tabla que se exporta con el backup.
+    """
+    return ((data.codigo if data else "") or "")[:4]
+
+
 def build_json_api_auth_router(
     *, incluir_verify: bool = False, incluir_password_reset: bool = False,
     incluir_demo: bool = False, min_password_length: int = 6,
@@ -639,14 +667,30 @@ def build_json_api_auth_router(
             donde no da lo mismo. El `username` si, porque es lo que el boton
             necesita mostrar.
             """
-            return {"enabled": True, "username": demo_username()}
+            return {"enabled": True, "username": demo_username(),
+                    "requiere_codigo": True}
 
         @router.post("/demo", response_model=_UserOut)
-        def demo(request: Request, response: Response):
-            """Entra a la demo publica sin credenciales.
+        def demo(request: Request, response: Response,
+                 data: _DemoLoginRequest | None = None):
+            """Entra a la demo publica con un codigo de acceso.
 
-            No recibe cuerpo y no hay contrasena que adivinar: el usuario sale
-            de `DEMO_USERNAME`, que lo fija quien despliega la instancia.
+            El usuario sale de `DEMO_USERNAME`, que lo fija quien despliega la
+            instancia; lo que hay que traer es el **codigo**, emitido desde el
+            backoffice (ver `build_demo_codigos_router`).
+
+            🔴 **Hasta v0.9.x este endpoint no recibia nada y entraba de una.**
+            Cualquiera que supiera la URL de `demo.<producto>.com.ar` estaba
+            adentro. Desde v0.10.0 hace falta un codigo vigente, con
+            vencimiento y tope de usos.
+
+            🔴 **Falla cerrado si el repositorio no esta configurado**, y esa
+            es la parte que importa al subir el pin: una instancia demo que
+            actualice el motor sin cablear `app.state.demo_codigos` deja de
+            dejar entrar, en vez de seguir abierta. Es incomodo a proposito —
+            la alternativa (si no hay repo, entrar sin codigo) convierte un
+            olvido de configuracion en una demo publica abierta, que es
+            exactamente lo que este cambio existe para cerrar.
 
             🔴 **Nunca entrega un rol de la lista prohibida.** El chequeo esta
             aca y no en el despliegue porque el rol del usuario puede cambiar
@@ -666,6 +710,35 @@ def build_json_api_auth_router(
                 raise HTTPException(503, "demo user not provisioned")
             if user["role"] in ROLES_PROHIBIDOS_EN_DEMO:
                 raise HTTPException(503, "demo user has a forbidden role")
+
+            # 🔑 **El codigo se consume aca, y no arriba.** Consumiendolo antes
+            # de resolver al usuario, una instancia mal sembrada devolveria 503
+            # habiendo gastado un uso de un codigo valido: el visitante pierde
+            # intentos por un problema que no es suyo. Consumido aca, el gasto
+            # ocurre inmediatamente antes de crear la sesion.
+            codigos = getattr(request.app.state, "demo_codigos", None)
+            if codigos is None:
+                # Fail-closed. Una instancia demo que suba el pin del motor sin
+                # cablear el repositorio deja de dejar entrar, en vez de seguir
+                # abierta como antes de v0.10.0.
+                raise HTTPException(503, "demo access codes not configured")
+            try:
+                codigos.consumir(data.codigo if data else "")
+            except CodigoInvalido as exc:
+                # El intento se anota con el PREFIJO del codigo tipeado, no
+                # con el codigo: alcanza para ver un barrido en el log de
+                # accesos y no deja un codigo valido escrito en una tabla que
+                # se exporta.
+                registrar_seguro(
+                    request, LOGIN_FALLIDO,
+                    f"{username} (codigo {_prefijo_tipeado(data)}…)")
+                # 🔴 **Un solo mensaje para los cuatro motivos.** Distinguir
+                # "no existe" de "vencido" o "agotado" le dice a quien prueba
+                # codigos al azar cual de sus intentos estuvo cerca. El motivo
+                # real viaja en `exc.motivo` para el log del servidor.
+                raise HTTPException(
+                    401, "el código no es válido o ya venció") from exc
+
             json_api_get_session_auth(request).create_session_cookie(response, user["username"])
             registrar_seguro(request, LOGIN, user["username"])
             return _salida(user, request)
@@ -790,5 +863,66 @@ def build_smtp_settings_router(*, prefix: str = "/admin/smtp") -> APIRouter:
         repo = request.app.state.smtp_settings
         repo.delete()
         return repo.estado()
+
+    return router
+
+
+def build_demo_codigos_router(*, prefix: str = "/admin/demo-codigos") -> APIRouter:
+    """ABM de codigos de acceso a la demo, para el backoffice (v0.10.0).
+
+    Espera `request.app.state.demo_codigos` con un `DemoCodigoRepository`.
+    Opt-in y aparte del router de `/auth` por lo mismo que
+    `build_smtp_settings_router`: es administracion, no autenticacion, y
+    montarlo sin el repositorio publicaria endpoints que fallan.
+
+    **Todo exige rol admin o token de servicio.** El backoffice llega con
+    `X-Internal-Auth` por la red interna de Docker; un admin de la propia
+    instancia tambien puede, que es lo que permite emitir un codigo sin
+    depender del backoffice.
+
+    🔴 **Se monta solo en la instancia DEMO.** El guard de arriba lo permitiria
+    en cualquiera, pero una instancia de cliente no tiene demo que abrir: ahi
+    la tabla existiria vacia y los endpoints no significarian nada. Quien
+    monta decide, igual que con `incluir_demo`.
+    """
+    router = APIRouter(prefix=prefix, tags=["demo"])
+
+    @router.get("")
+    def listar(request: Request, _: dict = Depends(json_api_require_admin_o_servicio)):
+        """Los codigos emitidos. **Ninguno trae el codigo en si** — ver el
+        docstring de `demo_codigos`: de la base no sale nada usable."""
+        return {"codigos": request.app.state.demo_codigos.listar()}
+
+    @router.post("", status_code=201)
+    def emitir(
+        data: _DemoCodigoIn,
+        request: Request,
+        usuario: dict = Depends(json_api_require_admin_o_servicio),
+    ):
+        """Emite un codigo y lo devuelve **en claro por unica vez**.
+
+        Quien llama tiene que mostrarlo en ese momento: no hay forma de
+        recuperarlo despues, y volver a pedirlo es emitir otro.
+        """
+        try:
+            return request.app.state.demo_codigos.crear(
+                etiqueta=data.etiqueta, dias=data.dias, usos_max=data.usos_max,
+                emitido_por=usuario.get("username", ""),
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @router.delete("/{codigo_id}")
+    def revocar(
+        codigo_id: int,
+        request: Request,
+        _: dict = Depends(json_api_require_admin_o_servicio),
+    ):
+        """Corta un codigo sin borrar la fila: interesa saber que existio y
+        cuantas veces se uso antes de cortarlo."""
+        try:
+            return request.app.state.demo_codigos.revocar(codigo_id)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
 
     return router
