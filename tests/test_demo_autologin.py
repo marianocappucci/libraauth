@@ -21,7 +21,7 @@ Lo que fijan estos tests, en orden de lo que se rompe sin que se note:
    puede cambiar despues de desplegar, desde el ABM de la propia demo.
 4. Que el consumidor tenga que pedirlo (`incluir_demo=True`).
 
-> 🔑 **Desde v0.10.0 ya no entra sin credenciales: entra con un codigo.** El
+> 🔑 **Desde v0.26.0 ya no entra sin credenciales: entra con un codigo.** El
 > titulo de este archivo quedo viejo a proposito —sigue siendo el auto-login,
 > en el sentido de que no hay usuario ni contrasena que elegir—, pero el
 > ingreso indiscriminado se cerro. Lo que un codigo agrega esta en

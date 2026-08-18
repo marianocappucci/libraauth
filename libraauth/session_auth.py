@@ -181,7 +181,7 @@ class _DemoInfo(BaseModel):
     explicita es lo que distingue este JSON de cualquier otro `200`."""
     enabled: bool
     username: str
-    #: Desde v0.10.0 es **siempre `True`**, y esta igual por lo mismo que
+    #: Desde v0.26.0 es **siempre `True`**, y esta igual por lo mismo que
     #: `enabled`: la pantalla de login tiene que decidir si dibuja un boton
     #: suelto o un boton con campo de codigo, y eso no se puede resolver en
     #: tiempo de build. Un frontend viejo que ignore la clave sigue viendo el
@@ -679,9 +679,9 @@ def build_json_api_auth_router(
             instancia; lo que hay que traer es el **codigo**, emitido desde el
             backoffice (ver `build_demo_codigos_router`).
 
-            🔴 **Hasta v0.9.x este endpoint no recibia nada y entraba de una.**
+            🔴 **Hasta v0.25.x este endpoint no recibia nada y entraba de una.**
             Cualquiera que supiera la URL de `demo.<producto>.com.ar` estaba
-            adentro. Desde v0.10.0 hace falta un codigo vigente, con
+            adentro. Desde v0.26.0 hace falta un codigo vigente, con
             vencimiento y tope de usos.
 
             🔴 **Falla cerrado si el repositorio no esta configurado**, y esa
@@ -720,7 +720,7 @@ def build_json_api_auth_router(
             if codigos is None:
                 # Fail-closed. Una instancia demo que suba el pin del motor sin
                 # cablear el repositorio deja de dejar entrar, en vez de seguir
-                # abierta como antes de v0.10.0.
+                # abierta como antes de v0.26.0.
                 raise HTTPException(503, "demo access codes not configured")
             try:
                 codigos.consumir(data.codigo if data else "")
@@ -868,7 +868,7 @@ def build_smtp_settings_router(*, prefix: str = "/admin/smtp") -> APIRouter:
 
 
 def build_demo_codigos_router(*, prefix: str = "/admin/demo-codigos") -> APIRouter:
-    """ABM de codigos de acceso a la demo, para el backoffice (v0.10.0).
+    """ABM de codigos de acceso a la demo, para el backoffice (v0.26.0).
 
     Espera `request.app.state.demo_codigos` con un `DemoCodigoRepository`.
     Opt-in y aparte del router de `/auth` por lo mismo que

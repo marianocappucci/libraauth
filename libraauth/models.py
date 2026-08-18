@@ -223,7 +223,7 @@ class SmtpSettings(Base):
 
 
 class DemoCodigo(Base):
-    """Un codigo de acceso a la demo publica (v0.10.0).
+    """Un codigo de acceso a la demo publica (v0.26.0).
 
     **Se guarda solo el sha256 del codigo**, mismo criterio que
     `PasswordResetToken`: quien lea la base no puede entrar con lo que

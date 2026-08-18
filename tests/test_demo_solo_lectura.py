@@ -85,7 +85,7 @@ def _app():
         cookie_name="test_session",
     )
     app.include_router(build_json_api_auth_router(incluir_demo=True))
-    # Desde v0.10.0 `POST /auth/demo` pide codigo. Se cablea el repositorio
+    # Desde v0.26.0 `POST /auth/demo` pide codigo. Se cablea el repositorio
     # real sobre SQLite en memoria —no un doble— porque estos tests entran de
     # verdad por ahi: con un doble complaciente, un cambio que rompa el
     # ingreso pasaria en verde justo en el archivo que prueba que el visitante

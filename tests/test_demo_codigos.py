@@ -1,10 +1,10 @@
-"""El codigo de acceso a la demo publica (v0.10.0).
+"""El codigo de acceso a la demo publica (v0.26.0).
 
 > *"Las demos no tienen que ser libres, se debe pedir un codigo que es el que
 > van a cargar en la demo y asi poder ingresar, sacamos el ingreso a las demos
 > de forma indiscriminada."*
 
-Hasta v0.9.x `POST /auth/demo` no recibia nada y entraba: cualquiera que
+Hasta v0.25.x `POST /auth/demo` no recibia nada y entraba: cualquiera que
 supiera la URL de `demo.<producto>.com.ar` estaba adentro de un sistema
 completo. Estos tests fijan que eso se cerro, y **que se cerro por el motivo
 correcto**.
@@ -130,7 +130,7 @@ def test_con_codigo_valido_se_entra(repo):
 
 
 def test_sin_cuerpo_no_se_entra(repo):
-    """🔴 Es exactamente la llamada que hacia el frontend hasta v0.9.x, y la
+    """🔴 Es exactamente la llamada que hacia el frontend hasta v0.25.x, y la
     que hara cualquier bundle viejo que quede servido despues del deploy.
 
     Da 401 y no 422 a proposito: el cuerpo es opcional en la firma justamente

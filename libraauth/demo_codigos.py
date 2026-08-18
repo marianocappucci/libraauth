@@ -2,10 +2,10 @@
 Codigos de acceso a la demo publica: emitirlos, listarlos, revocarlos y
 consumirlos.
 
-**Por que existe.** Hasta v0.9.x la demo se abria con `POST /auth/demo` sin
+**Por que existe.** Hasta v0.25.x la demo se abria con `POST /auth/demo` sin
 nada: cualquiera que supiera la URL entraba. Eso convertia a una instancia con
 datos de muestra —que se arma para mostrarsela a un cliente concreto— en una
-aplicacion abierta a internet. Desde v0.10.0 la demo pide un codigo, y los
+aplicacion abierta a internet. Desde v0.26.0 la demo pide un codigo, y los
 codigos los emite el backoffice.
 
 **De la base no sale ningun codigo usable.** Se guarda solo su sha256, igual
