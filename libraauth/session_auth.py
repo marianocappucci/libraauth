@@ -18,7 +18,10 @@ from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.exceptions import HTTPException
 
-from .auth_events import LOGIN, LOGIN_FALLIDO, LOGOUT, registrar_seguro
+from .auth_events import (
+    LOGIN, LOGIN_BLOQUEADO, LOGIN_FALLIDO, LOGOUT, VENTANA_FALLIDOS_MINUTOS,
+    contar_fallidos_seguro, registrar_seguro,
+)
 from .crypto import ClaveDeCifradoAusente
 from .demo_codigos import CodigoInvalido, DIAS_DEFECTO, USOS_DEFECTO
 from .password_reset import EmailNotConfigured, InvalidResetToken
@@ -493,6 +496,9 @@ def build_json_api_auth_router(
     *, incluir_verify: bool = False, incluir_password_reset: bool = False,
     incluir_demo: bool = False, min_password_length: int = 6,
     get_empresa_nombre: Callable[[Request], str | None] | None = None,
+    max_intentos_fallidos: int = 5,
+    ventana_fallidos_minutos: int = VENTANA_FALLIDOS_MINUTOS,
+    prefix: str = "/auth",
 ) -> APIRouter:
     """Router `/auth` (login/logout/me) para SPAs sin backoffice
     server-rendered propio. Espera `request.app.state.users`/
@@ -541,7 +547,16 @@ def build_json_api_auth_router(
     > MedLibra, VentaLibra, LibraDesk— no tenian de donde sacarlo, y por eso
     > eran exactamente los cuatro que no lo mostraban.
     """
-    router = APIRouter(prefix="/auth", tags=["auth"])
+    # 🔑 `prefix` configurable, como ya lo aceptan `build_smtp_settings_router`
+    # y `build_demo_codigos_router`. El default `/auth` es lo que ya usan los
+    # cuatro consumidores actuales, asi que no mueve nada.
+    #
+    # Existe por Contalibra y Restolibra: sirven su auth bajo `/api` desde
+    # siempre, con el frontend y los integradores apuntando ahi. Sin este
+    # parametro, adoptar este router les obligaria a mover siete rutas
+    # publicas — y esa sola diferencia alcanzaba para que siguieran con una
+    # copia propia, que es justamente lo que se esta terminando.
+    router = APIRouter(prefix=prefix, tags=["auth"])
 
     def _salida(user: dict, request: Request) -> dict:
         """El usuario tal como sale por la API: bandera de demo + empresa.
@@ -558,6 +573,29 @@ def build_json_api_auth_router(
 
     @router.post("/login", response_model=_UserOut)
     def login(data: _LoginRequest, request: Request, response: Response):
+        # 🔴 **El corte va ANTES de chequear la credencial, no despues.**
+        # Chequear primero y cortar despues le contestaria distinto a quien
+        # acerto la clave que a quien no, y eso convierte al rate limiting en
+        # un oraculo: probando contra una IP ya bloqueada se puede distinguir
+        # una contrasena correcta de una incorrecta por la forma del rechazo.
+        #
+        # La ventana es deslizante sobre `auth_log` y no guarda estado nuevo:
+        # cuenta los `login_fallido` de esta IP en los ultimos N minutos. Un
+        # login que sale bien no borra los fallidos previos — a los N minutos
+        # se caen solos de la ventana.
+        #
+        # Con `max_intentos_fallidos=0` no se cuenta nada: es la unica forma de
+        # apagarlo, y existe porque un consumidor detras de un proxy que no
+        # reenvie la IP real veria a todos sus usuarios como una sola.
+        if max_intentos_fallidos:
+            recientes = contar_fallidos_seguro(request, ventana_fallidos_minutos)
+            if recientes >= max_intentos_fallidos:
+                registrar_seguro(request, LOGIN_BLOQUEADO, data.username)
+                raise HTTPException(
+                    429,
+                    "Demasiados intentos fallidos. Esperá "
+                    f"{ventana_fallidos_minutos} minutos e intentá de nuevo.",
+                )
         users = request.app.state.users
         user = users.check_credentials(data.username, data.password)
         if user is None:
