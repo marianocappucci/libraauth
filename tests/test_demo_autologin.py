@@ -291,3 +291,49 @@ def test_la_sonda_no_devuelve_la_contrasena(demo_encendida, monkeypatch):
 
     assert r.status_code == 200
     assert "una-clave-muy-reconocible" not in r.text
+
+
+# ── 🔴 La ruta registrada y el entorno cambiado ───────────────────────────
+#
+# El `if` que registra estas rutas ya llamó a `demo_username()`. Mientras el
+# handler la volvía a llamar, existía un estado en el que la ruta está
+# registrada y la función devuelve `None` — y ahí `GET /auth/demo` contestaba
+# `500 ResponseValidationError` en vez de un JSON, porque `username` no admite
+# nulo.
+#
+# No es teórico: lo destapó la suite de LibraDesk (2026-08-18), donde el router
+# se arma al importar el módulo y un test que lo recarga con `DEMO_MODE` puesto
+# le deja la ruta registrada al test siguiente, que ya no tiene esa variable.
+
+def test_la_sonda_contesta_aunque_el_entorno_haya_cambiado(demo_encendida, monkeypatch):
+    """La app se arma con la demo encendida y el entorno cambia después.
+
+    En un proceso real eso no pasa —el `.env` se lee al arrancar— pero un
+    endpoint que devuelve 500 según el orden en que se hagan las cosas lo va a
+    devolver alguna vez, y el 500 no dice qué pasó.
+    """
+    cliente = _app()
+    monkeypatch.delenv("DEMO_MODE", raising=False)
+    monkeypatch.delenv("DEMO_USERNAME", raising=False)
+
+    r = cliente.get("/auth/demo")
+
+    assert r.status_code == 200, r.text
+    # Sigue diciendo el usuario con el que se registró: es el que la instancia
+    # tiene sembrado en la base, que tampoco cambió.
+    assert r.json()["username"] == "visitante"
+
+
+def test_el_ingreso_tambien_sobrevive_al_cambio_de_entorno(demo_encendida, monkeypatch):
+    """La otra ruta del par. Sin esto, `POST /auth/demo` buscaría el usuario
+    `None` y contestaría `503 not provisioned` — que manda a mirar la siembra
+    de la instancia cuando el problema es otro."""
+    cliente = _app()
+    codigo = cliente.codigos.crear()["codigo"]
+    monkeypatch.delenv("DEMO_MODE", raising=False)
+    monkeypatch.delenv("DEMO_USERNAME", raising=False)
+
+    r = cliente.post("/auth/demo", json={"codigo": codigo})
+
+    assert r.status_code == 200, r.text
+    assert r.json()["username"] == "visitante"

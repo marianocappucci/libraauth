@@ -645,7 +645,12 @@ def build_json_api_auth_router(
     # Se registra **solo si el consumidor lo pidio Y las dos variables de
     # entorno estan puestas**. En cualquier otra instancia la ruta no existe
     # (ver `demo_username` para que contesta realmente una app con catch-all).
-    if incluir_demo and demo_username():
+    if incluir_demo and (usuario_de_la_demo := demo_username()):
+        # 🔑 **Se captura aca, no se vuelve a preguntar adentro del handler.**
+        # El `if` de arriba ya decidio que hay demo y con que usuario; leerlo de
+        # nuevo por request abre el caso "ruta registrada y `demo_username()`
+        # devolviendo None", que es un `500 ResponseValidationError` en vez de
+        # un JSON. La ruta y el nombre son la misma decision: se toman juntos.
         @router.get("/demo", response_model=_DemoInfo)
         def demo_info():
             """Le dice al frontend si esta instancia es una demo publica.
@@ -667,7 +672,7 @@ def build_json_api_auth_router(
             donde no da lo mismo. El `username` si, porque es lo que el boton
             necesita mostrar.
             """
-            return {"enabled": True, "username": demo_username(),
+            return {"enabled": True, "username": usuario_de_la_demo,
                     "requiere_codigo": True}
 
         @router.post("/demo", response_model=_UserOut)
@@ -699,7 +704,7 @@ def build_json_api_auth_router(
             haya tocado el `.env`. Es la clase de cambio que no deja rastro
             hasta que ya paso.
             """
-            username = demo_username()
+            username = usuario_de_la_demo
             users = request.app.state.users
             user = users.get_by_username(username)
             if user is None or not user.get("active"):
