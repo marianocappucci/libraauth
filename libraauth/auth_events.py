@@ -33,6 +33,11 @@ from .models import AuthEvent
 LOGIN = "login"
 LOGOUT = "logout"
 LOGIN_FALLIDO = "login_fallido"
+#: Un intento rechazado por el rate limiting, sin llegar a chequear la clave.
+#: El string es **el mismo que ya venian anotando Contalibra y Restolibra** con
+#: su rate limiting propio: cambiarlo partiria en dos el historial de esas dos
+#: instancias, donde los bloqueos viejos y los nuevos dejarian de agruparse.
+LOGIN_BLOQUEADO = "login_bloqueado"
 
 # Mismo valor que usa `libracore.db.logs.contar_login_fallidos_recientes`.
 VENTANA_FALLIDOS_MINUTOS = 15
@@ -161,3 +166,24 @@ def registrar_seguro(request: Request, evento: str, username: str, detalle: str 
         repo.registrar(evento, username, ip_del_request(request), detalle)
     except Exception:  # noqa: BLE001 — a proposito, ver docstring
         pass
+
+
+def contar_fallidos_seguro(request: Request, minutos: int = VENTANA_FALLIDOS_MINUTOS) -> int:
+    """Intentos fallidos recientes desde la IP del request, o **0** si no se
+    puede saber.
+
+    🔴 **Devuelve 0 ante cualquier problema, y eso es a proposito.** Este
+    numero alimenta el rate limiting del login: si la tabla no existe, el
+    producto no configuro `auth_events` o la base esta trabada, la alternativa
+    a devolver 0 es tratar a todo el mundo como si hubiera agotado sus
+    intentos — o sea, **dejar a todos afuera porque falla el que cuenta**. Es
+    el mismo criterio que `registrar_seguro`: el rate limiting es defensa en
+    profundidad, no la puerta.
+    """
+    repo = getattr(request.app.state, "auth_events", None)
+    if repo is None:
+        return 0
+    try:
+        return repo.contar_fallidos_recientes(ip_del_request(request), minutos)
+    except Exception:  # noqa: BLE001 — ver docstring
+        return 0
