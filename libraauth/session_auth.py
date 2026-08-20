@@ -404,6 +404,52 @@ def token_de_servicio_valido(request: Request) -> bool:
     return bool(recibido) and hmac.compare_digest(recibido, esperado)
 
 
+# ── Credencial del panel del cliente ────────────────────────────────────────
+#
+# Segunda credencial de servicio, deliberadamente **separada** de la de arriba.
+#
+# 🔴 `LIBRA_SERVICE_TOKEN` es **por producto, no por instancia**. Medido el
+# 2026-08-20 en el VPS: `contalibra` y `contalibra-demo` comparten uno, y
+# `libradesk-lagrace` y `libradesk-compulibra` —**dos clientes distintos**—
+# tambien. Es correcto para lo que es: el backoffice del proveedor administra
+# todas las instancias de un producto.
+#
+# Pero el panel de un CLIENTE lee sus instancias y las de nadie mas. Darle el
+# token de servicio le abriria las de los demas, empezando por la de la propia
+# empresa del proveedor. Por eso lleva su propia variable —distinta en cada
+# instancia— y su propio header: una filtrada expone la lectura de agregados de
+# UNA sucursal, y no se puede repetir como token de servicio.
+#
+# Ver wiki/analyses/panel-del-dueno-multisucursal.md.
+PANEL_TOKEN_HEADER = "x-panel-auth"
+PANEL_TOKEN_ENV = "LIBRA_PANEL_TOKEN"
+
+#: Identidad de una request del panel. Como `SERVICE_USER` no es un usuario
+#  real; a diferencia de aquella, el panel solo lee.
+PANEL_USER = {
+    "id": None,
+    "username": "@panel",
+    "name": "Panel del cliente",
+    "role": "admin",
+    "active": True,
+    "es_panel": True,
+}
+
+
+def token_de_panel_valido(request: Request) -> bool:
+    """Igual que `token_de_servicio_valido`, con otra variable y otro header.
+
+    **Opt-in por ausencia**: sin la variable en el entorno devuelve False sin
+    mirar el header, asi que una instancia que no participa de ningun panel no
+    expone nada de mas.
+    """
+    esperado = os.environ.get(PANEL_TOKEN_ENV, "")
+    if not esperado:
+        return False
+    recibido = request.headers.get(PANEL_TOKEN_HEADER, "")
+    return bool(recibido) and hmac.compare_digest(recibido, esperado)
+
+
 def json_api_require_admin_o_servicio(request: Request) -> dict:
     """Rol admin del producto **o** token de servicio valido.
 
