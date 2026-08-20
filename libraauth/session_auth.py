@@ -450,6 +450,30 @@ def token_de_panel_valido(request: Request) -> bool:
     return bool(recibido) and hmac.compare_digest(recibido, esperado)
 
 
+def json_api_require_panel_o_admin(request: Request) -> dict:
+    """Credencial del panel del cliente **o** un admin de esta instancia.
+
+    El admin sirve para que la pantalla del propio producto pueda consumir el
+    mismo endpoint sin una segunda implementacion, y para poder probarlo con una
+    sesion normal.
+
+    🔴 **No acepta el token de servicio a proposito.** Ese es del backoffice del
+    proveedor y es compartido entre las instancias de un producto; aceptarlo
+    haria que la credencial del panel de un cliente valiera para las instancias
+    de otro. Ver el comentario de `PANEL_TOKEN_ENV`.
+
+    Vive aca y no en libracore porque es autenticacion, y porque **libracore no
+    depende de este paquete**: son motores peers. El router del resumen recibe
+    esta funcion inyectada.
+    """
+    if token_de_panel_valido(request):
+        return dict(PANEL_USER)
+    usuario = json_api_get_current_user(request, request.app.state.session_auth)
+    if usuario["role"] == "admin":
+        return usuario
+    raise HTTPException(403, "No autorizado")
+
+
 def json_api_require_admin_o_servicio(request: Request) -> dict:
     """Rol admin del producto **o** token de servicio valido.
 

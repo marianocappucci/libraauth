@@ -98,3 +98,55 @@ def test_los_headers_y_las_variables_son_distintos():
     vacuo y esto lo delata."""
     assert PANEL_TOKEN_HEADER != SERVICE_TOKEN_HEADER
     assert PANEL_TOKEN_ENV != SERVICE_TOKEN_ENV
+
+
+# ── El guard, que es lo que monta el router del resumen ─────────────────────
+
+def _app_con_guard(session_auth):
+    from fastapi import Depends, FastAPI
+
+    from libraauth.session_auth import json_api_require_panel_o_admin
+
+    app = FastAPI()
+    app.state.session_auth = session_auth
+
+    @app.get("/protegido")
+    def protegido(u: dict = Depends(json_api_require_panel_o_admin)):
+        return {"quien": u["username"]}
+
+    return app
+
+
+class _SesionFalsa:
+    """Un  minimo: devuelve el usuario que le pongan, o ninguno."""
+
+    def __init__(self, usuario=None):
+        self._usuario = usuario
+
+    def get_current_user(self, request):
+        return self._usuario
+
+
+def test_el_guard_deja_entrar_al_panel(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv(PANEL_TOKEN_ENV, TOKEN_PANEL)
+    cliente = TestClient(_app_con_guard(_SesionFalsa()))
+
+    resp = cliente.get("/protegido", headers={PANEL_TOKEN_HEADER: TOKEN_PANEL})
+
+    assert resp.status_code == 200
+    assert resp.json()["quien"] == "@panel"
+
+
+def test_el_guard_NO_deja_entrar_con_el_token_de_servicio(monkeypatch):
+    """Lo mismo que arriba, pero en la puerta que usa el producto."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv(SERVICE_TOKEN_ENV, TOKEN_SERVICIO)
+    monkeypatch.setenv(PANEL_TOKEN_ENV, TOKEN_PANEL)
+    cliente = TestClient(_app_con_guard(_SesionFalsa()))
+
+    resp = cliente.get("/protegido", headers={SERVICE_TOKEN_HEADER: TOKEN_SERVICIO})
+
+    assert resp.status_code in (401, 403)
