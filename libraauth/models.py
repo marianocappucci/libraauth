@@ -273,3 +273,67 @@ class DemoCodigo(Base):
     # Baja logica. La fila no se borra: interesa saber que ese codigo existio y
     # cuantas veces se uso antes de cortarlo.
     revocado: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class AceptacionTerminos(Base):
+    """Una aceptacion de los Terminos y Condiciones del Servicio (v0.30.0).
+
+    **Es prueba, no configuracion.** La fila es lo que sostiene la clausula 30.3
+    del contrato: quien acepto, cuando, desde que IP, que version y **el sha256
+    del texto exacto** que tenia delante. Sin el hash, dentro de dos anios no hay
+    forma de demostrar que lo aceptado es lo que hoy esta publicado.
+
+    **La aceptacion es de la INSTANCIA, no de cada usuario.** El contrato se
+    celebra con el Cliente, y quien lo obliga es su responsable (clausula 30.5),
+    no cada operador que entra. Por eso el gate pregunta si *la instancia* tiene
+    una aceptacion de la version vigente, y no si la tiene el usuario que esta
+    entrando. La columna `usuario_id` dice **quien** acepto; no es una clave por
+    la que se decida quien pasa.
+
+    🔴 **La FK va con `SET NULL`, no con `CASCADE`.** `UserRepository.delete()`
+    borra usuarios, y con CASCADE ese borrado se llevaria puesta la prueba de la
+    aceptacion — justo la fila que existe para sobrevivir a todo lo demas. Con
+    RESTRICT (el default) pasaria lo contrario: no se podria borrar nunca mas al
+    usuario que acepto. `SET NULL` deja las dos cosas en pie, y por eso
+    `username` se guarda **denormalizado y en claro**: cuando el id se anula, esa
+    columna es lo unico que queda diciendo quien fue.
+
+    > ⚠️ En SQLite el `SET NULL` solo corre con `PRAGMA foreign_keys=ON`, que
+    > SQLAlchemy no prende por su cuenta. Ahi el id queda colgado en vez de
+    > anularse. Es inocuo para lo que la tabla tiene que probar —el dato
+    > probatorio es `username` + `ts` + `hash_texto`, no el id— pero conviene
+    > saberlo antes de escribir un JOIN que asuma que el id resuelve.
+
+    Vive en el mismo `Base` que `Usuario` por la razon de siempre: los
+    consumidores corren `Base.metadata.create_all(engine)` contra el engine donde
+    esta `usuarios`, que en Gestiolibra/MedLibra/VentaLibra es la base de
+    LibraCore y no la del dominio. Una FK a una `usuarios` que no este en la
+    misma MetaData no resuelve y corta el `create_all` entero.
+
+    Y de eso sale que **no necesita migracion**: en los ocho productos las tablas
+    de este paquete las crea `create_all()`, no la cadena de Alembic del
+    producto. Al subir el pin, la tabla aparece sola en el proximo arranque.
+    """
+
+    __tablename__ = "aceptaciones_terminos"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    usuario_id: Mapped[int | None] = mapped_column(
+        ForeignKey("usuarios.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    #: Denormalizado a proposito: sobrevive al borrado del usuario. Ver docstring.
+    username: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    #: Nombre visible al momento de aceptar. Tambien congelado: si despues cambia,
+    #: la prueba tiene que seguir diciendo el que estaba.
+    nombre: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    version: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    #: sha256 hex del texto exacto, 64 caracteres. Es la clausula 30.3.
+    hash_texto: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: Hora local, mismo criterio que `auth_log` y `actividad_log`: las tres se
+    #: leen juntas cuando alguien reconstruye que paso, y una en UTC quedaria
+    #: tres horas corrida contra las otras dos.
+    aceptado_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.now, server_default=ahora_local()
+    )
+    ip: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    user_agent: Mapped[str] = mapped_column(String(400), nullable=False, default="")

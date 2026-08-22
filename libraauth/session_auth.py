@@ -345,6 +345,22 @@ def json_api_require_role(*roles: str):
     def _dependency(
         request: Request, user: dict = Depends(json_api_get_current_user),
     ) -> dict:
+        # 🔴 **El gate de Terminos va ANTES del chequeo de rol, no despues.**
+        # Al reves, alguien sin el rol pedido recibiria `403 forbidden` en una
+        # instancia que en realidad esta frenada por otra cosa, y la pantalla de
+        # aceptacion no aparecereria nunca para el. Adelante, los dos rechazos
+        # se distinguen por el `code` del `detail`.
+        #
+        # Va aca y no en `json_api_get_current_user` porque ESA es la identidad
+        # pelada: la usan `/auth/me`, `/auth/change-password` y el propio router
+        # de Terminos. Gatearla cerraria el gate sobre si mismo y no habria
+        # forma de aceptar.
+        #
+        # Import diferido: `terminos` importa `es_visitante_de_demo` de este
+        # modulo, asi que a nivel de modulo seria un ciclo.
+        from .terminos import exigir_terminos
+
+        exigir_terminos(request, user)
         if user["role"] in roles:
             return user
         if request.method in _METODOS_DE_LECTURA and es_visitante_de_demo(user):
