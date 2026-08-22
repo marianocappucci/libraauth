@@ -16,11 +16,12 @@ usan Contalibra y Restolibra. Esto es la misma tabla y el mismo contrato, sobre
 SQLAlchemy, para los productos cuyo dominio no vive en sqlite3 crudo. Ver
 `models.AuthEvent` para por que la tabla conserva el nombre `auth_log`.
 """
+import logging
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
 from typing import Callable
 
-from sqlalchemy import func, select
+from sqlalchemy import String, func, inspect, select
 from sqlalchemy.orm import Session
 from starlette.requests import Request
 
@@ -41,6 +42,19 @@ LOGIN_BLOQUEADO = "login_bloqueado"
 
 # Mismo valor que usa `libracore.db.logs.contar_login_fallidos_recientes`.
 VENTANA_FALLIDOS_MINUTOS = 15
+
+#: 🔴 **Este logger existe para que la defensa no pueda apagarse en silencio.**
+#: `registrar_seguro` y `contar_fallidos_seguro` se tragan cualquier error a
+#: propósito —ver sus docstrings—, y hasta el 2026-08-22 lo hacían sin dejar
+#: rastro. Eso convirtió un desacuerdo de esquema en un rate limiting inerte
+#: durante meses, en tres productos, sin una sola línea en ningún log.
+_log = logging.getLogger("libraauth.auth_events")
+
+#: El formato en que los DOS escritores guardan `ts`: el `datetime.now` del
+#: modelo de acá y el `datetime('now','localtime')` de `libracore.db.logs`.
+#: Es ISO con espacio, y **cero-padded**, que es lo que hace que comparar
+#: lexicográficamente sea comparar cronológicamente.
+FORMATO_TS = "%Y-%m-%d %H:%M:%S"
 
 
 def ip_del_request(request: Request) -> str:
@@ -92,6 +106,8 @@ class AuthEventRepository:
 
     def __init__(self, session_factory: Callable[[], AbstractContextManager[Session]]):
         self.session_factory = session_factory
+        #: Cache de `_ts_es_texto`. `None` = todavía no se miró.
+        self._ts_texto: bool | None = None
 
     def registrar(self, evento: str, username: str, ip: str = "", detalle: str = "") -> None:
         """Anota un evento. **Nunca levanta**: ver `registrar_seguro` para el
@@ -122,6 +138,34 @@ class AuthEventRepository:
         with self.session_factory() as session:
             return int(session.execute(select(func.count(AuthEvent.id))).scalar_one())
 
+    def _ts_es_texto(self, session: Session) -> bool:
+        """Si la columna `ts` de ESTA base es texto en vez de timestamp.
+
+        🔴 **Las dos formas son legítimas y conviven en la familia.** El modelo
+        de acá declara `ts` como `DateTime`, pero en los productos donde la
+        tabla la crea el **DDL crudo** de LibraCore la columna es `TEXT` — a
+        propósito, porque esa capa filtra fechas comparando lexicográficamente.
+        `ts_legible` ya tolera las dos al LEER; esto es lo mismo al CONTAR.
+
+        Se resuelve mirando el esquema y no probando y viendo qué pasa: un
+        `except` acá es indistinguible de una base momentáneamente trabada, y
+        justamente lo que hay que evitar es volver a confundir un desacuerdo de
+        tipos con un problema pasajero.
+
+        El resultado se cachea por repositorio: el tipo de una columna no
+        cambia mientras el proceso vive, y esto corre en el camino del login.
+        """
+        if self._ts_texto is None:
+            try:
+                columnas = inspect(session.get_bind()).get_columns(AuthEvent.__tablename__)
+                tipo = next(c["type"] for c in columnas if c["name"] == "ts")
+                self._ts_texto = isinstance(tipo, String)
+            except Exception:  # noqa: BLE001 — sin esquema legible, el default
+                # es el del modelo. Si además la consulta falla, quien llama se
+                # entera por `contar_fallidos_seguro`, que ahora sí lo registra.
+                self._ts_texto = False
+        return self._ts_texto
+
     def contar_fallidos_recientes(self, ip: str, minutos: int = VENTANA_FALLIDOS_MINUTOS) -> int:
         """Intentos fallidos desde esa IP en los ultimos `minutos`. Ventana
         deslizante sobre la misma tabla, sin estado nuevo — igual que
@@ -130,16 +174,32 @@ class AuthEventRepository:
         Devuelve 0 con `ip` vacia: sin IP, la ventana agruparia a todos los
         clientes en un mismo balde y el primer fallido de cualquiera
         bloquearia a todos.
+
+        🔴 **El corte se compara contra el tipo REAL de la columna** (ver
+        `_ts_es_texto`). Hasta el 2026-08-22 esto mandaba siempre un `datetime`,
+        y contra una columna `TEXT` en PostgreSQL la consulta moría con
+        *operator does not exist: text >= timestamp*. Como `contar_fallidos_seguro`
+        se traga los errores y devuelve 0 —que significa "nadie agotó
+        intentos"—, **el bloqueo por fuerza bruta nunca disparaba**. Medido en
+        vivo: nueve intentos fallidos seguidos contra una demo, los nueve
+        anotados con la IP real, ni un solo 429.
+
+        Contra SQLite no se veía: es dinámicamente tipado y la comparación
+        pasa igual. Sólo aparece contra PostgreSQL real.
         """
         if not ip:
             return 0
         desde = datetime.now() - timedelta(minutes=int(minutos))
         with self.session_factory() as session:
+            # Texto contra texto, o timestamp contra timestamp: nunca cruzados,
+            # y sin `CAST` — un cast de timestamp a texto depende del
+            # `DateStyle` del servidor, que es una variable de sesión.
+            corte = desde.strftime(FORMATO_TS) if self._ts_es_texto(session) else desde
             return int(session.execute(
                 select(func.count(AuthEvent.id)).where(
                     AuthEvent.evento == LOGIN_FALLIDO,
                     AuthEvent.ip == ip,
-                    AuthEvent.ts >= desde,
+                    AuthEvent.ts >= corte,
                 )
             ).scalar_one())
 
@@ -165,7 +225,10 @@ def registrar_seguro(request: Request, evento: str, username: str, detalle: str 
     try:
         repo.registrar(evento, username, ip_del_request(request), detalle)
     except Exception:  # noqa: BLE001 — a proposito, ver docstring
-        pass
+        # Se traga el error, pero NO en silencio: un `pass` pelado convierte
+        # un problema permanente (una tabla que no existe, un tipo que no
+        # cuadra) en algo indistinguible de "no pasó nada".
+        _log.warning("no se pudo registrar el evento de acceso %r", evento, exc_info=True)
 
 
 def contar_fallidos_seguro(request: Request, minutos: int = VENTANA_FALLIDOS_MINUTOS) -> int:
@@ -179,11 +242,65 @@ def contar_fallidos_seguro(request: Request, minutos: int = VENTANA_FALLIDOS_MIN
     intentos — o sea, **dejar a todos afuera porque falla el que cuenta**. Es
     el mismo criterio que `registrar_seguro`: el rate limiting es defensa en
     profundidad, no la puerta.
+
+    🔴 **Pero devolver 0 SIN DECIR NADA fue el defecto.** Ese `except` mudo
+    tapó durante meses un desacuerdo de tipos en `auth_log.ts` que dejaba el
+    bloqueo por fuerza bruta inerte en tres productos. Sigue devolviendo 0
+    —eso está bien—, pero ahora lo registra: un fallo permanente y una base
+    trabada un segundo dejan de ser la misma cosa para quien mire los logs.
     """
     repo = getattr(request.app.state, "auth_events", None)
     if repo is None:
+        # No es un error: es el opt-in por ausencia. Pero se dice UNA vez, en
+        # el arranque, no en cada login — ver `advertir_si_no_hay_registro`.
         return 0
     try:
         return repo.contar_fallidos_recientes(ip_del_request(request), minutos)
     except Exception:  # noqa: BLE001 — ver docstring
+        _log.warning(
+            "no se pudieron contar los intentos fallidos: el rate limiting del "
+            "login queda INERTE hasta que esto se arregle", exc_info=True,
+        )
         return 0
+
+
+def verificar_registro_de_accesos(repo: "AuthEventRepository | None") -> str:
+    """Un diagnóstico de una línea sobre el registro de accesos, para gritar en
+    el arranque. Devuelve `""` si está todo bien.
+
+    🔴 **Existe porque las dos mitades de este módulo fallan calladas.** El
+    `registrar_seguro` que no puede escribir y el `contar_fallidos_seguro` que
+    no puede contar devuelven lo mismo que si no hubiera pasado nada. Un
+    producto podía correr meses con el log de accesos vacío y el rate limiting
+    apagado sin una sola señal — pasó, en cuatro de ocho productos.
+
+    No levanta: se llama al arrancar y lo que corresponde es un log ruidoso, no
+    tumbar la app porque no puede anotar quién entra.
+
+    **Ejecuta las dos operaciones de verdad**, no mira el esquema: un chequeo
+    que no ejercita la consulta es exactamente el que dejó pasar esto.
+    """
+    if repo is None:
+        return ("el producto no configuró `app.state.auth_events`: no se "
+                "registran accesos NI funciona el rate limiting del login")
+    try:
+        repo.contar()
+    except Exception as e:  # noqa: BLE001
+        return f"no se puede leer `auth_log`: {e}"
+    try:
+        # Una IP que no va a existir: cuenta cero, pero EJECUTA la comparación
+        # de `ts`, que es la que se rompía. Un `contar()` a secas no la toca.
+        repo.contar_fallidos_recientes("0.0.0.0")
+    except Exception as e:  # noqa: BLE001
+        return (f"el rate limiting del login está INERTE — la cuenta de "
+                f"intentos fallidos falla: {e}")
+    return ""
+
+
+def advertir_si_no_hay_registro(app) -> str:
+    """`verificar_registro_de_accesos` sobre `app.state`, y lo registra como
+    warning. Devuelve el mismo diagnóstico para que un test pueda afirmarlo."""
+    problema = verificar_registro_de_accesos(getattr(app.state, "auth_events", None))
+    if problema:
+        _log.warning("registro de accesos: %s", problema)
+    return problema
