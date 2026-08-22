@@ -23,6 +23,14 @@ dependencies = [
     # no alcanza (no trae AES) e `itsdangerous`, que si es dependencia, FIRMA
     # pero no cifra: su payload se lee en base64 sin ninguna clave.
     "cryptography>=42.0.0",
+    # `terminos.texto_html()`: el UNICO convertidor de Markdown a HTML del
+    # contrato, compartido por la pantalla de aceptacion de libra-ui y por las
+    # paginas publicas que genera libra-web-kit. Puro Python, sin extensiones C.
+    #
+    # Va en las dependencias del paquete y no en un extra porque el endpoint
+    # `GET /terminos?texto=1` lo necesita en runtime, dentro del contenedor de
+    # cada instancia.
+    "markdown>=3.6",
 ]
 
 [project.optional-dependencies]

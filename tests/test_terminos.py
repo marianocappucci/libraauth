@@ -32,7 +32,7 @@ from libraauth.session_auth import (
 )
 from libraauth.terminos import (
     CODIGO_PENDIENTE, VERSION_VIGENTE, TerminosRepository, build_terminos_router,
-    hash_vigente, texto_vigente,
+    hash_vigente, texto_html, texto_vigente,
 )
 
 
@@ -201,9 +201,23 @@ def test_el_estado_no_arrastra_el_contrato_salvo_que_se_pida(sessions):
     assert liviano["texto"] is None
     assert liviano["hash_texto"] == hash_vigente()  # la huella sí va siempre
 
+    assert liviano["texto_html"] is None
+
     completo = cliente.get("/terminos?texto=1").json()
     assert completo["texto"] == texto_vigente()
     assert len(completo["texto"]) > 10_000  # el insumo es el que se cree
+    assert completo["texto_html"] == texto_html()
+
+
+def test_el_html_sale_del_mismo_markdown_que_se_hashea():
+    """Un solo convertidor para la pantalla de aceptación y para las páginas
+    públicas: si cada lado convirtiera por su cuenta, el cliente podría estar
+    leyendo un contrato con otro formato sin que nada falle."""
+    html = texto_html()
+    assert "<h1>" in html and "<table>" in html
+    assert html.count("<table>") == 2  # severidades de soporte + Anexo II
+    # Y el HTML no interviene en el hash: lo que se firma es el Markdown.
+    assert hash_vigente() == hashlib.sha256(texto_vigente().encode("utf-8")).hexdigest()
 
 
 def test_aceptar_una_version_que_no_es_la_vigente_da_409(sessions):

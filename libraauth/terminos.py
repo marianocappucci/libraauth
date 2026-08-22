@@ -100,6 +100,27 @@ def texto_vigente() -> str:
     return crudo.replace("\r\n", "\n").replace("\r", "\n")
 
 
+def texto_html() -> str:
+    """El mismo contrato, convertido a HTML.
+
+    🔑 **Existe para que haya UN solo convertidor.** Lo consumen los dos lados:
+    la pantalla de aceptacion de `libra-ui` (que lo inserta tal cual) y
+    `libra_web_kit.legal_gen`, que genera las paginas publicas. Si cada uno
+    convirtiera por su cuenta, el cliente podria estar leyendo un contrato con
+    otras negritas, otras listas o —peor— una tabla que en un lado se ve y en el
+    otro no, sin que nada falle.
+
+    Devuelve HTML **pelado**, sin clases: el estilo lo pone cada consumidor, que
+    es lo unico que legitimamente cambia entre una landing y una SPA.
+
+    **No interviene en el hash.** Lo que se firma es el Markdown; esto es
+    presentacion.
+    """
+    import markdown  # local: solo lo necesita quien va a mostrar el texto
+
+    return markdown.markdown(texto_vigente(), extensions=["tables", "sane_lists"])
+
+
 def hash_vigente() -> str:
     """sha256 hex del texto vigente. Es la huella de la clausula 30.3."""
     return hashlib.sha256(texto_vigente().encode("utf-8")).hexdigest()
@@ -264,6 +285,10 @@ class _EstadoTerminos(BaseModel):
     #: contestar `pendiente: false` — y el texto solo lo necesita la pantalla
     #: que lo muestra, que se abre una vez por instancia.
     texto: str | None = None
+    #: El mismo contrato en HTML, tambien solo con `?texto=1`. Va junto al
+    #: Markdown y no en su lugar: el Markdown es lo que se hashea y lo que se
+    #: puede verificar, el HTML es lo que la pantalla dibuja.
+    texto_html: str | None = None
 
 
 class _AceptarRequest(BaseModel):
@@ -312,6 +337,7 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
             "aceptada_por": (aceptacion or {}).get("nombre") or (aceptacion or {}).get("username"),
             "aceptada_at": (aceptacion or {}).get("aceptado_at"),
             "texto": texto_vigente() if incluir_texto else None,
+            "texto_html": texto_html() if incluir_texto else None,
         }
 
     @router.get("", response_model=_EstadoTerminos)
