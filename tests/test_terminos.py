@@ -28,7 +28,8 @@ from sqlalchemy.pool import StaticPool
 from libraauth import terminos as terminos_mod
 from libraauth.models import AceptacionTerminos, Base
 from libraauth.session_auth import (
-    SessionAuth, build_json_api_auth_router, json_api_require_staff,
+    SessionAuth, build_json_api_auth_router, json_api_require_admin_o_servicio,
+    json_api_require_staff,
 )
 from libraauth.terminos import (
     CODIGO_PENDIENTE, VERSION_VIGENTE, TerminosRepository, build_terminos_router,
@@ -96,6 +97,14 @@ def _app(sessions, *, con_terminos=True):
     def clientes():
         return {"ok": True}
 
+    # 🔴 El router de usuarios de los ocho productos cuelga de ESTE guard, que no
+    # pasa por `json_api_require_role`. Con el gate sólo en aquél, `/usuarios`
+    # seguía contestando 200 con el contrato sin aceptar — lo encontró el test
+    # del gate de LibraClub, no una revisión del código.
+    @app.get("/usuarios", dependencies=[Depends(json_api_require_admin_o_servicio)])
+    def usuarios():
+        return {"ok": True}
+
     return app
 
 
@@ -114,6 +123,30 @@ def test_ruta_gateada_corta_con_el_codigo_de_terminos(sessions):
     assert r.status_code == 403
     assert r.json()["detail"]["code"] == CODIGO_PENDIENTE
     assert r.json()["detail"]["version"] == VERSION_VIGENTE
+
+
+def test_el_guard_de_admin_o_servicio_tambien_corta(sessions):
+    """No pasa por `json_api_require_role`, así que necesita su propia llamada.
+    De este guard cuelga el router de usuarios de los ocho productos."""
+    cliente = _logueado(_app(sessions))
+    r = cliente.get("/usuarios")
+    assert r.status_code == 403
+    assert r.json()["detail"]["code"] == CODIGO_PENDIENTE
+
+    cliente.post("/terminos/aceptar", json={"version": VERSION_VIGENTE})
+    assert cliente.get("/usuarios").status_code == 200
+
+
+def test_el_token_de_servicio_no_queda_frenado(sessions, monkeypatch):
+    """El backoffice del proveedor administra instancias ajenas y no tiene
+    contrato propio que aceptar. Si el gate lo frenara, el alta de usuarios de
+    un cliente nuevo quedaría bloqueada por un contrato que ese cliente todavía
+    no puede aceptar — porque todavía no tiene con qué entrar."""
+    monkeypatch.setenv("LIBRA_SERVICE_TOKEN", "token-de-servicio")
+    app = _app(sessions)
+    sin_sesion = TestClient(app, base_url="https://testserver")
+    r = sin_sesion.get("/usuarios", headers={"x-internal-auth": "token-de-servicio"})
+    assert r.status_code == 200
 
 
 def test_las_rutas_para_salir_del_gate_siguen_abiertas(sessions):

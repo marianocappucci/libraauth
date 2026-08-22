@@ -356,11 +356,7 @@ def json_api_require_role(*roles: str):
         # de Terminos. Gatearla cerraria el gate sobre si mismo y no habria
         # forma de aceptar.
         #
-        # Import diferido: `terminos` importa `es_visitante_de_demo` de este
-        # modulo, asi que a nivel de modulo seria un ciclo.
-        from .terminos import exigir_terminos
-
-        exigir_terminos(request, user)
+        _exigir_terminos(request, user)
         if user["role"] in roles:
             return user
         if request.method in _METODOS_DE_LECTURA and es_visitante_de_demo(user):
@@ -466,6 +462,17 @@ def token_de_panel_valido(request: Request) -> bool:
     return bool(recibido) and hmac.compare_digest(recibido, esperado)
 
 
+def _exigir_terminos(request: Request, usuario: dict | None) -> None:
+    """`terminos.exigir_terminos`, importado tarde.
+
+    El import es diferido y no de modulo porque `terminos` importa
+    `es_visitante_de_demo` de aca: a nivel de modulo seria un ciclo.
+    """
+    from .terminos import exigir_terminos
+
+    exigir_terminos(request, usuario)
+
+
 def json_api_require_panel_o_admin(request: Request) -> dict:
     """Credencial del panel del cliente **o** un admin de esta instancia.
 
@@ -485,6 +492,9 @@ def json_api_require_panel_o_admin(request: Request) -> dict:
     if token_de_panel_valido(request):
         return dict(PANEL_USER)
     usuario = json_api_get_current_user(request, request.app.state.session_auth)
+    # El token sale arriba; de aca en adelante es un usuario de la instancia, y
+    # le corresponde el mismo gate de Terminos que a cualquier otra pantalla.
+    _exigir_terminos(request, usuario)
     if usuario["role"] == "admin":
         return usuario
     raise HTTPException(403, "No autorizado")
@@ -500,6 +510,16 @@ def json_api_require_admin_o_servicio(request: Request) -> dict:
     if token_de_servicio_valido(request):
         return dict(SERVICE_USER)
     usuario = json_api_get_current_user(request, request.app.state.session_auth)
+    # 🔴 **El gate de Terminos hace falta ACA aparte**, por lo mismo que la
+    # excepcion de lectura de la demo: este guard **no pasa por
+    # `json_api_require_role`**, y de el cuelga el router de usuarios de los ocho
+    # productos. Con el gate solo en el otro, `/api/usuarios` seguia contestando
+    # 200 con el contrato sin aceptar — lo encontro el test del gate de
+    # LibraClub, no una revision del codigo.
+    #
+    # Va DESPUES del token de servicio: el backoffice del proveedor administra
+    # instancias ajenas y no tiene contrato propio que aceptar.
+    _exigir_terminos(request, usuario)
     if usuario["role"] == "admin":
         return usuario
     # Misma excepción de lectura que `json_api_require_role`. Hace falta acá
