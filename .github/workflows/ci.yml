@@ -107,7 +107,12 @@ jobs:
           # `pipefail` porque el `tee` se come el codigo de salida de pytest:
           # sin esto, un gate en rojo llega aca como exito.
           set -o pipefail
-          pytest tests/test_postgres_real.py -q --no-cov -p no:cacheprovider \
+          # Los DOS archivos que dependen de PostgreSQL real. El de rate
+          # limiting se suma el 2026-08-22: tiene el mismo `skipif`, así que
+          # sin nombrarlo acá podría auto-saltearse y nadie se enteraría — que
+          # es exactamente contra lo que existe este paso.
+          pytest tests/test_postgres_real.py tests/test_rate_limiting_ts_texto.py \
+            -q --no-cov -p no:cacheprovider \
             | tee /tmp/pg_gate.txt
 
           # Los dos chequeos van como `if`, no como `grep ... && { exit 1; }`:
