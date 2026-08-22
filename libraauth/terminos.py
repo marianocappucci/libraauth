@@ -253,11 +253,17 @@ class _EstadoTerminos(BaseModel):
     version: str
     vigente_desde: str
     hash_texto: str
-    texto: str
     pendiente: bool
     puede_aceptar: bool
     aceptada_por: str | None = None
     aceptada_at: str | None = None
+    #: 🔴 **Solo con `?texto=1`.** El contrato son ~30 KB y el frontend consulta
+    #: este endpoint **en cada carga de la aplicacion** para saber si tiene que
+    #: mostrar la pantalla bloqueante. Mandarlo siempre seria pagar el contrato
+    #: entero, para todos los usuarios, todos los dias, para casi siempre
+    #: contestar `pendiente: false` — y el texto solo lo necesita la pantalla
+    #: que lo muestra, que se abre una vez por instancia.
+    texto: str | None = None
 
 
 class _AceptarRequest(BaseModel):
@@ -294,20 +300,28 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
             )
         return repo
 
-    @router.get("", response_model=_EstadoTerminos)
-    def estado(request: Request, user: dict = Depends(json_api_get_current_user)):
+    def _estado(request: Request, user: dict, incluir_texto: bool) -> dict:
         repo = _repo(request)
         aceptacion = repo.aceptacion_vigente()
         return {
             "version": VERSION_VIGENTE,
             "vigente_desde": VIGENTE_DESDE,
             "hash_texto": hash_vigente(),
-            "texto": texto_vigente(),
             "pendiente": aceptacion is None,
             "puede_aceptar": user.get("role") in ROLES_QUE_ACEPTAN,
             "aceptada_por": (aceptacion or {}).get("nombre") or (aceptacion or {}).get("username"),
             "aceptada_at": (aceptacion or {}).get("aceptado_at"),
+            "texto": texto_vigente() if incluir_texto else None,
         }
+
+    @router.get("", response_model=_EstadoTerminos)
+    def estado(
+        request: Request, texto: bool = False,
+        user: dict = Depends(json_api_get_current_user),
+    ):
+        """El estado. Con `?texto=1` incluye el contrato completo — ver el
+        comentario del campo `texto` en `_EstadoTerminos`."""
+        return _estado(request, user, texto)
 
     @router.post("/aceptar", response_model=_EstadoTerminos)
     def aceptar(
@@ -335,7 +349,8 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
             ip=_ip_de(request),
             user_agent=request.headers.get("user-agent", ""),
         )
-        return estado(request, user)
+        # Sin texto: quien acaba de aceptar ya lo tiene en pantalla.
+        return _estado(request, user, False)
 
     @router.get("/historial")
     def historial(request: Request, user: dict = Depends(json_api_get_current_user)):

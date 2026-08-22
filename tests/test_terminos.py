@@ -190,6 +190,22 @@ def test_el_admin_puede_aceptar_y_el_estado_lo_dice(sessions):
     assert cliente.get("/terminos").json()["puede_aceptar"] is True
 
 
+# ── El texto viaja sólo cuando se pide ───────────────────────────────────────
+
+def test_el_estado_no_arrastra_el_contrato_salvo_que_se_pida(sessions):
+    """El frontend consulta este endpoint en cada carga para decidir si muestra
+    la pantalla bloqueante. Mandar los ~30 KB del contrato siempre sería pagarlo
+    para casi siempre contestar `pendiente: false`."""
+    cliente = _logueado(_app(sessions))
+    liviano = cliente.get("/terminos").json()
+    assert liviano["texto"] is None
+    assert liviano["hash_texto"] == hash_vigente()  # la huella sí va siempre
+
+    completo = cliente.get("/terminos?texto=1").json()
+    assert completo["texto"] == texto_vigente()
+    assert len(completo["texto"]) > 10_000  # el insumo es el que se cree
+
+
 def test_aceptar_una_version_que_no_es_la_vigente_da_409(sessions):
     """La pestaña abierta desde antes de un deploy no puede aceptar un texto
     que ya no es el que se le mostró."""
