@@ -225,6 +225,38 @@ def _a_dict(f: AceptacionTerminos) -> dict:
     }
 
 
+def exige_aceptacion() -> bool:
+    """Si esta instancia tiene contrato que aceptar. **Las demos no.**
+
+    Una demo publica no es una instancia de cliente: no hay Cliente, no hay
+    contrato y no hay responsable de la cuenta que pueda obligarse. Exigirle la
+    aceptacion es pedirle a nadie que firme por nadie.
+
+    🔴 **Esto ya estaba a medias, y por eso fallaba.** Hasta la v0.34.0 la
+    excepcion vivia en `exigir_terminos` y cubria **solo al visitante**, con
+    este mismo argumento escrito en su docstring. Pero el resto de la instancia
+    quedaba gateada, y ahi el argumento se da vuelta solo: `ROLES_QUE_ACEPTAN`
+    es `("admin",)`, el visitante de la demo es `staff`, y **el auto-login se
+    niega a entregar `admin`** (`ROLES_PROHIBIDOS_EN_DEMO`) — asi que en una
+    demo no habia por donde aceptar nada. La exencion del visitante tapaba lo
+    justo para que la pantalla publica anduviera.
+
+    Lo que quedaba roto era todo lo demas, y esta medido: el reset nocturno
+    borra el schema —`aceptaciones_terminos` incluida— y despues la siembra, que
+    entra como `admin`, chocaba contra el 403. La corrida del cron del
+    2026-08-25 fallo en **los ocho productos** y las ocho demos amanecieron
+    vacias.
+
+    La marca de instancia es `demo_username()`, que exige **dos** cerrojos
+    (`DEMO_MODE` y `DEMO_USERNAME`) justamente para que no se prenda por copiar
+    un `.env` de una instancia a otra. Medido sobre las 10 instancias vivas:
+    devuelve el usuario en las 8 demos y `None` en las 2 de cliente.
+    """
+    from .session_auth import demo_username  # circular: session_auth importa este modulo
+
+    return demo_username() is None
+
+
 def hay_terminos_pendientes(request: Request) -> bool:
     """`True` si esta instancia todavia no acepto la version vigente.
 
@@ -236,7 +268,16 @@ def hay_terminos_pendientes(request: Request) -> bool:
     (fallar duro si no esta cableado) rompe el arranque de cualquier consumidor
     que suba el pin sin tocar su factory, incluido el backoffice de superadmin,
     que no es una instancia de cliente y no tiene contrato que aceptar.
+
+    Una demo tampoco tiene nada pendiente — ver `exige_aceptacion`. La exencion
+    va **aca** y no solo en `exigir_terminos` porque esta funcion decide tambien
+    el `pendiente` que devuelve el estado, y **el frontend bloquea la aplicacion
+    entera con ese booleano** (`GateTerminos`, de libra-ui): exceptuar el 403 y
+    dejar el estado en `true` cambiaria un muro del backend por uno del
+    navegador.
     """
+    if not exige_aceptacion():
+        return False
     repo = getattr(request.app.state, "terminos", None)
     if repo is None:
         return False
@@ -247,15 +288,11 @@ def exigir_terminos(request: Request, user: dict | None = None) -> None:
     """Corta con 403 si la instancia no acepto. La usan las dependencias de
     `session_auth` que gatean las APIs JSON.
 
-    **El visitante de la demo publica queda afuera.** La demo no es una
-    instancia de cliente: no hay contrato que aceptar, y su usuario es `staff`,
-    asi que sin esta excepcion la demo quedaria bloqueada para siempre —
-    `ROLES_QUE_ACEPTAN` no la deja aceptar y nadie mas entra ahi.
+    `user` ya no se mira: desde la v0.34.0 la exencion de la demo es **de la
+    instancia** y la resuelve `hay_terminos_pendientes`. El parametro se
+    conserva porque las tres dependencias de `session_auth` lo pasan, y sacarlo
+    obligaria a tocarlas sin que cambie nada.
     """
-    from .session_auth import es_visitante_de_demo  # circular: session_auth importa este modulo
-
-    if user is not None and es_visitante_de_demo(user):
-        return
     if hay_terminos_pendientes(request):
         raise HTTPException(
             status_code=403,
@@ -332,7 +369,12 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
             "version": VERSION_VIGENTE,
             "vigente_desde": VIGENTE_DESDE,
             "hash_texto": hash_vigente(),
-            "pendiente": aceptacion is None,
+            # 🔴 `exige_aceptacion()` y no solo `aceptacion is None`: en una demo
+            # no hay contrato que aceptar, y **el frontend bloquea la aplicacion
+            # entera con este booleano** (`GateTerminos`). Sin esto, exceptuar el
+            # 403 del gate no alcanzaria: la demo quedaria trabada igual, del
+            # lado del navegador y sin un solo 403 en los logs que lo explique.
+            "pendiente": aceptacion is None and exige_aceptacion(),
             "puede_aceptar": user.get("role") in ROLES_QUE_ACEPTAN,
             "aceptada_por": (aceptacion or {}).get("nombre") or (aceptacion or {}).get("username"),
             "aceptada_at": (aceptacion or {}).get("aceptado_at"),

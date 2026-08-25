@@ -303,19 +303,103 @@ def test_el_historial_lo_lee_el_admin_y_no_el_operador(sessions):
 
 # ── 5. La demo no queda bloqueada ────────────────────────────────────────────
 
-def test_el_visitante_de_la_demo_no_queda_frenado(sessions, monkeypatch):
-    """Sin esta excepción la demo pública queda inutilizable para siempre: su
-    usuario es `staff`, así que no puede aceptar, y no entra nadie más."""
+def _demo(monkeypatch):
+    """Prende los DOS cerrojos que `demo_username()` exige."""
     monkeypatch.setenv("DEMO_MODE", "1")
     monkeypatch.setenv("DEMO_USERNAME", "demo")
+
+
+def test_en_una_demo_no_queda_frenado_nadie(sessions, monkeypatch):
+    """Una demo no es una instancia de cliente: no hay contrato que aceptar.
+
+    🔴 **Este test reemplaza a uno que eximía sólo al visitante**, y el cambio
+    ES el arreglo. Hasta la v0.34.0 la excepción era por usuario, así que el
+    visitante entraba y todo el resto de la instancia seguía con 403. Como
+    `ROLES_QUE_ACEPTAN` es `("admin",)` y el auto-login **se niega a entregar
+    `admin`** (`ROLES_PROHIBIDOS_EN_DEMO`), en una demo no había por dónde
+    aceptar: el gate era una puerta sin llave. El síntoma medido: la siembra
+    nocturna entra como `admin`, se comía el 403, y las ocho demos amanecían
+    vacías.
+
+    El control negativo de aquel test —que `ana` siguiera frenada en la MISMA
+    instancia— **tenía que caerse**: es exactamente el comportamiento que se
+    corrige. El control equivalente vive ahora en
+    `test_fuera_de_una_demo_el_gate_sigue_cortando`, que es donde corresponde.
+    """
+    _demo(monkeypatch)
     app = _app(sessions)
-    cliente = _logueado(app, "demo", "demo")
-    assert cliente.get("/clientes").status_code == 200
-    # Control negativo: en la misma instancia, un usuario que NO es el de la
-    # demo sigue frenado. Sin esto, el verde de arriba también se explicaría
-    # por un gate que no gatea nada.
-    otra = _logueado(app, "ana", "anapw")
-    assert otra.get("/clientes").status_code == 403
+    for usuario, clave in (("demo", "demo"), ("ana", "anapw"), ("admin", "adminpw")):
+        cliente = _logueado(app, usuario, clave)
+        assert cliente.get("/clientes").status_code == 200, (
+            f"{usuario} quedó frenado en una demo"
+        )
+
+        # El otro guard, el del router de usuarios de los ocho productos.
+        #
+        # 🔑 Lo que se aserta es **que ningún 403 sea de términos**, no un código
+        # concreto por usuario. Este guard tiene sus propias reglas de rol y de
+        # lectura para el visitante, que no son asunto de este arreglo: fijarlas
+        # acá pondría el test en rojo el día que cambien, por un motivo que no
+        # tiene nada que ver con el contrato.
+        r = cliente.get("/usuarios")
+        detalle = r.json().get("detail") if r.status_code == 403 else None
+        codigo = detalle.get("code") if isinstance(detalle, dict) else None
+        assert codigo != CODIGO_PENDIENTE, (
+            f"{usuario} recibió un 403 de TÉRMINOS en una demo"
+        )
+
+    # Control positivo de la ruta: que el admin la pueda leer de verdad. Sin
+    # esto, un `/usuarios` que devolviera 404 para todos también pasaría el
+    # chequeo de arriba — "no es un 403 de términos" se cumple sin gate y
+    # también sin ruta.
+    admin = _logueado(app, "admin", "adminpw")
+    assert admin.get("/usuarios").status_code == 200
+
+
+def test_en_una_demo_el_estado_no_dice_pendiente(sessions, monkeypatch):
+    """🔴 El otro muro, el que no deja rastro en los logs.
+
+    `GateTerminos` (libra-ui) bloquea la aplicación entera con el `pendiente`
+    de este endpoint, sin esperar ningún 403. Eximir sólo el gate del backend
+    dejaría la demo trabada igual, del lado del navegador — y ahí no hay un 403
+    que lo explique. Por eso la exención vive en `hay_terminos_pendientes`, que
+    es de donde sale este booleano.
+    """
+    _demo(monkeypatch)
+    cliente = _logueado(_app(sessions), "admin", "adminpw")
+    r = cliente.get("/terminos")
+    assert r.status_code == 200, r.text
+    assert r.json()["pendiente"] is False
+
+
+def test_fuera_de_una_demo_el_gate_sigue_cortando(sessions, monkeypatch):
+    """El control negativo del arreglo: que no haya quedado una puerta abierta.
+
+    Se prueban las **tres** formas en que la marca puede no estar, porque
+    `demo_username()` tiene dos cerrojos y alcanza con que falte uno: sin
+    ninguna variable, con `DEMO_MODE` pero sin usuario, y con usuario pero sin
+    `DEMO_MODE`. Si cualquiera de esas eximiera, un `.env` copiado a medias
+    dejaría sin gate a una instancia de cliente — que es justo lo que los dos
+    cerrojos existen para evitar.
+    """
+    casos = (
+        ("sin ninguna", {}),
+        ("solo DEMO_MODE", {"DEMO_MODE": "1"}),
+        ("solo DEMO_USERNAME", {"DEMO_USERNAME": "demo"}),
+    )
+    for etiqueta, variables in casos:
+        monkeypatch.delenv("DEMO_MODE", raising=False)
+        monkeypatch.delenv("DEMO_USERNAME", raising=False)
+        for k, v in variables.items():
+            monkeypatch.setenv(k, v)
+
+        cliente = _logueado(_app(sessions), "admin", "adminpw")
+        r = cliente.get("/clientes")
+        assert r.status_code == 403, f"el gate no cortó con {etiqueta}"
+        assert r.json()["detail"]["code"] == CODIGO_PENDIENTE
+        assert cliente.get("/terminos").json()["pendiente"] is True, (
+            f"el estado no dijo pendiente con {etiqueta}"
+        )
 
 
 # ── 6. Lo que el contrato existe para sentar ─────────────────────────────────
