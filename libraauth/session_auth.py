@@ -436,8 +436,15 @@ def token_de_servicio_valido(request: Request) -> bool:
 PANEL_TOKEN_HEADER = "x-panel-auth"
 PANEL_TOKEN_ENV = "LIBRA_PANEL_TOKEN"
 
-#: Identidad de una request del panel. Como `SERVICE_USER` no es un usuario
-#  real; a diferencia de aquella, el panel solo lee.
+#: Identidad de una request del panel. Como `SERVICE_USER`, no es un usuario
+#  real.
+#
+#  ⚠️ **Decia "el panel solo lee" y desde v0.35.0 ya no es cierto.** El panel
+#  aprovisiona empleados en las instancias del cliente
+#  (`json_api_require_admin_o_servicio_o_panel`), asi que escribe. Lo que sigue
+#  siendo cierto ---y es lo que importa--- es que **una credencial de panel vale
+#  para UNA instancia**: la variable es distinta en cada una. Ver el comentario
+#  de `PANEL_TOKEN_ENV`.
 PANEL_USER = {
     "id": None,
     "username": "@panel",
@@ -498,6 +505,55 @@ def json_api_require_panel_o_admin(request: Request) -> dict:
     if usuario["role"] == "admin":
         return usuario
     raise HTTPException(403, "No autorizado")
+
+
+def json_api_require_admin_o_servicio_o_panel(request: Request) -> dict:
+    """Como `json_api_require_admin_o_servicio`, y ademas la credencial del panel.
+
+    Existe para **una sola cosa**: que el panel del cliente pueda dar de alta y
+    de baja empleados en las instancias de ese cliente, desde un solo lugar. Un
+    empleado que trabaja en dos sedes hoy necesita dos usuarios creados a mano,
+    uno en cada sistema.
+
+    🔴 **La alternativa era darle al panel el `LIBRA_SERVICE_TOKEN`, y es peor.**
+    Ese token es **uno por producto**, compartido por todas sus instancias
+    ---medido el 2026-08-20: `libradesk-lagrace` y `libradesk-compulibra`, dos
+    clientes distintos, tienen el mismo---. Con el, un panel comprometido abre
+    la escritura en **todas** las instancias de todos los productos. Con la
+    credencial de panel, que es distinta en cada instancia, abre **una**.
+
+    ⚠️ **Esto es mas de lo que el panel podia hacer antes**, y conviene decirlo:
+    hasta ahora su credencial autorizaba exactamente una ruta, `/api/resumen`,
+    de solo lectura. Ahora, en los routers que usen ESTE gate, tambien crea,
+    edita y da de baja usuarios ---incluidos admins--- de esa instancia. Es el
+    sistema del propio cliente y el panel es su herramienta, asi que el alcance
+    es el correcto; lo que no seria correcto es ponerlo en un router donde no
+    haga falta.
+
+    🔑 **Por eso NO se amplio `json_api_require_admin_o_servicio` en lugar de
+    agregar este.** De aquel cuelgan siete u ocho routers por producto; ampliarlo
+    le habria dado al panel todo eso de una, sin que nadie lo pidiera. Este se
+    aplica router por router.
+
+    El orden de los chequeos importa y es el mismo que el del otro: los tokens
+    primero, porque una request con token no trae cookie de sesion y evaluar la
+    sesion antes daria 401 sin llegar a mirar el header.
+    """
+    if token_de_servicio_valido(request):
+        return dict(SERVICE_USER)
+    if token_de_panel_valido(request):
+        return dict(PANEL_USER)
+    # De aca en adelante es identico a `json_api_require_admin_o_servicio`: una
+    # sesion de la instancia, con su gate de Terminos y la excepcion de lectura
+    # de la demo. Se repite en vez de delegar porque delegar volveria a evaluar
+    # el token de servicio, que ya se descarto arriba.
+    usuario = json_api_get_current_user(request, request.app.state.session_auth)
+    _exigir_terminos(request, usuario)
+    if usuario["role"] == "admin":
+        return usuario
+    if request.method in _METODOS_DE_LECTURA and es_visitante_de_demo(usuario):
+        return usuario
+    raise HTTPException(403, "forbidden")
 
 
 def json_api_require_admin_o_servicio(request: Request) -> dict:
