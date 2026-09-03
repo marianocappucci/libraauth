@@ -77,18 +77,46 @@ line-length = 120
 extend-exclude = ["frontend", "website", "node_modules"]
 
 [tool.ruff.lint]
-select = [
-    "E9",    # el archivo no parsea, o error de IO al leerlo
-    "F63",   # comparaciones invalidas (`is` contra un literal, `in` mal usado)
-    "F7",    # `break` / `continue` / `return` fuera de lugar
-    "F811",  # redefinicion de un nombre ya definido o importado
-    "F821",  # nombre no definido -> NameError seguro en runtime
-    "F822",  # nombre listado en __all__ que no existe en el modulo
-    "F823",  # variable local usada antes de asignarse
-    "F841",  # variable asignada y nunca usada (codigo muerto)
-    "F541",  # f-string sin placeholders (suele ser llaves olvidadas)
-    "F502", "F506", "F522", "F524",  # %/format() con argumentos mal armados
-    "F601", "F602",                  # `x in 1, 2` en vez de `x in (1, 2)`
+# Un solo regimen de lint para los 17 repos de la familia (etapa E2 de la
+# auditoria, 2026-09-03). Antes convivian dos: este --el que ya usaban
+# LibraCargo y LibraClub-- y uno mucho mas corto en los otros 15, que solo
+# miraba errores seguros en runtime (E9/F63/F7/F811/F821/F822/F823/F841) y
+# no veia orden de imports, modernizacion ni los patrones de bugbear.
+#
+# La longitud queda en 120, que es la que ya usaban 13 de los 15: bajarla a
+# 100 agregaba ~400 E501 en la familia, que no tienen fix automatico y no
+# arreglan nada.
+select = ["E", "F", "I", "UP", "B"]
+
+# 🔴 TRINQUETE, no "reglas que no importan". Cada linea lleva la cuenta del
+# dia que se unifico el regimen: la lista SOLO se achica, y lo que no esta
+# aca ya no puede entrar en codigo nuevo. Los casos auto-corregibles
+# (orden de imports y modernizacion) se arreglaron en el mismo commit.
+ignore = [
+    "B904",      # 6 caso(s): `raise ... from err` dentro de un except. Ruff NO tiene fix, ni
+              #   siquiera unsafe: son a mano, una por una.
+    "F401",      # 4 caso(s): import sin usar. 🔴 NO se auto-corrige a proposito: de los 430
+              #   de la familia, 168 son RE-EXPORTS —`scripts/panel_admin.py`
+              #   re-exporta 27 nombres que `libracore.admin.services` usa como
+              #   `pa.find_client`, `pa.compose`, `pa._NPM_AVAILABLE`—. Borrarlos
+              #   rompe el backoffice en runtime con los tests en verde.
+    "E402",      # 3 caso(s): import que no esta arriba de todo. Suele ser a proposito
+              #   (cargar algo antes de importar), asi que se mira caso por caso.
+    "E501",      # 3 caso(s): linea de mas de 120. Sin fix automatico: hay que reescribirla.
+    "E741",      # 1 caso(s): nombre de variable ambiguo (`l`, `I`, `O`). Renombrar a mano.
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Las migraciones las escribe el autogenerate: no se reformatean a mano.
+"**/migrations/versions/*.py" = ["E501"]
+# En un `__init__.py` el import "sin usar" ES la interfaz del paquete.
+"**/__init__.py" = ["F401"]
+
+[tool.ruff.lint.flake8-bugbear]
+# `Depends()` en el default es el idioma de FastAPI, no un descuido.
+extend-immutable-calls = [
+    "fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.File",
+    "fastapi.Form", "fastapi.Header", "fastapi.Cookie", "fastapi.Body",
 ]
 
 [tool.coverage.run]

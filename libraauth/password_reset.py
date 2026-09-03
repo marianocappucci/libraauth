@@ -18,8 +18,8 @@ producto -> el usuario abre el link y elige contrasena nueva.
 """
 import hashlib
 import secrets
-from datetime import datetime, timedelta, timezone
-from typing import Callable
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta, timezone
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -46,7 +46,7 @@ class EmailNotConfigured(Exception):
 def _utcnow() -> datetime:
     # Naive en UTC, para comparar contra columnas DateTime sin timezone
     # (que es lo que escribe `server_default=func.now()` en SQLite).
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def _hash_token(token: str) -> str:

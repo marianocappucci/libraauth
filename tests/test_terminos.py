@@ -28,12 +28,19 @@ from sqlalchemy.pool import StaticPool
 from libraauth import terminos as terminos_mod
 from libraauth.models import AceptacionTerminos, Base
 from libraauth.session_auth import (
-    SessionAuth, build_json_api_auth_router, json_api_require_admin_o_servicio,
+    SessionAuth,
+    build_json_api_auth_router,
+    json_api_require_admin_o_servicio,
     json_api_require_staff,
 )
 from libraauth.terminos import (
-    CODIGO_PENDIENTE, VERSION_VIGENTE, TerminosRepository, build_terminos_router,
-    hash_vigente, texto_html, texto_vigente,
+    CODIGO_PENDIENTE,
+    VERSION_VIGENTE,
+    TerminosRepository,
+    build_terminos_router,
+    hash_vigente,
+    texto_html,
+    texto_vigente,
 )
 
 

@@ -29,7 +29,6 @@ from libraauth.auditoria import (
     usuario_actual,
 )
 
-
 # ── Un dominio de juguete, que hace las veces del producto consumidor ──────
 
 class DominioBase(DeclarativeBase):

@@ -38,11 +38,17 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from libraauth.demo_codigos import (
-    ALFABETO, CodigoInvalido, DemoCodigoRepository, LARGO, normalizar,
+    ALFABETO,
+    LARGO,
+    CodigoInvalido,
+    DemoCodigoRepository,
+    normalizar,
 )
 from libraauth.models import Base, DemoCodigo
 from libraauth.session_auth import (
-    SessionAuth, build_demo_codigos_router, build_json_api_auth_router,
+    SessionAuth,
+    build_demo_codigos_router,
+    build_json_api_auth_router,
 )
 
 AHORA = datetime(2026, 8, 17, 10, 0, 0)
