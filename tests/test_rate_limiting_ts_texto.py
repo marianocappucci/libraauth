@@ -26,7 +26,10 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from libraauth.auth_events import (
-    FORMATO_TS, LOGIN_FALLIDO, AuthEventRepository, verificar_registro_de_accesos,
+    FORMATO_TS,
+    LOGIN_FALLIDO,
+    AuthEventRepository,
+    verificar_registro_de_accesos,
 )
 from libraauth.models import AuthEvent, Base
 

@@ -30,9 +30,9 @@ una, en cada intento de ingreso.
 """
 import hashlib
 import secrets
+from collections.abc import Callable
 from contextlib import AbstractContextManager
-from datetime import datetime, timedelta, timezone
-from typing import Callable
+from datetime import UTC, datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -79,7 +79,7 @@ def _utcnow() -> datetime:
     # Naive-UTC, igual que `password_reset._utcnow`: es lo que guarda
     # `server_default=func.now()` en SQLite, y mezclar aware con naive en la
     # misma columna hace que las comparaciones exploten.
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def generar_codigo() -> str:

@@ -7,7 +7,7 @@ from sqlalchemy.orm import sessionmaker
 
 from libraauth.bootstrap import ensure_admin_user, ensure_default_admin
 from libraauth.models import Base
-from libraauth.repository import UserRepository, UsernameTaken
+from libraauth.repository import UsernameTaken, UserRepository
 
 
 @pytest.fixture

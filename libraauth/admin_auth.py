@@ -28,7 +28,7 @@ import os
 import threading
 import time
 
-from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 

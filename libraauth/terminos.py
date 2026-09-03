@@ -33,10 +33,10 @@ comporta como antes de esta version — ver `hay_terminos_pendientes`.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 # FastAPI a nivel de modulo y NO dentro de `build_terminos_router`, por lo mismo
 # que `auditoria.py`: este archivo tiene `from __future__ import annotations`, asi

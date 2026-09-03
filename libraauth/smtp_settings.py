@@ -22,8 +22,8 @@ instancia alcanzaria para mandar correo en su nombre.
 `estado()` devuelve solo si hay una cargada; el valor descifrado se usa
 unicamente para armar el `SmtpConfig` que consume `enviar_email`.
 """
+from collections.abc import Callable
 from contextlib import AbstractContextManager
-from typing import Callable
 
 from sqlalchemy.orm import Session
 

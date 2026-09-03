@@ -16,11 +16,12 @@ from sqlalchemy.orm import sessionmaker
 from libraauth.email_sender import SmtpConfig
 from libraauth.models import Base, PasswordResetToken
 from libraauth.password_reset import (
-    EmailNotConfigured, InvalidResetToken, PasswordResetService,
+    EmailNotConfigured,
+    InvalidResetToken,
+    PasswordResetService,
 )
 from libraauth.repository import UserRepository
 from libraauth.session_auth import SessionAuth, build_json_api_auth_router
-
 
 AHORA = datetime(2026, 7, 30, 12, 0, 0)
 
