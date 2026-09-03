@@ -53,10 +53,10 @@ Uso tipico en el `create_app()` del producto:
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from contextvars import ContextVar
 from datetime import datetime
-from typing import Callable
 
 # FastAPI a nivel de modulo y NO dentro de `build_logs_router`: este archivo
 # tiene `from __future__ import annotations`, asi que todas las anotaciones son

@@ -30,7 +30,7 @@ from sqlalchemy import String, create_engine
 from sqlalchemy.orm import Mapped, Session, mapped_column, sessionmaker
 
 from libraauth.models import Base
-from libraauth.repository import UserRepository, UsernameTaken
+from libraauth.repository import UsernameTaken, UserRepository
 
 POSTGRES_URL = os.environ.get("LIBRAAUTH_POSTGRES_URL", "")
 
@@ -258,7 +258,9 @@ def test_el_log_de_actividad_acepta_un_id_de_texto_contra_postgres(tmp_path):
     from sqlalchemy.orm import DeclarativeBase
 
     from libraauth.auditoria import (
-        AuditoriaBase, AuditoriaRepository, configurar_auditoria,
+        AuditoriaBase,
+        AuditoriaRepository,
+        configurar_auditoria,
     )
 
     class DominioBase(DeclarativeBase):

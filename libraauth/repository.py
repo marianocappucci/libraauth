@@ -6,8 +6,8 @@ id/username/nombre/email/role/activo) — mismo contrato que
 `libracore.db.usuarios.UserRepository`, para que el patron de consumo sea
 igual al del resto de la familia si se migra mas adelante.
 """
+from collections.abc import Callable
 from contextlib import AbstractContextManager
-from typing import Callable
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError

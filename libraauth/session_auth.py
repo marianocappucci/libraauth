@@ -10,20 +10,25 @@ aplica a un producto de instancia unica) y el endpoint `/auth/verify` de
 """
 import hmac
 import os
-from typing import Callable
+from collections.abc import Callable
 
 from fastapi import APIRouter, Depends, Header, Response
-from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel, ConfigDict
-from starlette.requests import Request
 from starlette.exceptions import HTTPException
+from starlette.requests import Request
 
 from .auth_events import (
-    LOGIN, LOGIN_BLOQUEADO, LOGIN_FALLIDO, LOGOUT, VENTANA_FALLIDOS_MINUTOS,
-    contar_fallidos_seguro, registrar_seguro,
+    LOGIN,
+    LOGIN_BLOQUEADO,
+    LOGIN_FALLIDO,
+    LOGOUT,
+    VENTANA_FALLIDOS_MINUTOS,
+    contar_fallidos_seguro,
+    registrar_seguro,
 )
 from .crypto import ClaveDeCifradoAusente
-from .demo_codigos import CodigoInvalido, DIAS_DEFECTO, USOS_DEFECTO
+from .demo_codigos import DIAS_DEFECTO, USOS_DEFECTO, CodigoInvalido
 from .password_reset import EmailNotConfigured, InvalidResetToken
 from .smtp_settings import SIN_CAMBIOS
 

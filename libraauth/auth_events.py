@@ -17,9 +17,9 @@ SQLAlchemy, para los productos cuyo dominio no vive en sqlite3 crudo. Ver
 `models.AuthEvent` para por que la tabla conserva el nombre `auth_log`.
 """
 import logging
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
-from typing import Callable
 
 from sqlalchemy import String, func, inspect, select
 from sqlalchemy.orm import Session

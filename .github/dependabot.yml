@@ -1,0 +1,26 @@
+# Dependabot: avisa (por PR) cuando una dependencia de TERCEROS tiene una
+# version nueva o un CVE. Agrupado por ecosistema con usuario adm cdrom sudo dip plugdev users docker para que sea
+# UN PR por ecosistema, no uno por paquete. Los motores de la familia (libra*)
+# se excluyen: van por tag de git y los propaga bump-motores (ver libra-bump).
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      python:
+        patterns: ["*"]
+    ignore:
+      # Los motores de la familia se pinean por tag de git y se propagan
+      # con el workflow bump-motores (ver libra-bump), no por dependabot.
+      - dependency-name: "libra*"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]

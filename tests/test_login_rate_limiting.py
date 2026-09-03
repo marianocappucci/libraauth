@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from libraauth.auth_events import AuthEventRepository, LOGIN_BLOQUEADO
+from libraauth.auth_events import LOGIN_BLOQUEADO, AuthEventRepository
 from libraauth.models import Base
 from libraauth.session_auth import build_json_api_auth_router
 
