@@ -1,0 +1,24 @@
+# 🔴 Todo archivo de texto se guarda en el repo con finales de linea LF, sin
+# importar desde donde se escriba.
+#
+# Existe porque paso en la familia: archivos que entraron con CRLF escritos
+# desde Windows sobre la ruta UNC del WSL. `pathlib.Path.write_text` abre con
+# `newline=None`, o sea que traduce cada `\n` a `os.linesep` — y en Windows eso
+# es `\r\n`. No hay ningun sintoma: el codigo compila, los tests pasan y el
+# editor no muestra nada raro. Lo unico que se ve es un diff de "archivo entero
+# modificado" donde se cambio una linea. Y un `.sh` con CRLF directamente no
+# arranca en Linux (`bad interpreter: /bin/bash^M`).
+#
+# `text=auto` deja que git detecte que es texto; `eol=lf` fija como se guarda.
+* text=auto eol=lf
+
+# Binarios: que git no los toque nunca.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
