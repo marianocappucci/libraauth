@@ -55,11 +55,11 @@ jobs:
       LIBRAAUTH_POSTGRES_URL: postgresql+psycopg://libraauth_ci:libraauth_ci_only@localhost:5432/libraauth
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
