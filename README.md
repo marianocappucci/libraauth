@@ -254,6 +254,29 @@ en su nombre.
 Lo que **no** hace: no hay un endpoint de "mandar un mail de prueba". Hoy la
 unica forma de comprobar que la config anda es pedir un reset de verdad.
 
+## Segundo factor y lockout persistido del backoffice (v0.36.0)
+
+`AdminAuth` acepta dos variables de entorno nuevas, las dos opcionales:
+
+| Variable | Efecto |
+|---|---|
+| `ADMIN_PANEL_TOTP_SECRET` | Secreto base32 del autenticador. Con esto seteado, `check_credentials(username, password, codigo=...)` exige ademas el codigo TOTP de 6 digitos; cada codigo sirve una sola vez. |
+| `ADMIN_PANEL_ESTADO_PATH` | Archivo JSON donde viven los intentos fallidos por IP y el ultimo codigo usado. Con esto, el bloqueo por 5 intentos en 15 minutos **sobrevive al reinicio del contenedor**. |
+
+Enrolar al superadmin:
+
+```
+python -m libraauth.totp <producto>
+```
+
+Imprime `ADMIN_PANEL_TOTP_SECRET=...` y la URI `otpauth://` para el
+autenticador (Google Authenticator, Authy, 1Password, Bitwarden). El secreto se
+muestra una sola vez. Un secreto mal cargado frena el arranque con
+`RuntimeError`, a proposito: un segundo factor que nunca valida parece que esta.
+
+Un archivo de estado ilegible o no escribible **no apaga** el rate limiting:
+sigue en memoria y lo avisa por log. Ver ADR-009 en `DECISIONS.md`.
+
 ## Desarrollo
 
 ```
