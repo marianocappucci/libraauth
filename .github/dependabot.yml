@@ -1,5 +1,5 @@
 # Dependabot: avisa (por PR) cuando una dependencia de TERCEROS tiene una
-# version nueva o un CVE. Agrupado por ecosistema con usuario adm cdrom sudo dip plugdev users docker para que sea
+# version nueva o un CVE. Agrupado por ecosistema para que sea
 # UN PR por ecosistema, no uno por paquete. Los motores de la familia (libra*)
 # se excluyen: van por tag de git y los propaga bump-motores (ver libra-bump).
 version: 2
@@ -7,7 +7,7 @@ updates:
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     open-pull-requests-limit: 5
     groups:
       python:
@@ -19,7 +19,7 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     open-pull-requests-limit: 5
     groups:
       actions:
