@@ -99,3 +99,23 @@ wiki (entidad `libraauth`).
   (`_ahora_local_sqlite` / `_ahora_local_postgresql`).
 - Consecuencias: la hora AR es correcta en los dos motores; la restricción
   PostgreSQL-only la aplica el producto, no el motor.
+
+## ADR-009 — Segundo factor TOTP y lockout persistido para el backoffice
+
+- Estado: aceptada
+- Fecha: 2026-09
+- Contexto: `AdminAuth` protege los ocho backoffices de superadmin con una sola
+  contraseña por entorno, y su rate limiting vivía en memoria del proceso: un
+  reinicio del contenedor lo borraba. Una contraseña filtrada de un `-admin`
+  da acceso a todas las instancias del producto (auditoría F2, 2026-09-05).
+- Decisión: TOTP (RFC 6238, SHA1/6 dígitos/30 s) implementado con la stdlib
+  en `libraauth/totp.py`, activado por `ADMIN_PANEL_TOTP_SECRET`; cada código
+  vale una sola vez. Estado del login (intentos por IP y último código usado)
+  en un archivo JSON cuando `ADMIN_PANEL_ESTADO_PATH` está seteado, con
+  escritura atómica; sin la variable, memoria como antes.
+- Consecuencias: sin dependencia nueva; el enrolamiento es un comando
+  (`python -m libraauth.totp <producto>`) y una línea en el `.env`. Un secreto
+  inválido frena el arranque. El estado ilegible o no escribible falla
+  abierto y avisa por log, igual que el resto del rate limiting del paquete.
+  Obligar o sólo ofrecer el segundo factor es decisión del humano: con la
+  variable ausente el login sigue siendo de un factor.
