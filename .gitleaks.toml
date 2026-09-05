@@ -1,0 +1,22 @@
+# Configuracion de gitleaks para la familia Libra (F2, 2026-09-05).
+#
+# Extiende el ruleset por defecto de gitleaks; lo unico que agrega es una lista
+# de exclusiones. Se midio antes de escribirla: un barrido de TODA la historia
+# de los 17 repos dio 48 hallazgos, y los 48 eran contrasenas de prueba dentro
+# de `tests/` ("clave123456" y parecidas, en contalibra, restolibra y libracore).
+# Ningun secreto real. Eximir `tests/` es lo que hace que el gate arranque en
+# verde sin bajar el umbral de las reglas.
+#
+# Lo que NO se exime: cualquier archivo fuera de tests, incluidos workflows,
+# composes, `.env.example` y documentacion. Un token real pegado en un test
+# sigue teniendo el secret scanning de GitHub encima (repos publicos).
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fixtures de tests: contrasenas y tokens inventados para la suite"
+paths = [
+  '''(^|/)tests?/''',
+  '''\.gitleaks\.toml$''',
+]
