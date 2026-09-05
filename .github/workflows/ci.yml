@@ -137,3 +137,18 @@ jobs:
             exit 1
           fi
           echo "OK: el gate corrio contra PostgreSQL real"
+
+  # F2 (2026-09-05): que el CI ponga rojo un commit con un secreto. Barre los
+  # commits del PR (no toda la historia) con la configuracion de
+  # `.gitleaks.toml` en la raiz, que exime `tests/` porque ahi viven las
+  # contrasenas de prueba de la suite. Job independiente: corre en paralelo y
+  # su rojo no se mezcla con el de la suite.
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
