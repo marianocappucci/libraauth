@@ -4,7 +4,7 @@
 # se excluyen: van por tag de git y los propaga bump-motores (ver libra-bump).
 version: 2
 updates:
-  - package-ecosystem: "pip"
+  - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "monthly"

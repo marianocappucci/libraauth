@@ -63,8 +63,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install package + dev deps
-        run: pip install -e ".[dev]"
+      # F1 (2026-09-05): el entorno sale de `uv.lock`, no de la resolucion del dia.
+      # `--locked` falla si el lock no coincide con pyproject.toml: un pin que se
+      # mueve sin regenerar el lock pone rojo aca, no en produccion. El venv entra
+      # al PATH para que los pasos siguientes (ruff, pytest, alembic, scripts)
+      # sigan invocandose igual que antes.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.10"
+      - name: Install package + dev deps (uv.lock)
+        run: |
+          uv sync --locked --extra dev
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       # Lint antes que los tests: tarda segundos y su rojo se lee mucho mas
       # facil que el de una suite. El ruleset vive en pyproject.toml y esta
