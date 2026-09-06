@@ -2,9 +2,14 @@
 # version nueva o un CVE. Agrupado por ecosistema para que sea
 # UN PR por ecosistema, no uno por paquete. Los motores de la familia (libra*)
 # se excluyen: van por tag de git y los propaga bump-motores (ver libra-bump).
+# target-branch: develop en cada entrada (2026-09-06). Sin esto dependabot abre
+# contra la rama default (main) y libra-bump lo mergea ahi, mientras todo lo
+# demas entra por develop: la siguiente promocion develop -> main choca en el
+# archivo que las dos ramas tocaron (paso en los ocho productos con ci.yml).
 version: 2
 updates:
   - package-ecosystem: "uv"
+    target-branch: develop
     directory: "/"
     schedule:
       interval: "monthly"
@@ -17,6 +22,7 @@ updates:
       # con el workflow bump-motores (ver libra-bump), no por dependabot.
       - dependency-name: "libra*"
   - package-ecosystem: "github-actions"
+    target-branch: develop
     directory: "/"
     schedule:
       interval: "monthly"
