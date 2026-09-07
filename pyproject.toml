@@ -14,6 +14,9 @@ authors = [
 dynamic = ["version"]
 dependencies = [
     "starlette",
+    # Hashing de contrasenas (v0.37.0). Trae rueda manylinux, asi que no agrega
+    # toolchain de compilacion a ningun Dockerfile del parque.
+    "argon2-cffi>=23.1",
     "fastapi>=0.111.0",
     "sqlalchemy>=2.0",
     "itsdangerous>=2.2.0",
