@@ -31,8 +31,11 @@ import) — el resto orbita alrededor de él.
   (`_ahora_local_sqlite`/`_ahora_local_postgresql`). Segundo módulo más
   consumido (50 sitios).
 - **`repository.py`** (`UserRepository`, error `UsernameTaken`): CRUD de usuarios.
-- **`hashing.py`** (`hash_password`/`verify_password`): PBKDF2. Módulo mínimo y
-  estable, aislado a propósito.
+- **`hashing.py`** (`hash_password`/`verify_password`/`needs_rehash`): **argon2id**
+  desde la v0.37.0, con verificación de los hashes PBKDF2 anteriores y **re-hash
+  al login** (lo dispara `UserRepository.check_credentials`, el único punto donde
+  el sistema tiene la contraseña en claro). Módulo mínimo y estable, aislado a
+  propósito.
 - **`crypto.py`** (`cifrar`/`descifrar`, `clave_de_cifrado`): cifrado simétrico de
   secretos en reposo, con errores tipados (`ClaveDeCifradoAusente`,
   `SecretoIndescifrable`).
