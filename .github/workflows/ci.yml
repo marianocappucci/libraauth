@@ -70,7 +70,7 @@ jobs:
       # mueve sin regenerar el lock pone rojo aca, no en produccion. El venv entra
       # al PATH para que los pasos siguientes (ruff, pytest, alembic, scripts)
       # sigan invocandose igual que antes.
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           version: "0.12.10"
       - name: Install package + dev deps (uv.lock)
@@ -148,9 +148,9 @@ jobs:
   gitleaks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
