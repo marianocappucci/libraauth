@@ -49,7 +49,8 @@ wiki (entidad `libraauth`).
 - Decisión: `hashing.py` (`hash_password`/`verify_password`, PBKDF2) como módulo
   mínimo y estable, separado de la sesión y del repositorio.
 - Consecuencias: superficie chica y auditable; el algoritmo se cambia en un solo
-  lugar.
+  lugar. **Se cobró el 2026-09-07**: pasar a argon2id fue un archivo, y el resto
+  del motor no se enteró — ver ADR-010.
 
 ## ADR-005 — Secretos cifrados en reposo con clave dedicada
 
@@ -119,3 +120,31 @@ wiki (entidad `libraauth`).
   abierto y avisa por log, igual que el resto del rate limiting del paquete.
   Obligar o sólo ofrecer el segundo factor es decisión del humano: con la
   variable ausente el login sigue siendo de un factor.
+
+## ADR-010 — argon2id para contraseñas, con re-hash al login
+
+- Estado: aceptada
+- Fecha: 2026-09-07
+- Contexto: el hashing era PBKDF2-HMAC-SHA256 con 260.000 iteraciones. PBKDF2 se
+  defiende gastándole **tiempo de CPU** al atacante, que es justo lo barato para
+  una GPU o un ASIC: el mismo presupuesto compra órdenes de magnitud más intentos
+  por segundo que contra un algoritmo que además gasta **memoria**. Sale del
+  punto F2.5 del plan de septiembre.
+- Decisión: **argon2id** (`argon2-cffi`) con los parámetros del piso recomendado
+  por OWASP —19 MiB, 2 pasadas, 1 hilo— y **no** los defaults de la librería
+  (64 MiB, 4 hilos): en este parque conviven doce instancias en un VPS chico, y
+  64 MiB por login concurrente es memoria que se le saca a PostgreSQL.
+  `verify_password` sigue aceptando el formato viejo, y `check_credentials`
+  re-hashea cuando `needs_rehash` lo pide.
+- Consecuencias: **ninguna contraseña se resetea**. Una contraseña vieja se migra
+  sola la próxima vez que su dueño entra; una que nadie usa se queda en PBKDF2 —
+  peor que argon2, pero no una puerta abierta. El re-hash está envuelto en un
+  `try` que **nunca puede tumbar el login**: quien ya demostró que sabe su
+  contraseña no puede quedarse afuera porque falló una escritura de
+  almacenamiento.
+- Efecto lateral asumido: el hash señuelo pasó a ser argon2, así que mientras
+  queden usuarios sin migrar el costo de verificar contra ellos difiere del de un
+  usuario inexistente. Es una fuga más débil que la que el señuelo tapa —dice
+  "existe y no entró desde el cambio", no "no existe"— y se cierra sola. Igualar
+  los costos exigiría dejar el señuelo en PBKDF2, o sea el hueco abierto para
+  siempre del otro lado.

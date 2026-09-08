@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .hashing import DUMMY_PASSWORD_HASH, hash_password, verify_password
+from .hashing import DUMMY_PASSWORD_HASH, hash_password, needs_rehash, verify_password
 from .models import Usuario
 
 
@@ -162,7 +162,14 @@ class UserRepository:
     def check_credentials(self, username: str, password: str) -> dict | None:
         """Siempre corre `verify_password` (contra un hash señuelo del
         mismo costo si el username no existe o esta inactivo), para que
-        el tiempo de respuesta no delate si un username existe."""
+        el tiempo de respuesta no delate si un username existe.
+
+        Y **migra el hash si quedo viejo**: este es el unico momento en que el
+        sistema tiene la contrasena en claro, asi que es el unico momento en que
+        puede re-hashearla. Sin esto, pasar a argon2 solo alcanzaria a las
+        contrasenas creadas despues del cambio y las viejas se quedarian en
+        PBKDF2 para siempre.
+        """
         with self.session_factory() as session:
             u = session.execute(
                 select(Usuario).where(
@@ -171,4 +178,25 @@ class UserRepository:
             ).scalar_one_or_none()
         stored_hash = u.password_hash if u else DUMMY_PASSWORD_HASH
         password_ok = verify_password(stored_hash, password)
+        if u and password_ok and needs_rehash(stored_hash):
+            self._rehash(u.id, password)
         return _to_json_dict(u) if (u and password_ok) else None
+
+    def _rehash(self, uid: int, password: str) -> None:
+        """Reescribe el hash de un login que ya se valido.
+
+        🔴 **Nunca puede tumbar el login.** Si la escritura falla —base de solo
+        lectura, carrera con otra sesion, lo que sea— el usuario ya demostro que
+        sabe su contrasena: negarle la entrada porque no se pudo actualizar un
+        detalle de almacenamiento seria cambiar un problema chico por uno
+        grande. Se reintenta solo, en el proximo login.
+        """
+        try:
+            with self.session_factory() as session:
+                u = session.get(Usuario, uid)
+                if u is None:
+                    return
+                u.password_hash = hash_password(password)
+                session.commit()
+        except Exception:
+            pass
