@@ -28,6 +28,7 @@ from contextlib import AbstractContextManager
 from sqlalchemy.orm import Session
 
 from .crypto import SecretoIndescifrable, cifrar, descifrar
+from .crypto import recifrar as recifrar_secreto
 from .email_sender import SmtpConfig
 from .models import SmtpSettings
 
@@ -173,6 +174,31 @@ class SmtpSettingsRepository:
             session.commit()
 
         return self.get()
+
+    def recifrar(self) -> bool:
+        """Deja la contrasena guardada bajo la clave VIGENTE. Devuelve si cambio.
+
+        Es el paso que cierra una rotacion de `SECRET_KEY`: mientras la
+        contrasena siga cifrada con la clave vieja, sacar
+        `LIBRAAUTH_CLAVES_ANTERIORES` la volveria ilegible, o sea que la
+        rotacion no termino. Ver `crypto.recifrar`.
+
+        **No lanza si no hay nada que hacer** —sin fila, sin contrasena, o ya
+        al dia devuelve `False`— para que se pueda correr en todas las
+        instancias sin averiguar antes cuales tienen SMTP cargado. Si la
+        contrasena no se puede leer con ninguna clave conocida **si lanza**
+        `SecretoIndescifrable`: pisarla seria destruir el unico rastro.
+        """
+        with self.session_factory() as session:
+            fila = session.get(SmtpSettings, FILA_UNICA)
+            if fila is None or not fila.password_cifrada:
+                return False
+            nuevo = recifrar_secreto(fila.password_cifrada)
+            if nuevo is None:
+                return False
+            fila.password_cifrada = nuevo
+            session.commit()
+            return True
 
     def delete(self) -> bool:
         """Borra la config guardada y devuelve si habia algo que borrar.

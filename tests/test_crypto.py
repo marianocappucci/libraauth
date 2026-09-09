@@ -23,6 +23,11 @@ from libraauth.crypto import (
 @pytest.fixture(autouse=True)
 def _entorno_limpio(monkeypatch):
     monkeypatch.delenv("LIBRAAUTH_ENCRYPTION_KEY", raising=False)
+    # Sin esto, una `LIBRAAUTH_CLAVES_ANTERIORES` que exista en la maquina
+    # donde corre la suite le daria a `descifrar` una clave de mas: los tests
+    # de rotacion pasarian o fallarian segun el entorno, que es la peor forma
+    # de fallar.
+    monkeypatch.delenv(crypto.CLAVES_ANTERIORES, raising=False)
     monkeypatch.setenv("SECRET_KEY", "a" * 64)
 
 
@@ -74,7 +79,9 @@ def test_encryption_key_explicita_tiene_prioridad(monkeypatch):
     assert clave_de_cifrado() != con_dedicada
 
 
-def test_rotar_el_secret_key_da_secreto_indescifrable(monkeypatch):
+def test_rotar_el_secret_key_sin_declarar_el_anterior_da_secreto_indescifrable(
+    monkeypatch,
+):
     """El caso realista de fallo. Importa que se distinga de "no hay nada
     guardado": son dos situaciones distintas para el humano que lo mira."""
     blob = cifrar("clave-vieja")
@@ -167,3 +174,104 @@ def test_el_info_de_hkdf_esta_fijado():
     que sea una decision consciente con una migracion, no un renombre
     distraido."""
     assert crypto._INFO == b"libraauth/cifrado-en-reposo/v1"
+
+
+# ── Rotacion sin perder lo guardado ──────────────────────────────────────────
+#
+# Lo que fijan estos tests no es que el AES sepa probar dos claves, sino el
+# ciclo completo de una rotacion: leer con la vieja, recifrar con la nueva, y
+# poder sacar la variable de transicion sabiendo que ya no hace falta.
+
+
+def _rotar(monkeypatch, nueva: str, anteriores: str | None = None):
+    monkeypatch.setenv("SECRET_KEY", nueva)
+    if anteriores is None:
+        monkeypatch.delenv(crypto.CLAVES_ANTERIORES, raising=False)
+    else:
+        monkeypatch.setenv(crypto.CLAVES_ANTERIORES, anteriores)
+
+
+def test_declarando_la_clave_anterior_lo_guardado_se_sigue_leyendo(monkeypatch):
+    blob = cifrar("credencial-de-sos")
+    _rotar(monkeypatch, "z" * 64, anteriores="a" * 64)
+    assert descifrar(blob) == "credencial-de-sos"
+
+
+def test_descifrar_al_dia_avisa_que_vino_de_una_clave_vieja(monkeypatch):
+    """Sin esta señal la rotacion no se puede dar por cerrada: leer bien no
+    distingue "ya esta recifrado" de "todavia depende de la clave vieja"."""
+    blob = cifrar("credencial-de-sos")
+    assert crypto.descifrar_al_dia(blob) == ("credencial-de-sos", True)
+    _rotar(monkeypatch, "z" * 64, anteriores="a" * 64)
+    assert crypto.descifrar_al_dia(blob) == ("credencial-de-sos", False)
+
+
+def test_recifrar_deja_el_valor_bajo_la_clave_vigente(monkeypatch):
+    """El ciclo entero: recifrado, el valor sobrevive a SACAR la variable de
+    transicion. Es el unico test que prueba que la rotacion se puede terminar."""
+    blob = cifrar("credencial-de-sos")
+    _rotar(monkeypatch, "z" * 64, anteriores="a" * 64)
+
+    nuevo = crypto.recifrar(blob)
+    assert nuevo is not None and nuevo != blob
+
+    _rotar(monkeypatch, "z" * 64, anteriores=None)
+    assert descifrar(nuevo) == "credencial-de-sos"
+    # Y el control que le da sentido: el viejo YA no se puede leer sin ella.
+    with pytest.raises(SecretoIndescifrable):
+        descifrar(blob)
+
+
+def test_recifrar_lo_que_ya_esta_al_dia_devuelve_none(monkeypatch):
+    """Idempotencia: una segunda pasada no escribe en la base ni genera nonces
+    nuevos, asi que correrlo de mas es gratis y seguro."""
+    blob = cifrar("credencial-de-sos")
+    assert crypto.recifrar(blob) is None
+    assert crypto.recifrar("") is None
+
+
+def test_recifrar_no_toca_lo_que_no_puede_leer(monkeypatch):
+    """Reemplazarlo por algo cifrado con la clave nueva destruiria el unico
+    rastro de lo que habia."""
+    blob = cifrar("credencial-de-sos")
+    _rotar(monkeypatch, "z" * 64, anteriores="clave-que-no-es")
+    with pytest.raises(SecretoIndescifrable):
+        crypto.recifrar(blob)
+
+
+def test_cifrar_usa_siempre_la_vigente_aunque_haya_anteriores(monkeypatch):
+    """Si `cifrar` pudiera usar una anterior, sacar la variable de transicion
+    volveria ilegible algo recien guardado."""
+    _rotar(monkeypatch, "z" * 64, anteriores="a" * 64)
+    blob = cifrar("recien-cargada")
+    _rotar(monkeypatch, "z" * 64, anteriores=None)
+    assert descifrar(blob) == "recien-cargada"
+
+
+def test_se_admiten_varias_claves_anteriores(monkeypatch):
+    """Dos rotaciones seguidas sin recifrar en el medio no pueden dejar
+    huerfano lo de la primera."""
+    viejisimo = cifrar("de-la-primera-epoca")
+    _rotar(monkeypatch, "m" * 64, anteriores="a" * 64)
+    intermedio = cifrar("de-la-segunda")
+    _rotar(monkeypatch, "z" * 64, anteriores=f"{'m' * 64},{'a' * 64}")
+    assert descifrar(viejisimo) == "de-la-primera-epoca"
+    assert descifrar(intermedio) == "de-la-segunda"
+
+
+def test_las_claves_anteriores_vacias_se_ignoran(monkeypatch):
+    """`"a,,b"` y `" , "` son formas normales de quedar despues de editar la
+    variable a mano; una cadena vacia derivaria una clave valida que no es la
+    de nadie."""
+    _rotar(monkeypatch, "z" * 64, anteriores=f" , ,{'a' * 64}, ")
+    assert crypto._materiales_anteriores() == [("a" * 64).encode()]
+
+
+def test_sin_claves_anteriores_el_mensaje_lo_dice(monkeypatch):
+    """El error tiene que llevar a la accion correcta: declarar el valor viejo
+    para poder recifrar, en vez de dar la credencial por perdida."""
+    blob = cifrar("credencial-de-sos")
+    _rotar(monkeypatch, "z" * 64, anteriores=None)
+    with pytest.raises(SecretoIndescifrable) as exc:
+        descifrar(blob)
+    assert crypto.CLAVES_ANTERIORES in str(exc.value)

@@ -14,7 +14,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from libraauth.crypto import ClaveDeCifradoAusente
+from libraauth.crypto import (
+    CLAVES_ANTERIORES,
+    ClaveDeCifradoAusente,
+    SecretoIndescifrable,
+)
 from libraauth.models import Base, SmtpSettings
 from libraauth.session_auth import build_smtp_settings_router
 from libraauth.smtp_settings import (
@@ -29,6 +33,7 @@ from libraauth.smtp_settings import (
 def _entorno(monkeypatch):
     monkeypatch.setenv("SECRET_KEY", "s" * 64)
     monkeypatch.delenv("LIBRAAUTH_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv(CLAVES_ANTERIORES, raising=False)
     for v in ("LIBRAAUTH_SMTP_HOST", "LIBRAAUTH_SMTP_USER",
               "LIBRAAUTH_SMTP_PASSWORD", "LIBRAAUTH_SMTP_FROM_EMAIL",
               "LIBRAAUTH_SMTP_FROM_NAME", "LIBRAAUTH_SMTP_PORT"):
@@ -429,3 +434,58 @@ def test_prefijo_configurable(session_factory):
     client = TestClient(app)
     assert client.get("/api/config/smtp").status_code == 200
     assert client.get("/admin/smtp").status_code == 404
+
+
+# ── Cerrar una rotacion de SECRET_KEY ────────────────────────────────────────
+
+
+def _guardar_password(session_factory, valor="hunter2"):
+    repo = SmtpSettingsRepository(session_factory)
+    repo.save(host="smtp.test", port=587, user="u", password=valor,
+              from_email="a@b.c", from_name="X")
+    return repo
+
+
+def test_recifrar_deja_la_password_bajo_la_clave_nueva(session_factory, monkeypatch):
+    """El ciclo entero de una rotacion: la contrasena sobrevive a SACAR la
+    variable de transicion, que es lo unico que prueba que la rotacion cerro."""
+    repo = _guardar_password(session_factory)
+    monkeypatch.setenv("SECRET_KEY", "n" * 64)
+    monkeypatch.setenv(CLAVES_ANTERIORES, "s" * 64)
+
+    assert repo.recifrar() is True
+
+    monkeypatch.delenv(CLAVES_ANTERIORES)
+    assert repo.get().password == "hunter2"
+    assert repo.get().password_indescifrable is False
+
+
+def test_sin_recifrar_sacar_la_variable_la_vuelve_ilegible(session_factory, monkeypatch):
+    """El control negativo del test de arriba: sin el recifrado, el mismo
+    escenario termina con la contrasena perdida."""
+    repo = _guardar_password(session_factory)
+    monkeypatch.setenv("SECRET_KEY", "n" * 64)
+    assert repo.get().password_indescifrable is True
+
+
+def test_recifrar_es_idempotente(session_factory):
+    repo = _guardar_password(session_factory)
+    assert repo.recifrar() is False
+
+
+def test_recifrar_sin_fila_no_falla(session_factory):
+    """Se corre en todas las instancias sin averiguar antes cuales tienen SMTP."""
+    assert SmtpSettingsRepository(session_factory).recifrar() is False
+
+
+def test_recifrar_no_pisa_lo_que_no_puede_leer(session_factory, monkeypatch):
+    """Pisarlo con algo cifrado con la clave nueva destruiria el unico rastro
+    de lo que habia."""
+    repo = _guardar_password(session_factory)
+    with session_factory() as s:
+        antes = s.get(SmtpSettings, FILA_UNICA).password_cifrada
+    monkeypatch.setenv("SECRET_KEY", "n" * 64)
+    with pytest.raises(SecretoIndescifrable):
+        repo.recifrar()
+    with session_factory() as s:
+        assert s.get(SmtpSettings, FILA_UNICA).password_cifrada == antes
