@@ -148,3 +148,31 @@ wiki (entidad `libraauth`).
   "existe y no entró desde el cambio", no "no existe"— y se cierra sola. Igualar
   los costos exigiría dejar el señuelo en PBKDF2, o sea el hueco abierto para
   siempre del otro lado.
+
+## ADR-011 — Rotar `SECRET_KEY` deja de destruir lo cifrado en reposo
+
+- Estado: aceptada
+- Fecha: 2026-09-09
+- Contexto: la clave con la que este motor cifra secretos en reposo se **deriva**
+  de `SECRET_KEY`. Hasta acá, rotarla dejaba lo guardado ilegible para siempre.
+  Eso era deliberado —un respaldo por sí solo no alcanza para recuperar la
+  credencial— pero convertía cada rotación en una pérdida silenciosa. El
+  2026-09-07 se rotaron cinco instancias del VPS como respuesta a un incidente y
+  quedaron ilegibles tres credenciales de terceros; aparecieron dos días después
+  y dos de las tres sólo porque alguien las fue a buscar. Una medida de seguridad
+  que rompe cosas en silencio termina siendo un argumento para no tomarla.
+- Decisión: `LIBRAAUTH_CLAVES_ANTERIORES` lista los valores **anteriores** del
+  material de clave, separados por coma. `descifrar` prueba la vigente y después
+  esas; `cifrar` usa **siempre** la vigente. Se agregan `descifrar_al_dia()`, que
+  informa si el valor vino de una clave anterior, y `recifrar()`, que devuelve el
+  valor bajo la clave vigente o `None` si ya lo estaba.
+- Consecuencias: una rotación pasa a tener un **ciclo con final**: rotar, declarar
+  el valor viejo, recifrar, **sacar la variable**. Mientras la variable siga
+  puesta la rotación no terminó, y `descifrar_al_dia()` es lo que permite
+  auditarlo desde afuera en vez de confiar en que alguien se acuerde —
+  `operaciones/auditar_secretos.py` del wiki lo usa para eso.
+- Lo que **no** cambia: la propiedad que justifica todo esto. La base sigue sin
+  contener ninguna clave; sin el entorno, un respaldo sigue sin servir. Y
+  `recifrar()` **no toca** un valor que no puede leer: pisarlo con algo cifrado
+  con la clave nueva destruiría el único rastro de lo que había.
+
