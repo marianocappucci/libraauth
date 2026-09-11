@@ -138,9 +138,51 @@ def test_ip_prefiere_x_forwarded_for():
     assert ip_del_request(req) == "203.0.113.7"
 
 
-def test_ip_toma_el_primer_salto_de_la_cadena():
+def test_ip_saltea_los_proxies_de_confianza_desde_la_derecha():
     req = _FakeRequest({"x-forwarded-for": "203.0.113.7, 10.0.0.1, 172.18.0.1"})
     assert ip_del_request(req) == "203.0.113.7"
+
+
+def test_ip_no_la_elige_el_cliente():
+    """🔴 El defecto que corrige v0.39.0. El cliente manda su propio
+    `X-Forwarded-For` y NPM le agrega el par TCP a la derecha: lo de la
+    izquierda es inventado. Hasta v0.38.0 se tomaba el primero, y rotarlo en
+    cada intento esquivaba el bloqueo por IP.
+
+    De paso cuida la otra trampa: `198.51.100.23` es un rango de
+    documentacion, que `ipaddress.is_private` da por privado. Con ese
+    predicado se lo saltearia como proxy y volveria a ganar el inventado."""
+    req = _FakeRequest({"x-forwarded-for": "9.9.9.9, 198.51.100.23"})
+    assert ip_del_request(req) == "198.51.100.23"
+
+
+def test_ip_ignora_el_header_si_el_par_directo_no_es_un_proxy():
+    """Quien llega al contenedor sin pasar por NPM escribio el header entero."""
+    req = _FakeRequest({"x-forwarded-for": "9.9.9.9"}, client_host="198.51.100.23")
+    assert ip_del_request(req) == "198.51.100.23"
+
+
+def test_ip_par_directo_que_no_es_una_ip_no_es_proxy():
+    """`testclient`, `unknown`: nada que no sea una IP pelada es un proxy nuestro."""
+    req = _FakeRequest({"x-forwarded-for": "9.9.9.9"}, client_host="testclient")
+    assert ip_del_request(req) == "testclient"
+
+
+def test_ip_con_toda_la_cadena_de_confianza_vale_la_que_puso_el_proxy():
+    """Un cliente en la misma LAN: todo es privado, y el de la izquierda lo
+    sigue escribiendo el cliente. Vale el ultimo, el de nuestro proxy."""
+    req = _FakeRequest({"x-forwarded-for": "10.9.9.9, 192.168.1.5"})
+    assert ip_del_request(req) == "192.168.1.5"
+
+
+def test_ip_par_ipv6_con_ipv4_mapeada_cuenta_como_proxy():
+    req = _FakeRequest({"x-forwarded-for": "2001:4860:4860::8888"},
+                       client_host="::ffff:172.18.0.19")
+    assert ip_del_request(req) == "2001:4860:4860::8888"
+
+
+def test_ip_header_sin_saltos_cae_al_par_directo():
+    assert ip_del_request(_FakeRequest({"x-forwarded-for": " , "})) == "172.18.0.1"
 
 
 def test_ip_cae_al_cliente_directo_sin_header():

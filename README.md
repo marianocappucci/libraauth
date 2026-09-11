@@ -81,10 +81,14 @@ repo.contar_fallidos_recientes(ip)    # ventana de 15 minutos
 
 Dos cosas que conviene saber antes de apoyarse en esto:
 
-- **La IP sale de `X-Forwarded-For`**, porque los seis productos corren detras
-  de Nginx Proxy Manager y `request.client.host` seria siempre el proxy. Ese
-  header lo puede falsificar el cliente, asi que la IP **sirve para leer un
-  log, no para decidir un bloqueo**.
+- **La IP sale de `X-Forwarded-For`, leido desde la derecha** (v0.39.0),
+  porque los productos corren detras de Nginx Proxy Manager y
+  `request.client.host` seria siempre el proxy. NPM no reemplaza el header: le
+  agrega el par TCP al final, y lo de la izquierda lo escribe el cliente. Se
+  saltean los proxies de confianza (`REDES_DE_CONFIANZA`: redes privadas y
+  loopback) y el primero que no lo es es el cliente; y el header se ignora si
+  el par directo no es un proxy. Hasta v0.38.0 se tomaba el **primer**
+  elemento, y cambiarlo en cada intento esquivaba el bloqueo por IP.
 - **Un error al registrar nunca tumba el login.** Se traga a proposito: la
   alternativa es que nadie pueda entrar al sistema porque falla el que anota
   que entraron.

@@ -50,6 +50,7 @@ from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 
+from .auth_events import ip_del_request
 from .models import AceptacionTerminos
 
 #: Version vigente del contrato. **Subirla es el disparador de la re-aceptacion**
@@ -414,7 +415,7 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
             usuario_id=_id_int(user.get("id")),
             username=user.get("username", ""),
             nombre=user.get("name", ""),
-            ip=_ip_de(request),
+            ip=ip_del_request(request),
             user_agent=request.headers.get("user-agent", ""),
         )
         # Sin texto: quien acaba de aceptar ya lo tiene en pantalla.
@@ -437,17 +438,3 @@ def _id_int(valor) -> int | None:
         return int(valor)
     except (TypeError, ValueError):
         return None
-
-
-def _ip_de(request: Request) -> str:
-    """La IP del cliente, mirando primero `X-Forwarded-For`.
-
-    Las ocho instancias viven detras de Nginx Proxy Manager: sin este encabezado
-    la IP registrada seria siempre la del proxy, y la prueba de la clausula 30.3
-    quedaria diciendo lo mismo para todas las aceptaciones del VPS. Se toma el
-    **primer** valor de la lista, que es el cliente original.
-    """
-    reenviada = request.headers.get("x-forwarded-for", "")
-    if reenviada:
-        return reenviada.split(",")[0].strip()
-    return request.client.host if request.client else ""

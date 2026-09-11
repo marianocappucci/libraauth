@@ -16,6 +16,7 @@ usan Contalibra y Restolibra. Esto es la misma tabla y el mismo contrato, sobre
 SQLAlchemy, para los productos cuyo dominio no vive en sqlite3 crudo. Ver
 `models.AuthEvent` para por que la tabla conserva el nombre `auth_log`.
 """
+import ipaddress
 import logging
 from collections.abc import Callable
 from contextlib import AbstractContextManager
@@ -57,29 +58,65 @@ _log = logging.getLogger("libraauth.auth_events")
 FORMATO_TS = "%Y-%m-%d %H:%M:%S"
 
 
+#: Las redes desde las que se acepta que alguien diga "el cliente es otro".
+#: Son las mismas que Nginx Proxy Manager declara en su `set_real_ip_from`
+#: para la red de Docker, mas loopback. **Una lista explicita, no
+#: `ipaddress.is_private`**: ese predicado tambien da `True` para los rangos
+#: de documentacion (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) y
+#: otros reservados, y con el cualquier direccion de esas pasaria por proxy.
+REDES_DE_CONFIANZA = tuple(ipaddress.ip_network(r) for r in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
+    "::1/128", "fc00::/7",
+))
+
+
+def _es_proxy_de_confianza(valor: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(valor.strip())
+    except ValueError:
+        # "testclient", "unknown", una IP con puerto: nada que no sea una IP
+        # pelada puede ser un proxy nuestro.
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return any(ip in red for red in REDES_DE_CONFIANZA)
+
+
 def ip_del_request(request: Request) -> str:
-    """La IP del cliente, mirando primero `X-Forwarded-For`.
+    """La IP del cliente, **la que el cliente no puede elegir**.
 
-    Los seis productos corren detras de Nginx Proxy Manager, asi que
-    `request.client.host` es **siempre la IP del proxy** — un log de accesos
-    lleno de `172.18.0.1` no sirve para nada. NPM manda la real en
-    `X-Forwarded-For`.
+    Los productos corren detras de Nginx Proxy Manager, asi que
+    `request.client.host` es la IP del proxy — un log de accesos lleno de
+    `172.18.0.19` no sirve para nada. NPM agrega la real en `X-Forwarded-For`.
 
-    Se toma el **primer** elemento de la lista, que es el cliente original: el
-    header es una cadena `cliente, proxy1, proxy2` y cada salto appendea el
-    suyo.
+    🔴 **Se lee desde la DERECHA, no desde la izquierda.** NPM no reemplaza el
+    header: le **agrega** la IP del par TCP (`$proxy_add_x_forwarded_for`). Lo
+    que esta a la izquierda lo escribio el cliente, y hasta v0.38.0 se tomaba
+    ese primer elemento — o sea que cambiar el header en cada intento esquivaba
+    el bloqueo por intentos fallidos, que cuenta por IP. Medido en el VPS el
+    2026-09-11: un solo salto (DNS directo, NPM termina TLS y reenvia a cada
+    contenedor por la red de Docker).
 
-    > ⚠️ Un cliente puede mandar `X-Forwarded-For` inventado y el proxy le
-    > appendea el suyo detras en vez de descartarlo. O sea: **esta IP sirve
-    > para leer un log, no para decidir un bloqueo**, y por eso el rate
-    > limiting que se apoye en `contar_fallidos_recientes` no puede ser la
-    > unica defensa contra fuerza bruta. Registrarla igual es lo correcto —
-    > una IP falsificada tambien es informacion.
+    La regla: se recorre la cadena desde la derecha salteando los proxies de
+    confianza (`REDES_DE_CONFIANZA`), y el primero que no lo es es el cliente.
+    Si todos son de confianza —un cliente en la misma LAN— vale el ultimo, que
+    es el que escribio nuestro proxy y no el cliente.
+
+    Y el header **solo se lee si el par directo es un proxy de confianza**. Si
+    alguien llega al contenedor sin pasar por NPM, lo que diga `X-Forwarded-For`
+    es suyo de punta a punta y no se le cree nada.
     """
+    directo = request.client.host if request.client else ""
     reenviada = request.headers.get("x-forwarded-for", "")
-    if reenviada:
-        return reenviada.split(",")[0].strip()[:64]
-    return request.client.host if request.client else ""
+    if not reenviada or not _es_proxy_de_confianza(directo):
+        return directo[:64]
+    saltos = [s.strip() for s in reenviada.split(",") if s.strip()]
+    if not saltos:
+        return directo[:64]
+    for salto in reversed(saltos):
+        if not _es_proxy_de_confianza(salto):
+            return salto[:64]
+    return saltos[-1][:64]
 
 
 def _to_dict(e: AuthEvent) -> dict:
