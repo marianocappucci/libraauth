@@ -232,8 +232,15 @@ wiki (entidad `libraauth`).
   no controla, que es la condición para que el captcha y el bloqueo se sumen en
   vez de esquivarse igual. Detrás de un proxy con un par que no esté en la lista
   (un CDN delante de NPM, por ejemplo), todos los clientes se verían con la IP de
-  ese proxy: el día que se agregue un salto, esta lista cambia en el mismo PR.
-- Fuera de alcance: el `_ip` propio de `libra-backoffice` (usa el header entero) y
-  el de `libra-web-kit/docs_auth.py` (usa el par directo, y detrás de NPM su
-  bloqueo es global). Se adoptan en esos repos, con esta función.
+  ese proxy, y el bloqueo por IP pasaría a ser global.
+- **Cómo se agrega un salto** (v0.40.0): `LIBRAAUTH_PROXIES_DE_CONFIANZA`, redes
+  separadas por coma en el entorno de la instancia. **Se suman** a las de la
+  lista, no la reemplazan: reemplazar dejaría sacar por error la red de Docker
+  por la que habla NPM. Una entrada mal escrita se ignora con un error en el log,
+  en vez de tirar abajo el login.
+- Consumidores pendientes, que **no** quedan protegidos por este cambio hasta que
+  lo adopten: el `_ip` propio de `libra-backoffice` (usa el header entero) y
+  `libra-web-kit/docs_auth.py` (usa el par directo, así que detrás de NPM su
+  bloqueo es global: cinco fallos de cualquiera dejan a todos afuera de `/docs`).
+  Y los productos, recién cuando suban el pin.
 

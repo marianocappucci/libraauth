@@ -88,7 +88,9 @@ Dos cosas que conviene saber antes de apoyarse en esto:
   saltean los proxies de confianza (`REDES_DE_CONFIANZA`: redes privadas y
   loopback) y el primero que no lo es es el cliente; y el header se ignora si
   el par directo no es un proxy. Hasta v0.38.0 se tomaba el **primer**
-  elemento, y cambiarlo en cada intento esquivaba el bloqueo por IP.
+  elemento, y cambiarlo en cada intento esquivaba el bloqueo por IP. Un salto
+  mas (un CDN delante de NPM) se declara con `LIBRAAUTH_PROXIES_DE_CONFIANZA`,
+  redes separadas por coma que **se suman** a las privadas.
 - **Un error al registrar nunca tumba el login.** Se traga a proposito: la
   alternativa es que nadie pueda entrar al sistema porque falla el que anota
   que entraron.
