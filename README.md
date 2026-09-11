@@ -95,6 +95,24 @@ Dos cosas que conviene saber antes de apoyarse en esto:
   alternativa es que nadie pueda entrar al sistema porque falla el que anota
   que entraron.
 
+## Captcha «No soy un robot» (v0.40.0)
+
+`build_json_api_auth_router(captcha=True)` agrega `GET /auth/captcha` y exige
+el campo `captcha` en `POST /auth/login` y `POST /auth/forgot-password`. Es
+[ALTCHA](https://altcha.org): una prueba de trabajo que el navegador resuelve
+en alrededor de un segundo, emitida y verificada en el propio servidor —sin
+proveedor externo, sin cookies y sin tocar la CSP—. El widget va en
+`createLogin({ captchaPath })` de libra-ui. ADR-014.
+
+- Las claves se derivan del `SECRET_KEY` por HKDF: no hay variable nueva, y
+  rotar el secreto solo invalida los desafios en curso.
+- Cada desafio sirve **una vez** y vence a los diez minutos.
+- El bloqueo por IP corta antes; un captcha que falta o no vale es un 400 y
+  **no** suma intentos fallidos.
+- Fuera del router (el backoffice): `Captcha(secret_key)`, con `emitir()` y
+  `verificar(payload)`. Tiene que ser **uno por proceso**: la lista de
+  desafios usados vive adentro.
+
 ## Log de actividad (v0.9.0)
 
 Quien creo, edito o borro que, y que cambio. **No se siembran llamadas en los
