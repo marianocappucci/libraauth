@@ -277,6 +277,38 @@ muestra una sola vez. Un secreto mal cargado frena el arranque con
 Un archivo de estado ilegible o no escribible **no apaga** el rate limiting:
 sigue en memoria y lo avisa por log. Ver ADR-009 en `DECISIONS.md`.
 
+## Schema: la cadena de Alembic (2026-09-11)
+
+Hasta aca las seis tablas de este motor las creaba solo
+`AuthBase.metadata.create_all(engine)` en el arranque del producto, y
+`create_all` **no altera** una tabla que ya existe: cambiarle una columna a
+`usuarios` exigia un `ALTER` a mano en cada instancia. Ahora hay cadena propia,
+adentro del paquete, con tabla de version **`alembic_version_libraauth`** (la
+base es compartida con LibraCore, LibraCommerce y el producto):
+
+```
+pip install "libraauth[migrations]"              # trae alembic
+libraauth-migrar upgrade --prefijo gestiolibra --base core
+libraauth-migrar upgrade --prefijo libradesk --base dominio
+libraauth-migrar diferencias --prefijo P --base B  # mide, no cambia nada
+```
+
+- **`--base` es obligatorio con `--prefijo`**: las tablas de auth viven en la
+  base de LibraCore en unos productos y en la del dominio en otros, y no hay
+  una regla que lo deduzca. Ver el docstring de `libraauth/migrar.py`.
+- **La baseline (`0001_baseline_libraauth`) crea solo lo que falta** y no toca
+  ninguna tabla existente, asi que sobre una instancia viva es un `upgrade`, no
+  un `stamp`. Tampoco normaliza `usuarios`/`auth_log` donde los creo LibraCore
+  con columnas `TEXT`: eso lo mide `diferencias`.
+- **Adoptarla es opcional.** Subir el pin sin declararla no cambia nada: el
+  arranque sigue con `create_all()` y alembic no se importa.
+- **Todo cambio de schema es modelo + revision nueva**, en el mismo commit:
+  `alembic revision --autogenerate -m "..."` parado en la raiz, con
+  `DATABASE_URL` apuntando a una base en la cabeza. `test_modelo_y_cadena_coinciden`
+  pone rojo el CI si los dos no dicen lo mismo.
+- `actividad_log` (`AuditoriaBase`) queda **afuera**: vive en la base del
+  dominio, que no siempre es la de `usuarios`.
+
 ## Desarrollo
 
 ```

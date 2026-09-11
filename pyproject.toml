@@ -36,8 +36,24 @@ dependencies = [
     "markdown>=3.6",
 ]
 
+[project.scripts]
+# La cadena de Alembic del schema de auth, corrida desde el paquete instalado
+# (ver libraauth/migrar.py). Es el espejo de `libracore-migrar` y
+# `libracommerce-migrar`, para que los productos la declaren igual en
+# `configure(migraciones=...)`.
+libraauth-migrar = "libraauth.migrar:main"
+
 [project.optional-dependencies]
+# Alembic NO es dependencia del paquete, igual que en LibraCore y LibraCommerce:
+# lo necesita solo quien corre la cadena, y el arranque de un producto no la
+# corre. Asi un consumidor que suba el pin sin adoptarla no suma nada a su
+# imagen. El que la adopta instala `libraauth[migrations]`.
+migrations = [
+    "alembic>=1.13",
+]
 dev = [
+    # La suite ejercita la cadena (tests/test_cadena_alembic.py).
+    "alembic>=1.13",
     "pytest-cov>=6",
     "ruff>=0.13",
     "pytest>=8.0",
