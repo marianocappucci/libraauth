@@ -176,3 +176,71 @@ wiki (entidad `libraauth`).
   `recifrar()` **no toca** un valor que no puede leer: pisarlo con algo cifrado
   con la clave nueva destruiría el único rastro de lo que había.
 
+## ADR-012 — Cadena de Alembic propia para el schema de auth
+
+- Estado: aceptada
+- Fecha: 2026-09-11
+- Contexto: las seis tablas de este motor las creaba sólo `create_all()` en el
+  arranque de cada producto, que crea lo que falta y no altera lo que existe.
+  Cambiar una columna de `usuarios` en producción exigía un `ALTER` a mano por
+  instancia. LibraCore (`v1.53.0`) y LibraCommerce (P9-M0) ya tenían cadena en
+  el wheel; éste era el último motor con schema sin una. Punto 2 de "Dirección
+  de persistencia" de la auditoría de septiembre.
+- Decisión: cadena en `libraauth/migrations/`, tabla de versión
+  `alembic_version_libraauth`, comando `libraauth-migrar` con alembic en el
+  extra `[migrations]`. La baseline es **DDL escrito** (foto de `v0.38.0`) y no
+  una llamada a `create_all()`, porque los modelos siguen cambiando y una
+  baseline que creara la cabeza chocaría con la `0002`. Crea tabla por tabla
+  sólo lo que falta. `--base core|dominio` es obligatorio con `--prefijo`: el
+  engine de auth es la base de LibraCore en Gestiolibra, MedLibra y VentaLibra
+  y la del dominio en LibraCargo, LibraClub y LibraDesk, aunque los dos
+  primeros tengan base de LibraCore aparte.
+- Consecuencias: un cambio de schema es modelo + revisión en el mismo commit, y
+  `test_modelo_y_cadena_coinciden` lo ata. La baseline **no normaliza** las
+  bases donde `usuarios`/`auth_log` los creó el DDL de LibraCore con columnas
+  `TEXT`: una revisión que altere esas tablas tiene que medirlas antes
+  (`libraauth-migrar diferencias`) y tolerar las dos formas. Mientras un
+  producto no adopte la cadena, nada cambia para él: sigue `create_all()`.
+- Fuera de alcance: `actividad_log`, que vive en la base del dominio y en tres
+  productos no es la de `usuarios`. Una cadena no puede cubrir dos bases.
+
+## ADR-013 — La IP del cliente se lee desde la derecha de `X-Forwarded-For`
+
+- Estado: aceptada
+- Fecha: 2026-09-11
+- Contexto: `ip_del_request` tomaba el **primer** elemento de `X-Forwarded-For`,
+  y es con esa IP con la que el router de login cuenta los fallidos en
+  `auth_log`. Nginx Proxy Manager no reemplaza el header: le **agrega** el par
+  TCP (`$proxy_add_x_forwarded_for`), así que el primer elemento lo escribe el
+  cliente. Rotarlo en cada intento esquivaba el bloqueo por IP en todos los
+  productos. El propio docstring lo decía ("sirve para leer un log, no para
+  decidir un bloqueo"), y aun así el bloqueo se apoyaba en ella. `terminos._ip_de`
+  repetía la misma regla para la fila probatoria de la cláusula 30.3.
+  Topología medida en el VPS el 2026-09-11: DNS directo sin CDN, NPM termina TLS
+  y reenvía a cada contenedor en un solo salto por la red de Docker.
+- Decisión: se recorre `X-Forwarded-For` desde la derecha salteando los proxies de
+  confianza (`REDES_DE_CONFIANZA`: `10/8`, `172.16/12`, `192.168/16`, loopback y
+  `fc00::/7`, lo mismo que NPM declara para Docker), y el primero que no lo es es
+  el cliente. El header **sólo se lee si el par directo es un proxy de
+  confianza**: quien llega al contenedor sin NPM no elige su IP. Si toda la
+  cadena es de confianza vale el último elemento, el que escribió el proxy.
+  `terminos` usa la misma función.
+- Por qué una lista y no `ipaddress.is_private`: ese predicado da `True` también
+  para los rangos de documentación y otros reservados, y con él esas direcciones
+  pasarían por proxy. Lo cuida `test_ip_no_la_elige_el_cliente`.
+- Consecuencias: el bloqueo por intentos pasa a contar por una IP que el cliente
+  no controla, que es la condición para que el captcha y el bloqueo se sumen en
+  vez de esquivarse igual. Detrás de un proxy con un par que no esté en la lista
+  (un CDN delante de NPM, por ejemplo), todos los clientes se verían con la IP de
+  ese proxy, y el bloqueo por IP pasaría a ser global.
+- **Cómo se agrega un salto** (v0.39.0): `LIBRAAUTH_PROXIES_DE_CONFIANZA`, redes
+  separadas por coma en el entorno de la instancia. **Se suman** a las de la
+  lista, no la reemplazan: reemplazar dejaría sacar por error la red de Docker
+  por la que habla NPM. Una entrada mal escrita se ignora con un error en el log,
+  en vez de tirar abajo el login.
+- Consumidores pendientes, que **no** quedan protegidos por este cambio hasta que
+  lo adopten: el `_ip` propio de `libra-backoffice` (usa el header entero) y
+  `libra-web-kit/docs_auth.py` (usa el par directo, así que detrás de NPM su
+  bloqueo es global: cinco fallos de cualquiera dejan a todos afuera de `/docs`).
+  Y los productos, recién cuando suban el pin.
+

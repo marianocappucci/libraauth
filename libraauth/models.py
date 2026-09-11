@@ -5,6 +5,14 @@ conceptual, pero pensado para convivir en la misma base que el dominio
 propio del producto consumidor — el producto llama
 `Base.metadata.create_all(engine)` con el mismo engine que usa para sus
 propias tablas.
+
+🔴 **Desde el 2026-09-11 este schema tiene cadena de Alembic**
+(`libraauth/migrations/`, ver `libraauth/migrar.py`). Cambiar una columna o una
+tabla de este archivo es **modelo + revision nueva en el mismo commit**:
+`create_all()` no altera tablas existentes, y `test_modelo_y_cadena_coinciden`
+pone rojo el CI si la cabeza de la cadena y estos modelos no dicen lo mismo. Las
+notas de mas abajo que dicen "no necesita migracion" valen para **tablas
+nuevas** mientras haya productos que no adoptaron la cadena.
 """
 from datetime import datetime
 

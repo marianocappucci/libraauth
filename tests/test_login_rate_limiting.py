@@ -79,8 +79,16 @@ def _app(sessions=None, **kwargs):
     return app
 
 
-def _cliente(app):
-    return TestClient(app, base_url="https://producto.test")
+#: La IP con la que Nginx Proxy Manager le habla a cada contenedor en el VPS
+#: (red `stack_stack-net`, medido el 2026-09-11).
+IP_DEL_PROXY = "172.18.0.19"
+
+
+def _cliente(app, par=IP_DEL_PROXY):
+    # El par directo es el proxy, como en produccion. Con el `testclient` por
+    # defecto de Starlette, `ip_del_request` no le cree a ningun
+    # `X-Forwarded-For` (ver su docstring) y los tests medirian otra cosa.
+    return TestClient(app, base_url="https://producto.test", client=(par, 50000))
 
 
 def test_corta_a_los_cinco_intentos(sessions_de_test):
@@ -113,6 +121,37 @@ def test_cuenta_por_ip_y_no_global(sessions_de_test):
     otra = _cliente(app)
     r = otra.post("/auth/login", json=CLAVE_BUENA, headers={"X-Forwarded-For": "203.0.113.9"})
     assert r.status_code == 200, r.text
+
+
+def test_rotar_x_forwarded_for_no_esquiva_el_bloqueo(sessions_de_test):
+    """🔴 El control negativo de v0.39.0.
+
+    Cada intento manda un `X-Forwarded-For` distinto, y NPM le agrega a la
+    derecha el par TCP real, que es siempre el mismo. Hasta v0.38.0 se contaba
+    por el primer elemento —el que elige el cliente— y esto nunca llegaba al
+    429: la fuerza bruta pasaba con sólo cambiar un header.
+    """
+    c = _cliente(_app(sessions_de_test))
+    real = "198.51.100.23"
+    for n in range(5):
+        r = c.post("/auth/login", json=CLAVE_MALA,
+                   headers={"X-Forwarded-For": f"203.0.113.{n}, {real}"})
+        assert r.status_code == 401, r.text
+    r = c.post("/auth/login", json=CLAVE_BUENA,
+               headers={"X-Forwarded-For": f"203.0.113.99, {real}"})
+    assert r.status_code == 429, r.text
+
+
+def test_sin_pasar_por_el_proxy_el_header_no_cambia_la_ip(sessions_de_test):
+    """Quien le habla al contenedor directo, sin NPM, escribió el header entero:
+    se cuenta por su par TCP, diga lo que diga."""
+    c = _cliente(_app(sessions_de_test), par="198.51.100.23")
+    for n in range(5):
+        c.post("/auth/login", json=CLAVE_MALA,
+               headers={"X-Forwarded-For": f"203.0.113.{n}"})
+    r = c.post("/auth/login", json=CLAVE_BUENA,
+               headers={"X-Forwarded-For": "203.0.113.200"})
+    assert r.status_code == 429, r.text
 
 
 def test_se_puede_apagar(sessions_de_test):
