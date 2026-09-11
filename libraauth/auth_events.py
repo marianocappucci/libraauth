@@ -71,7 +71,7 @@ REDES_DE_CONFIANZA = tuple(ipaddress.ip_network(r) for r in (
     "::1/128", "fc00::/7",
 ))
 
-#: Redes de proxy ADICIONALES, separadas por coma (v0.40.0). Es como se agrega
+#: Redes de proxy ADICIONALES, separadas por coma (v0.39.0). Es como se agrega
 #: un salto: el dia que haya un CDN delante de NPM, sus rangos van aca, y sin
 #: eso todos los clientes se verian con la IP del CDN — un bloqueo global.
 #:

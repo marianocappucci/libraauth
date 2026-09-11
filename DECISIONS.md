@@ -233,7 +233,7 @@ wiki (entidad `libraauth`).
   vez de esquivarse igual. Detrás de un proxy con un par que no esté en la lista
   (un CDN delante de NPM, por ejemplo), todos los clientes se verían con la IP de
   ese proxy, y el bloqueo por IP pasaría a ser global.
-- **Cómo se agrega un salto** (v0.40.0): `LIBRAAUTH_PROXIES_DE_CONFIANZA`, redes
+- **Cómo se agrega un salto** (v0.39.0): `LIBRAAUTH_PROXIES_DE_CONFIANZA`, redes
   separadas por coma en el entorno de la instancia. **Se suman** a las de la
   lista, no la reemplazan: reemplazar dejaría sacar por error la red de Docker
   por la que habla NPM. Una entrada mal escrita se ignora con un error en el log,
