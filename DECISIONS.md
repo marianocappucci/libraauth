@@ -176,3 +176,31 @@ wiki (entidad `libraauth`).
   `recifrar()` **no toca** un valor que no puede leer: pisarlo con algo cifrado
   con la clave nueva destruiría el único rastro de lo que había.
 
+## ADR-012 — Cadena de Alembic propia para el schema de auth
+
+- Estado: aceptada
+- Fecha: 2026-09-11
+- Contexto: las seis tablas de este motor las creaba sólo `create_all()` en el
+  arranque de cada producto, que crea lo que falta y no altera lo que existe.
+  Cambiar una columna de `usuarios` en producción exigía un `ALTER` a mano por
+  instancia. LibraCore (`v1.53.0`) y LibraCommerce (P9-M0) ya tenían cadena en
+  el wheel; éste era el último motor con schema sin una. Punto 2 de "Dirección
+  de persistencia" de la auditoría de septiembre.
+- Decisión: cadena en `libraauth/migrations/`, tabla de versión
+  `alembic_version_libraauth`, comando `libraauth-migrar` con alembic en el
+  extra `[migrations]`. La baseline es **DDL escrito** (foto de `v0.38.0`) y no
+  una llamada a `create_all()`, porque los modelos siguen cambiando y una
+  baseline que creara la cabeza chocaría con la `0002`. Crea tabla por tabla
+  sólo lo que falta. `--base core|dominio` es obligatorio con `--prefijo`: el
+  engine de auth es la base de LibraCore en Gestiolibra, MedLibra y VentaLibra
+  y la del dominio en LibraCargo, LibraClub y LibraDesk, aunque los dos
+  primeros tengan base de LibraCore aparte.
+- Consecuencias: un cambio de schema es modelo + revisión en el mismo commit, y
+  `test_modelo_y_cadena_coinciden` lo ata. La baseline **no normaliza** las
+  bases donde `usuarios`/`auth_log` los creó el DDL de LibraCore con columnas
+  `TEXT`: una revisión que altere esas tablas tiene que medirlas antes
+  (`libraauth-migrar diferencias`) y tolerar las dos formas. Mientras un
+  producto no adopte la cadena, nada cambia para él: sigue `create_all()`.
+- Fuera de alcance: `actividad_log`, que vive en la base del dominio y en tres
+  productos no es la de `usuarios`. Una cadena no puede cubrir dos bases.
+
