@@ -16,8 +16,10 @@ usan Contalibra y Restolibra. Esto es la misma tabla y el mismo contrato, sobre
 SQLAlchemy, para los productos cuyo dominio no vive en sqlite3 crudo. Ver
 `models.AuthEvent` para por que la tabla conserva el nombre `auth_log`.
 """
+import functools
 import ipaddress
 import logging
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
@@ -69,6 +71,33 @@ REDES_DE_CONFIANZA = tuple(ipaddress.ip_network(r) for r in (
     "::1/128", "fc00::/7",
 ))
 
+#: Redes de proxy ADICIONALES, separadas por coma (v0.39.0). Es como se agrega
+#: un salto: el dia que haya un CDN delante de NPM, sus rangos van aca, y sin
+#: eso todos los clientes se verian con la IP del CDN — un bloqueo global.
+#:
+#: **Se suman a `REDES_DE_CONFIANZA`, no las reemplazan.** Reemplazar dejaria
+#: sacar por error la red de Docker por la que habla NPM, y con eso el header
+#: dejaria de leerse en silencio: todo el mundo con la IP del proxy.
+PROXIES_ENV = "LIBRAAUTH_PROXIES_DE_CONFIANZA"
+
+
+@functools.lru_cache(maxsize=8)
+def _redes(extra: str) -> tuple:
+    """Las redes de confianza para un valor de la variable. Cacheado por valor:
+    se parsea una vez, y un error se loguea una vez y no en cada login."""
+    redes = list(REDES_DE_CONFIANZA)
+    for parte in extra.split(","):
+        parte = parte.strip()
+        if not parte:
+            continue
+        try:
+            redes.append(ipaddress.ip_network(parte, strict=False))
+        except ValueError:
+            # Una entrada mal escrita no puede tirar abajo el login de la
+            # instancia: se ignora, y queda dicho en el log.
+            _log.error("%s: %r no es una red; se ignora", PROXIES_ENV, parte)
+    return tuple(redes)
+
 
 def _es_proxy_de_confianza(valor: str) -> bool:
     try:
@@ -79,7 +108,7 @@ def _es_proxy_de_confianza(valor: str) -> bool:
         return False
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
         ip = ip.ipv4_mapped
-    return any(ip in red for red in REDES_DE_CONFIANZA)
+    return any(ip in red for red in _redes(os.environ.get(PROXIES_ENV, "")))
 
 
 def ip_del_request(request: Request) -> str:

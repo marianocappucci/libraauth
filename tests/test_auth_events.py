@@ -181,6 +181,29 @@ def test_ip_par_ipv6_con_ipv4_mapeada_cuenta_como_proxy():
     assert ip_del_request(req) == "2001:4860:4860::8888"
 
 
+def test_ip_un_salto_mas_se_declara_por_entorno(monkeypatch):
+    """Un CDN delante de NPM: sin declararlo, el cliente seria el CDN."""
+    req = _FakeRequest({"x-forwarded-for": "9.9.9.9, 198.51.100.23, 203.0.113.5"})
+    assert ip_del_request(req) == "203.0.113.5"
+    monkeypatch.setenv("LIBRAAUTH_PROXIES_DE_CONFIANZA", "203.0.113.0/24")
+    assert ip_del_request(req) == "198.51.100.23"
+
+
+def test_ip_las_redes_del_entorno_se_suman_y_no_reemplazan(monkeypatch):
+    """Declarar un CDN no puede sacar la red de Docker por la que habla NPM."""
+    monkeypatch.setenv("LIBRAAUTH_PROXIES_DE_CONFIANZA", "203.0.113.0/24")
+    req = _FakeRequest({"x-forwarded-for": "198.51.100.23"}, client_host="172.18.0.19")
+    assert ip_del_request(req) == "198.51.100.23"
+
+
+def test_ip_una_red_mal_escrita_se_ignora_y_no_tumba_el_login(monkeypatch, caplog):
+    monkeypatch.setenv("LIBRAAUTH_PROXIES_DE_CONFIANZA", "no-es-una-red, 203.0.113.0/24")
+    req = _FakeRequest({"x-forwarded-for": "198.51.100.23, 203.0.113.5"})
+    with caplog.at_level("ERROR", logger="libraauth.auth_events"):
+        assert ip_del_request(req) == "198.51.100.23"
+    assert "no-es-una-red" in caplog.text
+
+
 def test_ip_header_sin_saltos_cae_al_par_directo():
     assert ip_del_request(_FakeRequest({"x-forwarded-for": " , "})) == "172.18.0.1"
 
