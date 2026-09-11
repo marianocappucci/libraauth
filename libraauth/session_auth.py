@@ -10,6 +10,7 @@ aplica a un producto de instancia unica) y el endpoint `/auth/verify` de
 """
 import hmac
 import os
+import threading
 from collections.abc import Callable
 
 from fastapi import APIRouter, Depends, Header, Response
@@ -27,6 +28,7 @@ from .auth_events import (
     contar_fallidos_seguro,
     registrar_seguro,
 )
+from .captcha import Captcha
 from .crypto import ClaveDeCifradoAusente
 from .demo_codigos import DIAS_DEFECTO, USOS_DEFECTO, CodigoInvalido
 from .password_reset import EmailNotConfigured, InvalidResetToken
@@ -145,6 +147,9 @@ class SessionAuth:
 class _LoginRequest(BaseModel):
     username: str
     password: str
+    # La solucion del captcha ALTCHA (v0.40.0). Con default vacio: los
+    # productos que no prendieron `captcha` siguen mandando dos campos.
+    captcha: str = ""
 
 
 class _UserOut(BaseModel):
@@ -222,6 +227,8 @@ class _ForgotPasswordRequest(BaseModel):
     # alta, y aceptar los dos evita una pantalla que pregunte "¿esto es tu
     # usuario o tu correo?".
     identificador: str
+    # Ver `_LoginRequest.captcha`.
+    captcha: str = ""
 
 
 class _ResetPasswordRequest(BaseModel):
@@ -268,6 +275,33 @@ class _SmtpSettingsIn(BaseModel):
     password: str | None = None
     from_email: str = ""
     from_name: str = ""
+
+
+#: Lo que contesta el router cuando el captcha falta o no vale. Un 400 y no un
+#: 401: con el captcha mal no se llego a mirar la contrasena, y el mensaje no
+#: puede sugerir que se la probo.
+CAPTCHA_INVALIDO = "Falta la verificación «No soy un robot», o venció. Volvé a tildarla."
+
+_captcha_lock = threading.Lock()
+
+
+def _captcha_de(request: Request) -> Captcha:
+    """El `Captcha` de la app: uno solo por proceso.
+
+    Si el producto no dejo uno en `app.state.captcha`, se arma con el
+    `SECRET_KEY` de su `SessionAuth` la primera vez que hace falta. Uno y no
+    uno por request: la lista de desafios usados vive adentro, y dos
+    instancias la partirian en dos — un desafio resuelto serviria una vez en
+    cada una.
+    """
+    captcha = getattr(request.app.state, "captcha", None)
+    if captcha is None:
+        with _captcha_lock:
+            captcha = getattr(request.app.state, "captcha", None)
+            if captcha is None:
+                captcha = Captcha(json_api_get_session_auth(request).secret_key)
+                request.app.state.captcha = captcha
+    return captcha
 
 
 def json_api_get_session_auth(request: Request) -> "SessionAuth":
@@ -673,6 +707,7 @@ def build_json_api_auth_router(
     ventana_fallidos_minutos: int = VENTANA_FALLIDOS_MINUTOS,
     prefix: str = "/auth",
     get_extras: Callable[[Request, dict], dict] | None = None,
+    captcha: bool = False,
 ) -> APIRouter:
     """Router `/auth` (login/logout/me) para SPAs sin backoffice
     server-rendered propio. Espera `request.app.state.users`/
@@ -720,6 +755,13 @@ def build_json_api_auth_router(
     > su propio `/auth/me`. Los cuatro que usan este router —Gestiolibra,
     > MedLibra, VentaLibra, LibraDesk— no tenian de donde sacarlo, y por eso
     > eran exactamente los cuatro que no lo mostraban.
+
+    `captcha=True` (v0.40.0, ADR-014) agrega `GET {prefix}/captcha`, el
+    desafio ALTCHA, y exige su solucion en el campo `captcha` del login y del
+    forgot-password. Es opt-in para que cada producto lo prenda junto con la
+    pantalla de libra-ui que lo resuelve: prenderlo sin ella dejaria a todos
+    afuera. El bloqueo por IP sigue cortando antes, y un captcha que falta o
+    no vale es un 400 que **no** cuenta como intento fallido.
     """
     # 🔑 `prefix` configurable, como ya lo aceptan `build_smtp_settings_router`
     # y `build_demo_codigos_router`. El default `/auth` es lo que ya usan los
@@ -760,6 +802,18 @@ def build_json_api_auth_router(
                     datos[clave] = _con_bandera_demo(user).get(clave, datos.get(clave))
         return datos
 
+    if captcha:
+        @router.get("/captcha")
+        def captcha_desafio(request: Request, response: Response):
+            """El desafio ALTCHA que resuelve el navegador antes de loguear.
+
+            Sin sesion, como el login. `no-store` porque cada desafio sirve una
+            sola vez: uno cacheado por un proxy seria el mismo para todos, y el
+            primero que lo usara se lo gastaria al resto.
+            """
+            response.headers["Cache-Control"] = "no-store"
+            return _captcha_de(request).emitir()
+
     @router.post("/login", response_model=_UserOut)
     def login(data: _LoginRequest, request: Request, response: Response):
         # 🔴 **El corte va ANTES de chequear la credencial, no despues.**
@@ -785,6 +839,13 @@ def build_json_api_auth_router(
                     "Demasiados intentos fallidos. Esperá "
                     f"{ventana_fallidos_minutos} minutos e intentá de nuevo.",
                 )
+        # El captcha va DESPUES del bloqueo —una IP bloqueada recibe 429 con o
+        # sin captcha— y ANTES de la credencial: cada contrasena probada cuesta
+        # un desafio resuelto. Si falta o no vale no se anota nada: no se llego
+        # a probar ninguna contrasena, y contarlo dejaria bloquear gratis una
+        # IP compartida.
+        if captcha and not _captcha_de(request).verificar(data.captcha):
+            raise HTTPException(400, CAPTCHA_INVALIDO)
         users = request.app.state.users
         user = users.check_credentials(data.username, data.password)
         if user is None:
@@ -1004,6 +1065,10 @@ def build_json_api_auth_router(
             endpoint publico y sin sesion, y una respuesta distinta lo
             convertiria en un buscador de usuarios y correos dados de alta.
             """
+            # Sin captcha, este endpoint manda correos en nombre de la
+            # instancia a quien se quiera y a la velocidad que se quiera.
+            if captcha and not _captcha_de(request).verificar(data.captcha):
+                raise HTTPException(400, CAPTCHA_INVALIDO)
             servicio = request.app.state.password_reset
             try:
                 servicio.request_reset(data.identificador)

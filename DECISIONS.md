@@ -244,3 +244,37 @@ wiki (entidad `libraauth`).
   bloqueo es global: cinco fallos de cualquiera dejan a todos afuera de `/docs`).
   Y los productos, recién cuando suban el pin.
 
+## ADR-014 — Captcha de prueba de trabajo (ALTCHA), siempre y en el propio servidor
+
+- Estado: aceptada
+- Fecha: 2026-09-11
+- Contexto: el bloqueo por intentos cuenta por IP, y con la IP arreglada (ADR-013)
+  sigue sin frenar a quien reparte los intentos entre muchas. Hacía falta un costo
+  por intento que no dependa de la IP. El humano eligió ALTCHA, y que vaya
+  **siempre**, no recién después de N fallos (2026-09-11).
+- Decisión: `libraauth/captcha.py` con `Captcha(secret_key)`. `emitir()` arma un
+  desafío PBKDF2/SHA-256 en modo determinista con la clave derivada firmada, y
+  `verificar()` lo acepta una sola vez. Dependencia nueva: `altcha` (MIT, sin
+  dependencias propias). En el router, `captcha=True` —opt-in— agrega el endpoint
+  del desafío y exige la solución en el login y en forgot-password.
+- Por qué ALTCHA: de los cuatro evaluados (con Turnstile, hCaptcha y reCAPTCHA) es
+  el único que no sale del servidor. Ningún tercero ve la IP del usuario, no hay
+  cookies, la CSP no cambia y el login no depende de que otro esté arriba.
+- Claves: HKDF del `SECRET_KEY` con `info` propio (`libraauth/captcha/firma/v1` y
+  `libraauth/captcha/clave/v1`), la misma receta que `crypto.py`. Rotar el secreto
+  sólo invalida los desafíos en curso: **no** es un consumidor más de la rotación.
+- Modo determinista con `hmac_key_secret`: verificar cuesta 0,1 ms sin volver a
+  derivar. El servidor no paga lo que paga el cliente, y una solución basura no
+  sirve para gastarle CPU.
+- Anti-replay en memoria del proceso: los productos corren un solo uvicorn por
+  contenedor (medido). Un reinicio vacía la lista, y lo peor que habilita es
+  reusar un desafío anterior mientras siga vigente.
+- Orden en el login: bloqueo por IP → captcha → credenciales. Un captcha que falta
+  o no vale es 400 y **no** se anota como fallido: no se llegó a probar ninguna
+  contraseña, y contarlo dejaría bloquear gratis una IP compartida.
+- Costo provisorio: 1000 iteraciones por contador, con el contador en
+  [2000, 4000): 0,70 s en un hilo de Python en una PC. Se ajusta con la medición
+  en el navegador.
+- Fuera de alcance: el login de la demo, que ya exige un código emitido por el
+  backoffice, y el `/docs` de `libra-web-kit`.
+
