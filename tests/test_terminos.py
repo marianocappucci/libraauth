@@ -272,10 +272,17 @@ def test_aceptar_una_version_que_no_es_la_vigente_da_409(sessions):
 
 def test_la_fila_guarda_version_hash_quien_e_ip_real(sessions):
     app = _app(sessions)
-    cliente = _logueado(app)
+    # El par directo es el proxy, como en el VPS: sin eso `ip_del_request` no
+    # le cree al header y la fila guardaria el par.
+    cliente = TestClient(app, base_url="https://testserver", client=("172.18.0.19", 50000))
+    r = cliente.post("/auth/login", json={"username": "admin", "password": "adminpw"})
+    assert r.status_code == 200, r.text
     cliente.post(
         "/terminos/aceptar", json={"version": VERSION_VIGENTE},
-        headers={"x-forwarded-for": "190.1.2.3, 172.18.0.1", "user-agent": "Firefox/1"},
+        # Lo que llega detras de NPM cuando el cliente manda su propio header:
+        # el suyo a la izquierda, el par TCP agregado a la derecha. La prueba de
+        # la clausula 30.3 no puede guardar lo que el cliente quiso escribir.
+        headers={"x-forwarded-for": "6.6.6.6, 190.1.2.3", "user-agent": "Firefox/1"},
     )
     with sessions() as s:
         fila = s.query(AceptacionTerminos).one()

@@ -204,3 +204,36 @@ wiki (entidad `libraauth`).
 - Fuera de alcance: `actividad_log`, que vive en la base del dominio y en tres
   productos no es la de `usuarios`. Una cadena no puede cubrir dos bases.
 
+## ADR-013 — La IP del cliente se lee desde la derecha de `X-Forwarded-For`
+
+- Estado: aceptada
+- Fecha: 2026-09-11
+- Contexto: `ip_del_request` tomaba el **primer** elemento de `X-Forwarded-For`,
+  y es con esa IP con la que el router de login cuenta los fallidos en
+  `auth_log`. Nginx Proxy Manager no reemplaza el header: le **agrega** el par
+  TCP (`$proxy_add_x_forwarded_for`), así que el primer elemento lo escribe el
+  cliente. Rotarlo en cada intento esquivaba el bloqueo por IP en todos los
+  productos. El propio docstring lo decía ("sirve para leer un log, no para
+  decidir un bloqueo"), y aun así el bloqueo se apoyaba en ella. `terminos._ip_de`
+  repetía la misma regla para la fila probatoria de la cláusula 30.3.
+  Topología medida en el VPS el 2026-09-11: DNS directo sin CDN, NPM termina TLS
+  y reenvía a cada contenedor en un solo salto por la red de Docker.
+- Decisión: se recorre `X-Forwarded-For` desde la derecha salteando los proxies de
+  confianza (`REDES_DE_CONFIANZA`: `10/8`, `172.16/12`, `192.168/16`, loopback y
+  `fc00::/7`, lo mismo que NPM declara para Docker), y el primero que no lo es es
+  el cliente. El header **sólo se lee si el par directo es un proxy de
+  confianza**: quien llega al contenedor sin NPM no elige su IP. Si toda la
+  cadena es de confianza vale el último elemento, el que escribió el proxy.
+  `terminos` usa la misma función.
+- Por qué una lista y no `ipaddress.is_private`: ese predicado da `True` también
+  para los rangos de documentación y otros reservados, y con él esas direcciones
+  pasarían por proxy. Lo cuida `test_ip_no_la_elige_el_cliente`.
+- Consecuencias: el bloqueo por intentos pasa a contar por una IP que el cliente
+  no controla, que es la condición para que el captcha y el bloqueo se sumen en
+  vez de esquivarse igual. Detrás de un proxy con un par que no esté en la lista
+  (un CDN delante de NPM, por ejemplo), todos los clientes se verían con la IP de
+  ese proxy: el día que se agregue un salto, esta lista cambia en el mismo PR.
+- Fuera de alcance: el `_ip` propio de `libra-backoffice` (usa el header entero) y
+  el de `libra-web-kit/docs_auth.py` (usa el par directo, y detrás de NPM su
+  bloqueo es global). Se adoptan en esos repos, con esta función.
+
