@@ -32,6 +32,19 @@ el codigo de 6 digitos del autenticador, y cada codigo sirve una sola vez. Es
 el activo mas sensible de la familia —una contrasena filtrada de un `-admin` da
 acceso a todas las instancias del producto— y el que menos cuesta proteger:
 un usuario, una pantalla, un motor.
+
+Desde la F3 (2026-09-13) el secreto TOTP tambien se puede **enrolar en
+runtime**, sin tocar el `.env` ni recrear el contenedor: `iniciar_totp` /
+`confirmar_totp` / `desactivar_totp` lo guardan en un archivo JSON aparte del
+estado de login (`ADMIN_PANEL_TOTP_PATH`, o el hermano `totp.json` de
+`ADMIN_PANEL_ESTADO_PATH` cuando esa variable no esta seteada). El entorno
+sigue mandando cuando esta presente: con `ADMIN_PANEL_TOTP_SECRET` seteado,
+`totp_origen` es `"entorno"` y enrolar o desactivar desde la app se rechaza
+con `TotpNoEnrolable`. Y a diferencia del estado de login —que falla
+ABIERTO—, un archivo de TOTP roto falla CERRADO: `totp_habilitado` da `True`
+y el login queda cerrado hasta borrar el archivo a mano desde el host, porque
+un segundo factor que se apaga solo porque el archivo se rompio es peor que
+un login cerrado que se arregla borrando un archivo (ver ADR-015).
 """
 import hmac
 import json
@@ -40,20 +53,40 @@ import os
 import threading
 import time
 from pathlib import Path
+from typing import Literal
 
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 
 from .session_auth import _resolve_secret_key
-from .totp import Totp
+from .totp import Totp, generar_secreto, uri_otpauth
 
 _log = logging.getLogger("libraauth.admin_auth")
 
 #: Variable de entorno con el secreto base32 del segundo factor. Vacia = sin 2FA.
 TOTP_SECRET_ENV = "ADMIN_PANEL_TOTP_SECRET"
+#: Variable de entorno con la ruta del archivo del secreto TOTP enrolable en
+#: runtime. Vacia = se deriva de ESTADO_PATH_ENV (ver `AdminAuth.__init__`).
+TOTP_PATH_ENV = "ADMIN_PANEL_TOTP_PATH"
 #: Variable de entorno con la ruta del archivo de estado del login. Vacia = memoria.
 ESTADO_PATH_ENV = "ADMIN_PANEL_ESTADO_PATH"
+#: Segundos que un secreto PENDIENTE de `iniciar_totp` sigue confirmable con
+#: `confirmar_totp` antes de vencer (10 minutos).
+TOTP_PENDIENTE_SEGUNDOS = 600
+
+
+class TotpNoEnrolable(RuntimeError):
+    """`iniciar_totp` / `confirmar_totp` / `desactivar_totp` no se pueden usar
+    ahora. El mensaje dice cual de los tres motivos es:
+
+    - El origen es el entorno: `ADMIN_PANEL_TOTP_SECRET` manda y el segundo
+      factor no se enrola ni se desactiva desde la app.
+    - No hay ruta de archivo configurada (ni `ADMIN_PANEL_TOTP_PATH` ni
+      `ADMIN_PANEL_ESTADO_PATH`): no enrolable por falta de donde guardar.
+    - El archivo de TOTP esta roto (ver `_EstadoTotp.leer`): hay que borrarlo
+      a mano desde el host antes de enrolar o desactivar de nuevo.
+    """
 
 
 def _estado_vacio() -> dict:
@@ -143,13 +176,102 @@ class _EstadoLogin:
             self._guardar(data)
 
 
+def _totp_archivo_vacio() -> dict:
+    return {"secreto": None, "pendiente": None, "roto": False}
+
+
+class _EstadoTotp:
+    """El secreto TOTP enrolado en runtime, en un archivo JSON aparte del
+    estado de login (`_EstadoLogin`). En memoria (siempre vacio, nunca
+    enrolable) si `path` es `None`; si no, cada lectura abre el archivo y
+    cada escritura lo reemplaza entero (tmp + `os.chmod(0o600)` +
+    `os.replace`, atomico en el mismo filesystem) — igual convencion que
+    `_EstadoLogin` y por la misma razon: un reinicio o dos procesos tienen
+    que ver lo mismo.
+
+    **Fail CLOSED, a diferencia de `_EstadoLogin`**: un archivo que existe
+    pero es ilegible, no es JSON o tiene forma inesperada NO se trata como
+    vacio. `leer()` devuelve `roto=True`, y es responsabilidad de quien llama
+    (`AdminAuth`) convertir eso en `totp_habilitado=True` con el login
+    cerrado. La justificacion vive en el docstring del modulo: un segundo
+    factor que se apaga solo porque el archivo se rompio es peor que un login
+    cerrado que se arregla borrando un archivo desde el host.
+    """
+
+    def __init__(self, path: str | os.PathLike | None):
+        self.path = Path(path) if path else None
+        self._lock = threading.Lock()
+
+    def leer(self) -> dict:
+        """`{"secreto": str | None, "pendiente": {"secreto", "creado"} | None,
+        "roto": bool}`. Se lee siempre del archivo, sin cache."""
+        if self.path is None:
+            return _totp_archivo_vacio()
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return _totp_archivo_vacio()
+        except (OSError, ValueError) as e:
+            _log.error(
+                "archivo de TOTP ilegible en %s (%s): el 2FA queda CERRADO "
+                "(fail closed) hasta borrarlo a mano desde el host", self.path, e,
+            )
+            return {**_totp_archivo_vacio(), "roto": True}
+        # Un `secreto` que no es texto (un archivo editado a mano con un
+        # numero, una lista) cuenta como forma inesperada: si pasara, `Totp()`
+        # reventaria con `AttributeError` en el login -- un 500 en vez del
+        # cierre controlado.
+        if (
+            not isinstance(data, dict)
+            or "secreto" not in data
+            or not isinstance(data["secreto"], (str, type(None)))
+        ):
+            _log.error(
+                "archivo de TOTP con forma inesperada en %s: el 2FA queda "
+                "CERRADO (fail closed) hasta borrarlo a mano desde el host", self.path,
+            )
+            return {**_totp_archivo_vacio(), "roto": True}
+        pendiente = data.get("pendiente") or None
+        # Un pendiente malformado se descarta sin cerrar nada: todavia no es
+        # un segundo factor, y sin el volver a iniciar lo reemplaza.
+        if pendiente is not None and not (
+            isinstance(pendiente, dict)
+            and isinstance(pendiente.get("secreto"), str)
+            and isinstance(pendiente.get("creado"), (int, float))
+            and not isinstance(pendiente.get("creado"), bool)
+        ):
+            pendiente = None
+        return {"secreto": data.get("secreto") or None, "pendiente": pendiente, "roto": False}
+
+    def guardar(self, *, secreto: str | None, pendiente: dict | None) -> bool:
+        """Reemplaza el archivo entero. `False` si fallo (nunca lanza): quien
+        llama decide si eso implica `RuntimeError` (ver `AdminAuth`:
+        `confirmar_totp` y `desactivar_totp` RELEEN despues de guardar, asi
+        que un fallo silencioso igual se detecta)."""
+        if self.path is None:
+            return False
+        data = {"secreto": secreto, "pendiente": pendiente}
+        with self._lock:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.path.with_name(self.path.name + ".tmp")
+                tmp.write_text(json.dumps(data), encoding="utf-8")
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, self.path)
+            except OSError as e:
+                _log.error("no se pudo guardar el archivo de TOTP en %s (%s)", self.path, e)
+                return False
+        return True
+
+
 class AdminAuth:
     """Autenticacion del backoffice de superadmin (ver docstring del modulo).
 
-    `totp_secret` y `estado_path` se leen del entorno cuando son `None`; pasar
-    `""` los apaga explicitamente (util en tests). Un secreto TOTP invalido
-    frena el arranque con `RuntimeError`: un segundo factor mal cargado que
-    nunca valida es peor que ninguno, porque parece que esta."""
+    `totp_secret`, `estado_path` y `totp_path` se leen del entorno cuando son
+    `None`; pasar `""` los apaga explicitamente (util en tests). Un secreto
+    TOTP del entorno invalido frena el arranque con `RuntimeError`: un segundo
+    factor mal cargado que nunca valida es peor que ninguno, porque parece que
+    esta."""
 
     def __init__(
         self,
@@ -161,6 +283,7 @@ class AdminAuth:
         login_ventana_segundos: int = 15 * 60,
         totp_secret: str | None = None,
         estado_path: str | os.PathLike | None = None,
+        totp_path: str | os.PathLike | None = None,
     ):
         self.secret_key = _resolve_secret_key(
             dev_secret_fallback,
@@ -184,15 +307,95 @@ class AdminAuth:
         else:
             self._totp = None
 
-        ruta = os.environ.get(ESTADO_PATH_ENV, "") if estado_path is None else estado_path
-        self._estado = _EstadoLogin(ruta or None)
+        ruta_estado = os.environ.get(ESTADO_PATH_ENV, "") if estado_path is None else estado_path
+        self._estado = _EstadoLogin(ruta_estado or None)
+
+        # Ruta del archivo TOTP enrolable en runtime: ADMIN_PANEL_TOTP_PATH si
+        # esta; si no (y solo si totp_path no vino explicitamente en "" -
+        # misma convencion que estado_path: None = leer entorno, "" = apagado
+        # explicito), el hermano `totp.json` de ADMIN_PANEL_ESTADO_PATH.
+        if totp_path is None:
+            ruta_totp = os.environ.get(TOTP_PATH_ENV, "")
+            if not ruta_totp and ruta_estado:
+                ruta_totp = Path(ruta_estado).parent / "totp.json"
+        else:
+            ruta_totp = totp_path
+        self._totp_archivo = _EstadoTotp(ruta_totp or None)
 
     # ── credenciales ───────────────────────────────────────────────────────
 
     @property
+    def totp_origen(self) -> Literal["entorno", "archivo"] | None:
+        """De donde sale el segundo factor activo, o `None` sin 2FA.
+
+        Se lee en cada acceso, sin cache — igual que `totp_habilitado` y
+        `check_credentials`, y por la misma razon: dos procesos (o un archivo
+        que un humano acaba de editar) tienen que verse igual."""
+        if self._totp is not None:
+            return "entorno"
+        if self._totp_archivo.path is None:
+            return None
+        estado = self._totp_archivo.leer()
+        if estado["roto"] or estado["secreto"]:
+            return "archivo"
+        return None
+
+    @property
     def totp_habilitado(self) -> bool:
-        """`True` cuando el login exige el codigo del autenticador."""
-        return self._totp is not None
+        """`True` cuando el login exige el codigo del autenticador: con
+        secreto en el entorno, con un secreto activo guardado en archivo, o
+        -- fail CLOSED -- con el archivo de TOTP roto (ver `_EstadoTotp`)."""
+        return self.totp_origen is not None
+
+    @property
+    def totp_enrolable(self) -> bool:
+        """Hay ruta de archivo para el TOTP y el origen no es el entorno
+        (equivalente a que `_exigir_enrolable` no levante)."""
+        try:
+            self._exigir_enrolable()
+        except TotpNoEnrolable:
+            return False
+        return True
+
+    def _exigir_enrolable(self) -> None:
+        """La regla de `iniciar_totp` / `confirmar_totp` / `desactivar_totp`,
+        compartida: levanta `TotpNoEnrolable` con el motivo, o no hace nada."""
+        if self._totp is not None:
+            raise TotpNoEnrolable(
+                f"{TOTP_SECRET_ENV} esta seteado: el segundo factor lo maneja "
+                "el entorno, no se puede enrolar ni desactivar desde la app."
+            )
+        if self._totp_archivo.path is None:
+            raise TotpNoEnrolable(
+                f"no hay ruta de archivo para el TOTP: setear {TOTP_PATH_ENV} "
+                f"o {ESTADO_PATH_ENV}."
+            )
+        if self._totp_archivo.leer()["roto"]:
+            raise TotpNoEnrolable(
+                "el archivo de TOTP esta roto: borrarlo a mano desde el host "
+                "antes de enrolar o desactivar de nuevo."
+            )
+
+    def _totp_activo(self) -> tuple[Totp | None, bool]:
+        """El validador del secreto activo ahora mismo (entorno o archivo) y
+        si el archivo esta roto. `(None, False)` = sin 2FA."""
+        if self._totp is not None:
+            return self._totp, False
+        if self._totp_archivo.path is None:
+            return None, False
+        estado = self._totp_archivo.leer()
+        if estado["roto"]:
+            return None, True
+        if not estado["secreto"]:
+            return None, False
+        try:
+            return Totp(estado["secreto"]), False
+        except ValueError as e:
+            _log.error(
+                "secreto TOTP guardado en %s no es valido (%s): el 2FA queda "
+                "CERRADO (fail closed)", self._totp_archivo.path, e,
+            )
+            return None, True
 
     def check_credentials(self, username: str, password: str, codigo: str | None = None) -> bool:
         """Usuario y contrasena, y ademas el codigo TOTP si esta habilitado.
@@ -201,7 +404,11 @@ class AdminAuth:
         solo `False`: que la clave este mal no ahorra la del codigo, y quien
         llama no puede distinguir cual de las dos fallo. El contador del
         codigo se marca como usado solo cuando TODO valido — asi un error de
-        tipeo en la contrasena no quema el codigo de ese medio minuto."""
+        tipeo en la contrasena no quema el codigo de ese medio minuto.
+
+        Con el archivo de TOTP roto, `False` siempre (fail CLOSED): ni la
+        clave correcta ni ningun codigo abren el login hasta que se borre el
+        archivo a mano desde el host."""
         if not self.panel_pass:
             # Sin contrasena configurada se rechaza todo (fail-closed): si no,
             # una instancia mal configurada dejaria entrar con password vacia.
@@ -209,11 +416,103 @@ class AdminAuth:
         clave_ok = hmac.compare_digest(
             username or "", self.panel_user
         ) and hmac.compare_digest(password or "", self.panel_pass)
-        if self._totp is None:
+        validador, roto = self._totp_activo()
+        if roto:
+            return False
+        if validador is None:
             return clave_ok
-        paso = self._totp.paso_valido(codigo or "", ultimo_paso=self._estado.ultimo_paso_totp())
+        paso = validador.paso_valido(codigo or "", ultimo_paso=self._estado.ultimo_paso_totp())
         if not clave_ok or paso is None:
             return False
+        self._estado.marcar_paso_totp(paso)
+        return True
+
+    # ── enrolamiento TOTP en runtime ─────────────────────────────────────────
+
+    def iniciar_totp(self, cuenta: str) -> dict:
+        """Arranca (o reinicia) el enrolamiento del segundo factor por
+        archivo: genera un secreto nuevo, lo guarda como PENDIENTE (pisando
+        cualquier pendiente anterior, sin tocar el activo) y devuelve
+        `{"secreto", "uri"}` para mostrar el QR (`uri` sale de
+        `totp.uri_otpauth`). Confirmar con `confirmar_totp` dentro de
+        `TOTP_PENDIENTE_SEGUNDOS`.
+
+        Levanta `TotpNoEnrolable` si no es enrolable (ver `_exigir_enrolable`)
+        o si ya hay un secreto activo por archivo (hay que desactivarlo antes
+        con `desactivar_totp`)."""
+        self._exigir_enrolable()
+        estado = self._totp_archivo.leer()
+        if estado["secreto"]:
+            raise TotpNoEnrolable(
+                "ya hay un segundo factor activo por archivo: desactivarlo "
+                "(desactivar_totp) antes de enrolar uno nuevo."
+            )
+        secreto = generar_secreto()
+        if not self._totp_archivo.guardar(
+            secreto=None, pendiente={"secreto": secreto, "creado": time.time()}
+        ):
+            raise RuntimeError("no se pudo guardar el secreto TOTP pendiente")
+        return {"secreto": secreto, "uri": uri_otpauth(secreto, cuenta)}
+
+    def confirmar_totp(self, codigo: str) -> bool:
+        """Confirma el PENDIENTE de `iniciar_totp` y lo vuelve el secreto
+        activo. `False` con codigo invalido, pendiente inexistente o pendiente
+        vencido (mas de `TOTP_PENDIENTE_SEGUNDOS`). El codigo se valida igual
+        que en el login (misma ventana, mismo `ultimo_paso_totp`: ese mismo
+        codigo no sirve despues para entrar).
+
+        Si el codigo vale: guarda el secreto como activo, RELEE el archivo
+        para confirmar que quedo asi, y recien entonces marca el paso como
+        usado. Si la escritura o la relectura no reflejan el cambio,
+        `RuntimeError` — nunca se dice "activado" si no persistio."""
+        self._exigir_enrolable()
+        pendiente = self._totp_archivo.leer()["pendiente"]
+        if not pendiente:
+            return False
+        if time.time() - float(pendiente["creado"]) > TOTP_PENDIENTE_SEGUNDOS:
+            return False
+        try:
+            validador = Totp(pendiente["secreto"])
+        except ValueError:
+            return False
+        paso = validador.paso_valido(codigo or "", ultimo_paso=self._estado.ultimo_paso_totp())
+        if paso is None:
+            return False
+        nuevo_secreto = pendiente["secreto"]
+        if not self._totp_archivo.guardar(secreto=nuevo_secreto, pendiente=None):
+            raise RuntimeError("no se pudo confirmar el TOTP: la escritura fallo")
+        if self._totp_archivo.leer()["secreto"] != nuevo_secreto:
+            raise RuntimeError(
+                "no se pudo confirmar el TOTP: la relectura no coincide con lo guardado"
+            )
+        self._estado.marcar_paso_totp(paso)
+        return True
+
+    def desactivar_totp(self, codigo: str) -> bool:
+        """Apaga el segundo factor por archivo (y descarta cualquier
+        pendiente). Exige un codigo valido del secreto ACTIVO, no reusado;
+        `False` con codigo invalido o sin secreto activo. Solo aplica a
+        origen "archivo" — con origen "entorno" levanta `TotpNoEnrolable`.
+
+        Igual que `confirmar_totp`: guarda, RELEE para confirmar y recien
+        entonces marca el paso como usado; si no persistio, `RuntimeError`."""
+        self._exigir_enrolable()
+        estado = self._totp_archivo.leer()
+        if not estado["secreto"]:
+            return False
+        try:
+            validador = Totp(estado["secreto"])
+        except ValueError:
+            return False
+        paso = validador.paso_valido(codigo or "", ultimo_paso=self._estado.ultimo_paso_totp())
+        if paso is None:
+            return False
+        if not self._totp_archivo.guardar(secreto=None, pendiente=None):
+            raise RuntimeError("no se pudo desactivar el TOTP: la escritura fallo")
+        if self._totp_archivo.leer()["secreto"] is not None:
+            raise RuntimeError(
+                "no se pudo desactivar el TOTP: la relectura no coincide con lo guardado"
+            )
         self._estado.marcar_paso_totp(paso)
         return True
 

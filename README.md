@@ -301,6 +301,43 @@ muestra una sola vez. Un secreto mal cargado frena el arranque con
 Un archivo de estado ilegible o no escribible **no apaga** el rate limiting:
 sigue en memoria y lo avisa por log. Ver ADR-009 en `DECISIONS.md`.
 
+## TOTP enrolable en runtime, con QR (v0.41.0)
+
+Ademas de `ADMIN_PANEL_TOTP_SECRET` (arriba), el segundo factor se puede
+**enrolar desde la app**, sin tocar el `.env` ni recrear el contenedor — el
+interruptor "habilitar doble factor" del backoffice:
+
+| Variable | Efecto |
+|---|---|
+| `ADMIN_PANEL_TOTP_PATH` | Archivo JSON donde vive el secreto enrolado en runtime. Si no esta seteada y **si** `ADMIN_PANEL_ESTADO_PATH` lo esta, se usa el hermano `totp.json` del mismo directorio. Sin ninguna de las dos, no es enrolable. |
+
+API de `AdminAuth`:
+
+```python
+a.totp_origen       # "entorno" | "archivo" | None
+a.totp_habilitado    # True con secreto activo (entorno o archivo) o con el archivo roto
+a.totp_enrolable     # hay ruta de archivo y el origen no es "entorno"
+
+datos = a.iniciar_totp("superadmin")      # {"secreto": "...", "uri": "otpauth://..."}
+# mostrar datos["uri"] como QR (o el secreto a mano) y pedir el codigo del autenticador
+a.confirmar_totp(codigo)                  # True: activa el secreto pendiente
+a.desactivar_totp(codigo)                 # True: apaga el segundo factor por archivo
+```
+
+- **Con `ADMIN_PANEL_TOTP_SECRET` seteado, el entorno manda**: `totp_origen`
+  es `"entorno"` y `iniciar_totp` / `confirmar_totp` / `desactivar_totp`
+  levantan `TotpNoEnrolable`.
+- **Enrolar son dos pasos a proposito**: `iniciar_totp` genera un secreto
+  PENDIENTE (no lo activa) y devuelve el QR; `confirmar_totp` con el primer
+  codigo del autenticador recien lo vuelve el secreto activo. El pendiente
+  vence a los 10 minutos si no se confirma.
+- **El archivo roto falla CERRADO** (al reves que el estado de login, que
+  falla abierto): ilegible, JSON invalido o con forma inesperada deja
+  `totp_habilitado=True` con el login cerrado hasta borrar el archivo a mano
+  desde el host. Ver ADR-015 en `DECISIONS.md`.
+- Escritura atomica con permisos `0600`, igual convencion que el estado de
+  login.
+
 ## Schema: la cadena de Alembic (2026-09-11)
 
 Hasta aca las seis tablas de este motor las creaba solo
