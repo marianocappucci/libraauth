@@ -379,6 +379,50 @@ a.create_session_cookie(response, username)
   el bloqueo por IP, y que la sesion en si sigue exigiendo el codigo. Ver
   ADR-016 en `DECISIONS.md`.
 
+## Sesion por inactividad de 8 horas, con renovacion deslizante (v0.43.0)
+
+`SessionAuth` (login del usuario final) y `AdminAuth` (backoffice de
+superadmin) cierran la sesion a las **8 horas sin uso**, no a un plazo fijo
+desde el login. "Uso" es cualquier pedido al servidor que pase por una de las
+dependencias de este paquete (`require_auth`, `require_admin`, `require_role`,
+`json_api_get_current_user` y los guards que cuelgan de ella; `require_login`
+del lado de `AdminAuth`): cada uno de esos pedidos, si la sesion sigue viva,
+re-firma la cookie con timestamp nuevo — misma cookie, mismos atributos, el
+reloj de las 8 horas vuelve a arrancar desde ese pedido. Una pantalla que se
+refresca sola (el KDS) sigue contando como uso mientras este abierta.
+
+**Llega solo con subir el pin, en casi todos los consumidores.** FastAPI
+inyecta un `Response` real en cualquier funcion usada con `Depends(...)` que
+lo declare, aunque el endpoint que la usa no lo declare el — asi que la
+renovacion viaja adentro de las dependencias de siempre, sin que el producto
+tenga que agregar nada. La excepcion es un consumidor que **envuelve**
+`SessionAuth.get_current_user` o `AdminAuth.current_user` en su propia
+dependencia sin declarar `response` y pasarlo: relevados, la API JSON de
+Contalibra y Restolibra (`get_current_user_json`) y el `admin_actual` de
+`libra-backoffice`. A esos les hace falta una linea propia (ver ADR-017).
+Sin esa linea no se rompe nada: la sesion sigue valida, pero no se renueva.
+
+```python
+from libraauth.session_auth import (
+    INACTIVIDAD_MAXIMA_SEGUNDOS,  # 8 * 3600 — default de `max_age`
+    RENOVACION_MINIMA_SEGUNDOS,   # 5 * 60 — piso entre una renovacion y la siguiente
+)
+```
+
+- No renueva en `logout` (no resucita la cookie que borra), ni encima de una
+  respuesta que ya trae su propio `Set-Cookie` para el mismo nombre.
+- La renovacion re-emite la cookie por `create_session_cookie`, la MISMA
+  funcion que usa el login: los atributos (`httponly`, `samesite=lax`,
+  `secure`, el nombre y el path) nunca se duplican en un segundo lugar.
+- 🔴 **Cambio de comportamiento:** antes de esta version `max_age` eran 7 dias
+  (`SessionAuth`) o 3 dias (`AdminAuth`) ABSOLUTOS desde el login. Una cookie
+  firmada hace 9 horas, que antes seguia siendo valida, ahora se rechaza
+  aunque falten dias para cumplir el plazo viejo.
+- Ver ADR-017 en `DECISIONS.md` para el detalle completo, la tabla de
+  consumidores y los riesgos relevados (peticiones concurrentes, cache
+  intermedia, y que un endpoint que devuelve su propio `Response` —un PDF,
+  una redireccion— no renueva la sesion).
+
 ## Schema: la cadena de Alembic (2026-09-11)
 
 Hasta aca las seis tablas de este motor las creaba solo

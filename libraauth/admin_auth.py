@@ -69,8 +69,14 @@ from typing import Literal
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
+from starlette.responses import Response
 
-from .session_auth import _resolve_secret_key
+from .session_auth import (
+    INACTIVIDAD_MAXIMA_SEGUNDOS,
+    _debe_renovar,
+    _resolve_secret_key,
+    _ya_tiene_set_cookie,
+)
 from .totp import Totp, generar_secreto, uri_otpauth
 
 _log = logging.getLogger("libraauth.admin_auth")
@@ -298,7 +304,7 @@ class AdminAuth:
         *,
         dev_secret_fallback: str,
         cookie_name: str = "cladmin_session",
-        max_age: int = 86400 * 3,
+        max_age: int = INACTIVIDAD_MAXIMA_SEGUNDOS,
         login_max_intentos: int = 5,
         login_ventana_segundos: int = 15 * 60,
         totp_secret: str | None = None,
@@ -623,17 +629,36 @@ class AdminAuth:
     def clear_session_cookie(self, response):
         response.delete_cookie(self.cookie_name)
 
-    def current_user(self, request: Request) -> str | None:
+    def current_user(self, request: Request, response: Response = None) -> str | None:
+        """El username de la cookie del backoffice, o `None` sin sesion valida.
+
+        Misma renovacion deslizante que `SessionAuth.get_current_user` — y el
+        mismo motivo para que `response` sea opcional: `require_login` (via
+        `Depends`, en los consumidores que la usan tal cual) se la pasa sola,
+        inyectada por FastAPI aunque el endpoint no la declare; un consumidor
+        que envuelve `current_user` en su propia dependencia (como
+        `libra-backoffice/backend/libra_backoffice/deps.py:admin_actual`)
+        necesita agregarle el parametro a mano para heredar la renovacion —
+        ver el ADR-017."""
         token = request.cookies.get(self.cookie_name)
         if not token:
             return None
         try:
-            return self._signer.loads(token, max_age=self.max_age)
+            username, firmado_en = self._signer.loads(
+                token, max_age=self.max_age, return_timestamp=True
+            )
         except (BadSignature, SignatureExpired):
             return None
+        if (
+            response is not None
+            and not _ya_tiene_set_cookie(response, self.cookie_name)
+            and _debe_renovar(self._signer, firmado_en)
+        ):
+            self.create_session_cookie(response, username)
+        return username
 
-    def require_login(self, request: Request) -> str:
-        user = self.current_user(request)
+    def require_login(self, request: Request, response: Response = None) -> str:
+        user = self.current_user(request, response)
         if not user:
             raise HTTPException(status_code=307, headers={"Location": "/login"})
         return user
