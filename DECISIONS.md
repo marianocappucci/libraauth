@@ -320,3 +320,45 @@ wiki (entidad `libraauth`).
   enrolable, `totp_habilitado` solo por entorno). `tests/test_admin_auth.py`
   y `tests/test_admin_auth_f2.py` no se tocaron.
 
+## ADR-016 — Login del backoffice en dos pasos, con desafio firmado
+
+- Estado: aceptada
+- Fecha: 2026-09-13
+- Contexto: el humano pidio que la pantalla de login pida usuario,
+  contrasena y captcha primero, y recien despues abra un modal para tipear
+  el codigo TOTP digito por digito — hoy `check_credentials` exige los tres
+  datos (usuario, contrasena, codigo) en una sola llamada, asi que no hay
+  forma de mostrar ese segundo paso sin que el backend ya sepa el codigo de
+  antemano.
+- Decision: cuatro metodos nuevos en `AdminAuth`, sin tocar
+  `check_credentials` (que sigue sirviendo al backoffice de un solo paso):
+  `verificar_clave(username, password)` valida solo la clave (misma
+  comparacion que la primera mitad de `check_credentials`, ahora factorizada
+  en un solo lugar); `emitir_desafio_totp(username)` devuelve un token
+  firmado con `itsdangerous.URLSafeTimedSerializer` y un **salt propio**
+  (`libraauth.admin.totp-desafio`), vida corta (`DESAFIO_TOTP_SEGUNDOS = 300`,
+  5 minutos); `validar_desafio_totp(desafio)` lo verifica sin lanzar nunca; y
+  `verificar_codigo_totp(codigo)` valida el codigo TOTP contra el secreto
+  activo (entorno o archivo, via `_totp_activo`), compartiendo
+  `ultimo_paso_totp` del estado de login con `check_credentials` — un codigo
+  usado en un camino no sirve en el otro.
+- Por que un salt propio y no la cookie de sesion firmando el desafio:
+  `itsdangerous` deriva una clave de firma distinta por salt a partir del
+  mismo `SECRET_KEY`, asi que un token firmado con un salt no valida contra
+  otro. Es lo que impide que el desafio del paso 1 sirva como cookie de
+  sesion (saltandose el paso 2 entero) y que una cookie de sesion robada se
+  reuse como desafio.
+- Sin estado en el servidor: el desafio lleva el username en el payload
+  firmado, no en una tabla ni en memoria — nada que limpiar ni que se pierda
+  al reiniciar el contenedor.
+- Consecuencia asumida: con 2FA encendido, superar el paso 1 (usuario y
+  contrasena correctos) le confirma a quien intenta que la contrasena es
+  correcta, algo que antes `check_credentials` no distinguia — clave mal o
+  codigo mal daban el mismo 401. Se mitiga con lo que ya protege el login: el
+  captcha (ADR-014) encarece cada intento de contrasena, el bloqueo por IP
+  (ADR-009) sigue cortando antes de llegar a probar, y la sesion en si exige
+  ademas el codigo — superar el paso 1 no abre nada por si solo.
+- El camino de un paso (`check_credentials`) sigue igual, para el backoffice
+  que todavia no migro a la pantalla en dos pasos: nada cambia de
+  comportamiento para el.
+
