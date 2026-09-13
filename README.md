@@ -455,6 +455,100 @@ libraauth-migrar diferencias --prefijo P --base B  # mide, no cambia nada
 - `actividad_log` (`AuditoriaBase`) queda **afuera**: vive en la base del
   dominio, que no siempre es la de `usuarios`.
 
+## Router de usuarios unificado (v0.43.0, ADR-018)
+
+Un solo router de usuarios (`libraauth/usuarios.py`) para los ocho productos
+de la familia, en vez de que cada uno mantenga su propia copia. Reemplaza:
+
+| Producto | Router de referencia (antes de adoptar) |
+|---|---|
+| Gestiolibra, MedLibra | `app/routers/users.py`, prefijo `/users` |
+| VentaLibra | `app/routers/users.py`, prefijo `/users`, sin `Depends` propio |
+| LibraDesk | `app/routers/users.py`, prefijo `/api/usuarios` |
+| LibraCargo, LibraClub | `app/routers/usuarios.py`, prefijo `/api/usuarios` |
+| Contalibra, Restolibra | `app/web/api/usuarios.py` + `app/db_usuarios.py` (contrato `nombre`/`activo`, traducido por el adaptador) |
+
+### Modelos públicos (`libraauth/usuarios.py`)
+
+`UsuarioAlta`, `UsuarioEdicion`, `UsuarioClaveNueva`, `UsuarioSalida`. Son el
+mismo objeto de Python que usa `libraauth.testing` para armar los payloads
+del test de contrato, y los que el backoffice (`libra-backoffice`) importa en
+vez de redefinir `UsuarioIn`/`UsuarioUpdate` -- ver "Adoptarla" más abajo.
+
+### `build_users_router(...)`
+
+```python
+from libraauth.usuarios import build_users_router
+from app.auth import require_admin_o_servicio  # el guard que ya arma el producto
+
+app.include_router(build_users_router(
+    prefix="/api/usuarios",              # el que ya usa el producto -- no cambiarlo
+    roles=("admin", "staff"),            # el mismo roles= del UserRepository
+    admin_guard=require_admin_o_servicio,
+))
+```
+
+Endpoints: `GET`, `POST`, `GET /{id}`, `PUT /{id}`, `PUT /{id}/password`,
+`DELETE /{id}`. Protecciones -- unión de las que tenía cada producto, tabla
+completa en el docstring de `build_users_router` y en el ADR-018:
+
+| Protección | Código | Quién la tenía antes |
+|---|---|---|
+| Username duplicado | 409 | los ocho |
+| Rol inválido, alta | 422 | los ocho |
+| Rol inválido, edición | 422 | LibraDesk, VentaLibra, LibraCargo, LibraClub (Gestiolibra/MedLibra/Contalibra dejaban escapar un 500) |
+| Contraseña < 6, alta | 422 | sólo Contalibra/Restolibra |
+| Contraseña < 6, reset ajeno | 422 | **nuevo** -- ninguno lo exigía |
+| No desactivarte/degradarte vos mismo | 409 | LibraCargo, LibraClub |
+| No borrarte vos mismo | 409 | LibraCargo, LibraClub, Contalibra, Restolibra |
+| No degradar al único admin activo | 422 | Contalibra, Restolibra |
+| No desactivar al único admin activo | 422 | **nuevo** -- ninguno lo exigía |
+| No eliminar al único admin | 422 | Contalibra, Restolibra |
+
+`DELETE` responde siempre `204` (Contalibra/Restolibra/VentaLibra respondían
+`200` con `{"ok": true}`: sus frontends propios -- no `Usuarios` de
+`libra-ui`, que no mira el cuerpo del borrado -- tienen que dejar de esperar
+ese cuerpo).
+
+**No incluye** `PUT /api/usuarios/me/password` (autoservicio de "Mi Cuenta"
+de Contalibra/Restolibra): es otra funcionalidad, con otro guard (cualquier
+usuario logueado) y sin la contraseña actual -- el equivalente de este motor
+es `POST /auth/change-password`, que sí la pide.
+
+### Test de contrato (`libraauth.testing`)
+
+```python
+from libraauth.testing import verificar_contrato_de_usuarios
+
+def test_contrato_de_usuarios(admin_client):
+    verificar_contrato_de_usuarios(admin_client, "/api/usuarios", role="staff")
+```
+
+Corre el mismo ciclo que ejerce el backoffice (listar → alta → editar →
+releer por `GET /{id}` → borrar) contra la instancia de router de ESE
+producto, con los modelos públicos de arriba -- así el backoffice y el test
+de cada producto no pueden divergir entre sí.
+
+### Adoptarla en un producto
+
+1. Borrar `app/routers/users.py` (o `usuarios.py`, o el par
+   `app/web/api/usuarios.py` + las 12 funciones equivalentes de
+   `app/db_usuarios.py` en Contalibra/Restolibra) y su import en `main.py`/
+   `web/app.py`.
+2. `app.include_router(build_users_router(prefix=..., roles=..., admin_guard=...))`
+   con el prefijo, la tupla de roles y el guard que el producto YA usa (ver
+   la tabla de arriba) -- no elegir un default nuevo.
+3. Sumar `test_contrato_de_usuarios` (arriba) a la suite del producto; borrar
+   los tests propios del router viejo que quedan redundantes con los que ya
+   corre `libraauth` (los de las protecciones se prueban acá, una sola vez).
+4. Contalibra/Restolibra: su frontend propio (`frontend/src/api.ts`,
+   `Usuarios.tsx`) espera `nombre`/`activo` y un `DELETE` con cuerpo -- pasar
+   a `name`/`active` y a leer `204` sin cuerpo es trabajo de ESE producto, no
+   de esta adopción del backend.
+5. `libra-backoffice`: importar `UsuarioIn`/`UsuarioUpdate` (o construir los
+   suyos a partir de `UsuarioAlta`/`UsuarioEdicion`) de `libraauth.usuarios`
+   en vez de redefinirlos en `routers/config_instancia.py`.
+
 ## Desarrollo
 
 ```

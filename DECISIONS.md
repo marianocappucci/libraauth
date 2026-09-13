@@ -468,3 +468,79 @@ wiki (entidad `libraauth`).
     durante 8 horas se quedaria sin sesión. Si algún día importa, el endpoint
     tiene que copiar `response.headers` de la dependencia a mano.
 
+## ADR-018 — Router de usuarios único, con contrato y test de contrato compartidos
+
+- Estado: aceptada
+- Fecha: 2026-09-13
+- Se escribió como ADR-017 y se renumeró antes de mergear: el 017 lo tomó la
+  sesión por inactividad de 8 horas (#92), que entró primero a `develop`. El
+  contenido no cambió.
+- Contexto: los ocho productos de la familia (Gestiolibra, MedLibra,
+  VentaLibra, LibraDesk, LibraCargo, LibraClub, Contalibra, Restolibra)
+  tenían cada uno su propia copia del router de usuarios -- cuatro variantes
+  de `app/routers/users(.py|usuarios.py)` más el par
+  `app/web/api/usuarios.py` + `app/db_usuarios.py` de Contalibra/Restolibra,
+  que además habla un contrato distinto puertas adentro (`nombre`/`activo`).
+  Copiar en vez de compartir dejó a las ocho divergiendo en silencio: cinco
+  de los ocho no protegían al único administrador activo de una edición que
+  lo degrada o desactiva; tres dejaban escapar un `ValueError` de rol
+  inválido en la EDICIÓN como `500` (Contalibra vía `db_usuarios.py`,
+  Gestiolibra y MedLibra vía el `except` que faltaba en su `PUT`); el
+  `DELETE` respondía `204` en cinco productos y `200` con cuerpo JSON en los
+  otros tres; y el mínimo de contraseña (6 caracteres) sólo se exigía en el
+  alta de Contalibra/Restolibra, en ningún reset de contraseña ajena. El
+  backoffice (`libra-backoffice/routers/config_instancia.py`) y la pantalla
+  compartida (`Usuarios` de `libra-ui`) ya asumían un contrato único -- lo
+  que no era único era lo que había del otro lado.
+- Decisión: un solo lugar de verdad, en `libraauth`, con tres piezas:
+  1. **Modelos públicos del contrato** (`libraauth/usuarios.py`):
+     `UsuarioAlta`, `UsuarioEdicion`, `UsuarioClaveNueva`, `UsuarioSalida`.
+     `role` es `str` y no un `Literal` fijo -- el vocabulario de roles no es
+     el mismo en toda la familia (`("admin","staff")` en seis productos,
+     `("admin","operador","cajero")` en Contalibra, con `"mozo"` sumado en
+     Restolibra) -- y se valida contra la tupla `roles` que cada producto le
+     pasa a la factory, no contra un tipo fijo del modelo.
+  2. **La factory `build_users_router(...)`**, en el mismo módulo: recibe
+     `prefix`, `roles`, `admin_role`, `admin_guard` (la dependencia de admin
+     que ya arma cada producto -- la factory no elige ninguna por default,
+     ver su docstring) y opcionalmente `get_repository`. Devuelve el router
+     completo: listar, alta, `GET /{id}`, edición, reset de contraseña de
+     otro usuario (`PUT /{id}/password`) y borrado.
+  3. **`libraauth.testing.verificar_contrato_de_usuarios(client, path, ...)`**:
+     el ciclo que ejerce el backoffice (listar → alta → editar → releer por
+     GET → borrar), armado con los MISMOS modelos públicos del punto 1 -- no
+     una copia con la misma forma. Cada producto lo llama desde su propia
+     suite, con su cliente admin.
+- Las protecciones son la UNIÓN de las que tenía cada producto, no la
+  intersección -- la tabla completa función × producto está en `README.md`.
+  Dos quedan estrictamente MÁS estrictas que cualquier original: el mínimo
+  de contraseña ahora aplica también al reset de la ajena, y la protección
+  del único admin ahora cubre también "desactivar" (antes sólo cubría
+  "degradar el rol"). Nadie pierde una protección al adoptar esto.
+- El bug de Contalibra (rol inválido en el `PUT` escapando como 500) no se
+  arregla parcheando su `db_usuarios.py`: se cierra de raíz porque la
+  factory valida el rol ANTES de llamar al repositorio, con su propio
+  mensaje en castellano, y además atrapa el `ValueError` del repositorio
+  como red de seguridad si algún día `roles=` de la factory y el `roles=`
+  del `UserRepository` de la instancia quedaran desalineados.
+- `DELETE` unificado a `204 No Content` en los ocho, alineado con la mayoría
+  (cinco de ocho). Contalibra, Restolibra y VentaLibra devuelven hoy `200`
+  con `{"ok": true}`; sus frontends propios (no la pantalla compartida de
+  `libra-ui`, que no lee el cuerpo del borrado) tienen que dejar de esperar
+  ese cuerpo al adoptar la factory -- ver el riesgo anotado en el informe de
+  la tarea que creó este ADR.
+- **No incluye** el autoservicio "Mi Cuenta" (`PUT /api/usuarios/me/password`)
+  que tienen Contalibra y Restolibra: cambia la contraseña PROPIA sin pedir
+  la actual, con un guard distinto (cualquier usuario logueado, no sólo
+  admin) y no lo consume la pantalla compartida de `libra-ui`. Es una
+  funcionalidad de cuenta, ortogonal al ABM de usuarios; el equivalente ya
+  cubierto por este motor es `POST /auth/change-password`
+  (`session_auth.build_json_api_auth_router`), que sí pide la actual.
+- Consecuencia asumida: adoptar la factory es un cambio de contrato para
+  Contalibra/Restolibra más allá del código -- pasan de `nombre`/`activo` a
+  `name`/`active` en el cuerpo JSON que ve su propio frontend (no el de
+  `libra-ui`, que ya usaba este nombrado), así que sus `frontend/src/api.ts`
+  y `Usuarios.tsx` propios necesitan su propio ajuste, no sólo el backend.
+  No se resuelve en este ADR ni en `libraauth`: es trabajo de adopción de
+  cada producto, evaluado por separado.
+
