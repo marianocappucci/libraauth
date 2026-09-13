@@ -338,6 +338,47 @@ a.desactivar_totp(codigo)                 # True: apaga el segundo factor por ar
 - Escritura atomica con permisos `0600`, igual convencion que el estado de
   login.
 
+## Login en dos pasos del backoffice (v0.42.0)
+
+Ademas de `check_credentials(username, password, codigo)` — que sigue igual,
+para quien no migro a la pantalla de dos pasos — `AdminAuth` tiene la API
+para pedir usuario y contrasena primero, y recien despues un segundo paso
+para el codigo del autenticador:
+
+```python
+# Paso 1: usuario y contrasena
+if not a.verificar_clave(username, password):
+    ...  # 401
+
+if a.totp_habilitado:
+    desafio = a.emitir_desafio_totp(username)   # mostrarlo al frontend
+    # ... el frontend abre el modal del codigo y lo manda de vuelta junto con `desafio`
+else:
+    a.create_session_cookie(response, username)  # sin 2FA, ya esta
+
+# Paso 2: el codigo, contra el desafio del paso 1
+username = a.validar_desafio_totp(desafio)
+if username is None:
+    ...  # 401: desafio vencido, alterado o de otra firma
+if not a.verificar_codigo_totp(codigo):
+    ...  # 401: codigo invalido o ya usado
+a.create_session_cookie(response, username)
+```
+
+- `emitir_desafio_totp` / `validar_desafio_totp`: token firmado
+  (`itsdangerous`) con un **salt propio**, distinto del que firma la cookie
+  de sesion — el desafio no sirve como cookie ni la cookie como desafio.
+  Vence a los `DESAFIO_TOTP_SEGUNDOS` (5 minutos). Sin estado en el
+  servidor: el username va en el payload firmado.
+- `verificar_codigo_totp` valida contra el TOTP activo ahora mismo (entorno
+  o archivo). El contador de "ultimo codigo usado" es **el mismo** que usa
+  `check_credentials`: un codigo gastado en un camino no sirve en el otro.
+  Sin 2FA activo, siempre `False` — el paso 2 no existe sin segundo factor.
+- **Con 2FA encendido, el paso 1 revela que la contrasena es correcta**
+  (antes, clave mal y codigo mal daban el mismo 401). Lo mitigan el captcha,
+  el bloqueo por IP, y que la sesion en si sigue exigiendo el codigo. Ver
+  ADR-016 en `DECISIONS.md`.
+
 ## Schema: la cadena de Alembic (2026-09-11)
 
 Hasta aca las seis tablas de este motor las creaba solo
