@@ -308,7 +308,7 @@ class _SessionAuthFalso:
     def __init__(self, username):
         self._username = username
 
-    def get_current_user(self, request):
+    def get_current_user(self, request, response=None):
         return self._username
 
 

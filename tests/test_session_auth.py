@@ -182,7 +182,7 @@ def test_secret_key_from_env_takes_priority(monkeypatch):
 
 # ── Dependencias JSON API ────────────────────────────────────────────────
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Response
 from fastapi.testclient import TestClient as FastAPITestClient
 
 from libraauth.session_auth import (
@@ -301,6 +301,29 @@ def test_json_api_get_current_user_rejects_user_deactivated_after_login():
     assert client.get("/auth/me").status_code == 200
     users.deactivate("staffer")
     assert client.get("/auth/me").status_code == 401
+
+
+def test_json_api_get_current_user_acepta_el_orden_viejo_por_posicion():
+    """`response` se agrego AL FINAL de la firma (ADR-017): quien la llamaba
+    como `json_api_get_current_user(request, auth)` tiene que seguir andando.
+    Con `response` en segundo lugar, el `auth` caia en `response` y el
+    `auth` real quedaba en el `Depends` por defecto: un `AttributeError`."""
+    from fastapi import Request as FastAPIRequest
+
+    from libraauth.session_auth import json_api_get_current_user
+
+    app = _make_json_api_app()
+
+    @app.get("/directo")
+    def directo(request: FastAPIRequest):
+        usuario = json_api_get_current_user(request, request.app.state.session_auth)
+        return {"username": usuario["username"]}
+
+    client = FastAPITestClient(app, base_url="https://testserver")
+    client.post("/auth/login", json={"username": "staffer", "password": "staffpw"})
+    r = client.get("/directo")
+    assert r.status_code == 200
+    assert r.json() == {"username": "staffer"}
 
 
 def test_json_api_require_admin_blocks_staff():
@@ -592,3 +615,225 @@ def test_la_empresa_sale_de_la_instancia_y_no_de_la_fila_del_usuario():
         client = FastAPITestClient(app, base_url="https://testserver")
         r = client.post("/auth/login", json={"username": usuario, "password": clave})
         assert r.json()["empresa_nombre"] == "Estudio Sur", usuario
+
+
+# ── Sesion por inactividad y renovacion deslizante (ADR-017) ───────────────
+#
+# El reloj se controla parcheando `TimestampSigner.get_timestamp` -- el unico
+# punto de itsdangerous que lee la hora, tanto al firmar (`sign`) como al
+# validar (`unsign`, de donde sale `return_timestamp`). No se usa freezegun:
+# pydantic v2 (que FastAPI trae) tiene problemas conocidos con el patcheo
+# global del reloj que hace freezegun, y este mecanismo alcanza sin tocar
+# nada fuera de itsdangerous.
+
+from http.cookies import SimpleCookie
+
+import itsdangerous.timed
+from starlette.requests import Request
+
+from libraauth.session_auth import (
+    INACTIVIDAD_MAXIMA_SEGUNDOS,
+    RENOVACION_MINIMA_SEGUNDOS,
+)
+
+
+class _RelojFalso:
+    """Segundos desde un origen arbitrario. `avanzar` es la unica forma de
+    moverlo -- nada corre en tiempo real durante estos tests."""
+
+    def __init__(self):
+        self.ahora = 1_800_000_000  # epoch arbitrario, sin significado
+
+    def avanzar(self, segundos: float) -> None:
+        self.ahora += segundos
+
+
+@pytest.fixture
+def reloj(monkeypatch):
+    r = _RelojFalso()
+    monkeypatch.setattr(
+        itsdangerous.timed.TimestampSigner,
+        "get_timestamp",
+        lambda self: int(r.ahora),
+    )
+    return r
+
+
+def _cookie_valor(set_cookie_header: str, nombre: str) -> str:
+    c = SimpleCookie()
+    c.load(set_cookie_header)
+    return c[nombre].value
+
+
+def _make_sliding_app(session_auth):
+    """Una app FastAPI chica, con una ruta protegida por `require_auth` --
+    la misma dependencia que usan los 8 productos-- para probar la
+    renovacion deslizante tal como la ve un consumidor real: via `Depends`,
+    sin que la ruta declare `response` ella misma."""
+    app = FastAPI()
+
+    @app.get("/ping")
+    def ping(user: str = Depends(session_auth.require_auth)):
+        return {"user": user}
+
+    @app.post("/login")
+    def login(username: str, response: Response):
+        session_auth.create_session_cookie(response, username)
+        return {"ok": True}
+
+    @app.post("/logout")
+    def logout(response: Response):
+        session_auth.clear_session_cookie(response)
+        return {"ok": True}
+
+    return app
+
+
+def test_sesion_usada_cada_hora_durante_10h_sigue_viva(reloj):
+    """(a) Un usuario activo -- un pedido por hora-- nunca deberia ver
+    cerrada su sesion: cada pedido la renueva antes de que llegue a las 8h
+    sin uso."""
+    auth = _make_session_auth()
+    client = FastAPITestClient(_make_sliding_app(auth), base_url="https://testserver")
+    assert client.post("/login", params={"username": "oper1"}).status_code == 200
+
+    r = None
+    for _ in range(10):
+        reloj.avanzar(3600)
+        r = client.get("/ping")
+        assert r.status_code == 200, r.text
+    assert r.json()["user"] == "oper1"
+
+
+def test_sesion_sin_uso_8h_mas_1s_se_rechaza(reloj):
+    """(b) Sin pedidos de por medio, la ventana de inactividad corta justo
+    despues de las 8 horas pedidas por el humano.
+
+    🔴 El avance usa el LITERAL `8 * 3600 + 1`, no la constante
+    `INACTIVIDAD_MAXIMA_SEGUNDOS` -- si usara la constante, este test seria
+    tautologico: correria igual de "verde" con cualquier valor que alguien le
+    ponga a la constante, porque el avance y el limite serian siempre el
+    mismo numero. Con el literal, cambiar la constante (una regresion real)
+    efectivamente pone esto en rojo -- verificado por mutacion. La constante
+    se sigue comprobando aparte, en `test_constante_de_inactividad_es_8_horas`."""
+    auth = _make_session_auth()
+    client = FastAPITestClient(_make_sliding_app(auth), base_url="https://testserver")
+    client.post("/login", params={"username": "oper1"})
+
+    reloj.avanzar(8 * 3600 + 1)
+    r = client.get("/ping", follow_redirects=False)
+    assert r.status_code == 307
+    assert r.headers["location"] == "/login"
+
+
+def test_constante_de_inactividad_es_8_horas():
+    """El valor concreto que decidio el humano (2026-09-13): 8 horas, ni una
+    mas ni una menos -- lo que hace que el literal de arriba y la constante de
+    produccion sean, hoy, el mismo numero."""
+    assert INACTIVIDAD_MAXIMA_SEGUNDOS == 8 * 3600
+
+
+def test_renovacion_reemite_cookie_con_los_mismos_atributos(reloj):
+    """(c) La cookie renovada tiene que salir de `create_session_cookie`,
+    literalmente -- por eso mismo trae httponly/secure/samesite/nombre
+    identicos a la de un login nuevo."""
+    auth = _make_session_auth()
+    client = FastAPITestClient(_make_sliding_app(auth), base_url="https://testserver")
+    client.post("/login", params={"username": "oper1"})
+
+    reloj.avanzar(RENOVACION_MINIMA_SEGUNDOS + 1)
+    r = client.get("/ping")
+    assert r.status_code == 200
+    set_cookie = r.headers["set-cookie"]
+    minuscula = set_cookie.lower()
+    assert "httponly" in minuscula
+    assert "secure" in minuscula
+    assert "samesite=lax" in minuscula
+    assert set_cookie.split("=", 1)[0] == auth.cookie_name
+    # Y la sesion renovada sigue identificando al mismo usuario.
+    assert _cookie_valor(set_cookie, auth.cookie_name) != ""
+
+
+def test_no_renueva_antes_de_n_minutos(reloj):
+    """(d) Por debajo del piso de renovacion, la respuesta no trae ninguna
+    cookie nueva -- ni CPU de mas ni un Set-Cookie en cada pedido."""
+    auth = _make_session_auth()
+    client = FastAPITestClient(_make_sliding_app(auth), base_url="https://testserver")
+    client.post("/login", params={"username": "oper1"})
+
+    reloj.avanzar(RENOVACION_MINIMA_SEGUNDOS - 1)
+    r = client.get("/ping")
+    assert r.status_code == 200
+    assert "set-cookie" not in r.headers
+
+
+def test_logout_no_resucita_la_cookie_borrada(reloj):
+    """(e) Aunque hayan pasado mas de `RENOVACION_MINIMA_SEGUNDOS` desde el
+    login -- la ventana en la que CUALQUIER otro pedido renovaria-- logout
+    tiene que borrar la cookie sin que nada la vuelva a firmar."""
+    auth = _make_session_auth()
+    client = FastAPITestClient(_make_sliding_app(auth), base_url="https://testserver")
+    client.post("/login", params={"username": "oper1"})
+
+    reloj.avanzar(RENOVACION_MINIMA_SEGUNDOS + 1)
+    r = client.post("/logout")
+    set_cookie = r.headers["set-cookie"]
+    assert _cookie_valor(set_cookie, auth.cookie_name) == ""
+
+    r2 = client.get("/ping", follow_redirects=False)
+    assert r2.status_code == 307
+
+
+def test_cookie_firmada_hace_9h_se_rechaza_aunque_falten_dias_para_los_7(reloj):
+    """(g) Antes de esta version, `max_age` eran 7 dias ABSOLUTOS: una firma
+    de 9 horas todavia hubiera sido valida. Con la ventana de inactividad
+    tiene que rechazarse igual, aunque falten dias para los 7."""
+    auth = _make_session_auth()
+    client = FastAPITestClient(_make_sliding_app(auth), base_url="https://testserver")
+    client.post("/login", params={"username": "oper1"})
+
+    reloj.avanzar(9 * 3600)
+    r = client.get("/ping", follow_redirects=False)
+    assert r.status_code == 307
+
+
+def test_json_api_logout_no_renueva_la_cookie(reloj):
+    """(e), version JSON API: mismo chequeo contra el router real
+    (`build_json_api_auth_router`), no contra la app de juguete de arriba."""
+    app = _make_json_api_app()
+    client = FastAPITestClient(app, base_url="https://testserver")
+    client.post("/auth/login", json={"username": "admin", "password": "adminpw"})
+
+    reloj.avanzar(RENOVACION_MINIMA_SEGUNDOS + 1)
+    r = client.post("/auth/logout")
+    set_cookie = r.headers["set-cookie"]
+    assert _cookie_valor(set_cookie, "test_json_session") == ""
+    assert client.get("/auth/me").status_code == 401
+
+
+def test_no_renueva_si_la_respuesta_ya_trae_set_cookie_para_el_mismo_nombre(reloj):
+    """Segunda linea de defensa (`_ya_tiene_set_cookie`): si algo ya emitio un
+    Set-Cookie con este nombre en la MISMA respuesta, `get_current_user` no
+    lo pisa con una renovacion. No hay ruta real de la libreria que llegue a
+    este caso hoy -- login/demo no le pasan `response` a `get_current_user`,
+    y por eso no interactuan-- pero es la garantia de que agregar una manana
+    no puede convertirse en un bug de resurreccion de cookie."""
+    auth = _make_session_auth()
+    r = Response()
+    auth.create_session_cookie(r, "oper1")
+    valor_original = _cookie_valor(r.headers["set-cookie"], auth.cookie_name)
+
+    reloj.avanzar(RENOVACION_MINIMA_SEGUNDOS + 1)
+    request = Request({
+        "type": "http", "method": "GET", "path": "/",
+        "headers": [(b"cookie", f"{auth.cookie_name}={valor_original}".encode())],
+    })
+    # `r` YA trae un Set-Cookie de este nombre (el del login de arriba) antes
+    # de pasar por get_current_user.
+    username = auth.get_current_user(request, r)
+    assert username == "oper1"
+    # Sigue habiendo un solo Set-Cookie para este nombre, con el valor
+    # original -- no se agrego ni se piso con uno renovado.
+    set_cookies = [v for k, v in r.raw_headers if k == b"set-cookie"]
+    assert len(set_cookies) == 1
+    assert _cookie_valor(set_cookies[0].decode("latin-1"), auth.cookie_name) == valor_original

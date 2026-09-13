@@ -153,7 +153,7 @@ class _SessionAuthFalso:
     def create_session_cookie(self, response, username):
         response.set_cookie("sesion", username)
 
-    def get_current_user(self, request):
+    def get_current_user(self, request, response=None):
         return request.cookies.get("sesion")
 
     def clear_session_cookie(self, response):
