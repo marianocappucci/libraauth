@@ -123,7 +123,7 @@ class _SesionFalsa:
     def __init__(self, usuario=None):
         self._usuario = usuario
 
-    def get_current_user(self, request):
+    def get_current_user(self, request, response=None):
         return self._usuario
 
 

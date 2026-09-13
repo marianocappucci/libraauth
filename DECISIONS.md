@@ -362,3 +362,185 @@ wiki (entidad `libraauth`).
   que todavia no migro a la pantalla en dos pasos: nada cambia de
   comportamiento para el.
 
+## ADR-017 — Sesion por inactividad de 8 horas, con renovacion deslizante
+
+- Estado: aceptada
+- Fecha: 2026-09-13
+- Contexto: el humano pidio que "todas las sesiones tienen que cerrarse
+  pasadas 8 horas sin uso", tanto para el login de usuario final
+  (`SessionAuth`, los ocho productos) como para el backoffice de superadmin
+  (`AdminAuth`). Hasta esta version `max_age` era un plazo ABSOLUTO desde el
+  login: 7 dias en `SessionAuth`, 3 en `AdminAuth`. Un plazo absoluto y una
+  ventana de inactividad no son la misma cosa: alguien trabajando sin
+  interrupcion durante 8 horas seguidas con el plazo absoluto seguia adentro
+  (recien cortaba a los 7 dias), y con una ventana de inactividad mal resuelta
+  (comparando siempre contra el login original) se lo echaria igual a mitad
+  de una jornada normal. Definimos "uso" como cualquier pedido al servidor —
+  el humano acepto la excepcion de las pantallas que se refrescan solas (el
+  KDS) mientras el navegador siga abierto.
+- Decision:
+  1. **Una sola constante para las dos clases**, en `session_auth.py`
+     (`admin_auth.py` la importa): `INACTIVIDAD_MAXIMA_SEGUNDOS = 8 * 3600`,
+     default de `max_age` en `SessionAuth.__init__` y `AdminAuth.__init__`.
+     Sin variable de entorno: no hay en el repo un patron de duracion de
+     sesion configurable por instancia, y agregar uno para esto solo
+     ampliaria una superficie que nadie pidio.
+  2. **Renovacion deslizante, no un plazo mas largo.** `max_age` deja de
+     medirse desde el login: `get_current_user`/`current_user` leen el
+     timestamp de la FIRMA (`URLSafeTimedSerializer.loads(...,
+     return_timestamp=True)`) y, si un `response` llega y esa firma ya tiene
+     mas de `RENOVACION_MINIMA_SEGUNDOS` (5 minutos, tambien constante unica),
+     re-emiten la cookie via `create_session_cookie` — mismos atributos,
+     timestamp nuevo. El piso de 5 minutos evita re-firmar y mandar un
+     `Set-Cookie` en cada pedido de un usuario activo.
+  3. **Es una API del motor que llega con subir el pin, sin tocar el
+     producto — para la mayoria.** `response: Response = None` (bare, no
+     `Response | None`: FastAPI no reconoce un tipo `Optional` como el
+     parametro especial y rompe con `Invalid args for response field`, medido
+     armando la suite) se agrego a `get_current_user`, `require_auth`,
+     `require_admin`, `require_role`, `json_api_get_current_user` y a los
+     guards compuestos que llaman a este ultimo por fuera de `Depends`
+     (`json_api_require_admin_o_servicio`, `_o_panel`,
+     `json_api_require_panel_o_admin`) — mismo mecanismo del lado de
+     `AdminAuth.current_user`/`require_login`. FastAPI inyecta un `Response`
+     real en cualquier dependencia que lo declare, aunque el endpoint que la
+     usa no lo declare el (verificado con una prueba dedicada antes de
+     escribir el resto). Relevados los nueve consumidores contra
+     `origin/main` (ver la tabla en el PR): a los ocho productos y a
+     `libracore.admin.app` (el backoffice Jinja2 de Contalibra/Restolibra)
+     les alcanza con el bump, porque todos gatean via `Depends(...)` sobre
+     alguna de estas funciones. La excepcion es `libra-backoffice`: envuelve
+     `AdminAuth.current_user` en su propia dependencia
+     (`backend/libra_backoffice/deps.py:admin_actual`, que devuelve 401 JSON
+     en vez del redirect de `require_login`) y esa envoltura no declara
+     `response` — necesita una linea propia en ESE repo para heredar la
+     renovacion. Queda anotado, no resuelto aca: esta tarea es sobre
+     `libraauth`.
+  4. **No renovar en logout, ni encima de una cookie que la misma respuesta
+     ya esta emitiendo.** El handler de `logout` sigue llamando a
+     `get_current_user(request)` sin pasar `response` — no hay forma de que
+     renueve lo que esta por borrar. Como segunda linea de defensa (no hay
+     hoy una ruta real que la necesite, pero cierra el caso para cualquier
+     cambio futuro), `_ya_tiene_set_cookie` se fija si `response` ya trae un
+     `Set-Cookie` para ese nombre antes de renovar.
+- Por que el "ahora" de la renovacion sale del propio signer
+  (`signer.make_signer().get_timestamp()`) y no de `datetime.now()`: es el
+  mismo reloj que usa `itsdangerous` para firmar y para expirar, asi que los
+  tests pueden controlarlo completo parcheando un solo punto
+  (`TimestampSigner.get_timestamp`). Se probo con `datetime.now(UTC)` primero
+  y el test (a) daba falso-negativo indefinidamente: con el reloj de los
+  tests adelantado, `datetime.now() - firmado_en` da negativo y la renovacion
+  nunca se dispara.
+- Cambio de comportamiento (a documentar en el README, seccion nueva): una
+  cookie firmada hace mas de 8 horas se rechaza aunque falten dias para
+  cumplir el viejo plazo de 7 (`SessionAuth`) o 3 (`AdminAuth`). Un producto
+  que sube el pin sin avisar a sus usuarios los va a desloguear mas seguido
+  que antes si dejan la pestaña abierta sin usarla.
+- Riesgos identificados, no todos resueltos aca:
+  - **Peticiones concurrentes** sobre la misma sesion, cerca del piso de
+    renovacion: dos pedidos casi simultaneos pueden renovar los dos (dos
+    `Set-Cookie` en dos respuestas distintas, cada una valida por separado —
+    no hay carrera de escritura porque no hay estado compartido del lado del
+    servidor, es solo cookie). El navegador se queda con la ultima que
+    proceso; no es un problema de consistencia, como mucho una renovacion de
+    mas.
+  - **Cache intermedia**: un proxy o CDN que cachee una respuesta con
+    `Set-Cookie` la serviria a otro cliente. No es nuevo de este cambio —
+    ya era un riesgo con el login— pero la renovacion ahora puede emitir un
+    `Set-Cookie` en CUALQUIER pedido GET, no solo en `/login`, lo que amplia
+    la superficie si algun proxy cachea rutas de la API por error. Los
+    productos ya deberian estar mandando `Cache-Control` apropiado en las
+    rutas autenticadas; no se audito aca.
+  - **CSP**: sin cambios — la renovacion usa el mismo `set_cookie` con los
+    mismos atributos, no agrega scripts ni headers nuevos.
+  - **Endpoints que devuelven su propio `Response`** (`FileResponse`,
+    `StreamingResponse`, `RedirectResponse`, un `JSONResponse` armado a mano):
+    **esos pedidos NO renuevan la sesion.** La dependencia escribe el
+    `Set-Cookie` en el `Response` que FastAPI le inyecta, y FastAPI sólo copia
+    esos headers a la respuesta final cuando el endpoint devuelve un valor que
+    él serializa; si el endpoint devuelve un `Response`, lo manda tal cual y
+    los headers de la dependencia se descartan (`fastapi/routing.py`,
+    `if isinstance(raw_response, Response): response = raw_response`, y el
+    `response.headers.raw.extend(...)` está sólo en la otra rama; medido en la
+    versión del venv del 2026-09-13). No rompe nada —la sesión sigue valida y
+    la renueva el próximo pedido JSON— y en la práctica las pantallas hacen
+    pedidos JSON todo el tiempo. Pero una pantalla que sólo descargara PDFs
+    durante 8 horas se quedaria sin sesión. Si algún día importa, el endpoint
+    tiene que copiar `response.headers` de la dependencia a mano.
+
+## ADR-018 — Router de usuarios único, con contrato y test de contrato compartidos
+
+- Estado: aceptada
+- Fecha: 2026-09-13
+- Se escribió como ADR-017 y se renumeró antes de mergear: el 017 lo tomó la
+  sesión por inactividad de 8 horas (#92), que entró primero a `develop`. El
+  contenido no cambió.
+- Contexto: los ocho productos de la familia (Gestiolibra, MedLibra,
+  VentaLibra, LibraDesk, LibraCargo, LibraClub, Contalibra, Restolibra)
+  tenían cada uno su propia copia del router de usuarios -- cuatro variantes
+  de `app/routers/users(.py|usuarios.py)` más el par
+  `app/web/api/usuarios.py` + `app/db_usuarios.py` de Contalibra/Restolibra,
+  que además habla un contrato distinto puertas adentro (`nombre`/`activo`).
+  Copiar en vez de compartir dejó a las ocho divergiendo en silencio: cinco
+  de los ocho no protegían al único administrador activo de una edición que
+  lo degrada o desactiva; tres dejaban escapar un `ValueError` de rol
+  inválido en la EDICIÓN como `500` (Contalibra vía `db_usuarios.py`,
+  Gestiolibra y MedLibra vía el `except` que faltaba en su `PUT`); el
+  `DELETE` respondía `204` en cinco productos y `200` con cuerpo JSON en los
+  otros tres; y el mínimo de contraseña (6 caracteres) sólo se exigía en el
+  alta de Contalibra/Restolibra, en ningún reset de contraseña ajena. El
+  backoffice (`libra-backoffice/routers/config_instancia.py`) y la pantalla
+  compartida (`Usuarios` de `libra-ui`) ya asumían un contrato único -- lo
+  que no era único era lo que había del otro lado.
+- Decisión: un solo lugar de verdad, en `libraauth`, con tres piezas:
+  1. **Modelos públicos del contrato** (`libraauth/usuarios.py`):
+     `UsuarioAlta`, `UsuarioEdicion`, `UsuarioClaveNueva`, `UsuarioSalida`.
+     `role` es `str` y no un `Literal` fijo -- el vocabulario de roles no es
+     el mismo en toda la familia (`("admin","staff")` en seis productos,
+     `("admin","operador","cajero")` en Contalibra, con `"mozo"` sumado en
+     Restolibra) -- y se valida contra la tupla `roles` que cada producto le
+     pasa a la factory, no contra un tipo fijo del modelo.
+  2. **La factory `build_users_router(...)`**, en el mismo módulo: recibe
+     `prefix`, `roles`, `admin_role`, `admin_guard` (la dependencia de admin
+     que ya arma cada producto -- la factory no elige ninguna por default,
+     ver su docstring) y opcionalmente `get_repository`. Devuelve el router
+     completo: listar, alta, `GET /{id}`, edición, reset de contraseña de
+     otro usuario (`PUT /{id}/password`) y borrado.
+  3. **`libraauth.testing.verificar_contrato_de_usuarios(client, path, ...)`**:
+     el ciclo que ejerce el backoffice (listar → alta → editar → releer por
+     GET → borrar), armado con los MISMOS modelos públicos del punto 1 -- no
+     una copia con la misma forma. Cada producto lo llama desde su propia
+     suite, con su cliente admin.
+- Las protecciones son la UNIÓN de las que tenía cada producto, no la
+  intersección -- la tabla completa función × producto está en `README.md`.
+  Dos quedan estrictamente MÁS estrictas que cualquier original: el mínimo
+  de contraseña ahora aplica también al reset de la ajena, y la protección
+  del único admin ahora cubre también "desactivar" (antes sólo cubría
+  "degradar el rol"). Nadie pierde una protección al adoptar esto.
+- El bug de Contalibra (rol inválido en el `PUT` escapando como 500) no se
+  arregla parcheando su `db_usuarios.py`: se cierra de raíz porque la
+  factory valida el rol ANTES de llamar al repositorio, con su propio
+  mensaje en castellano, y además atrapa el `ValueError` del repositorio
+  como red de seguridad si algún día `roles=` de la factory y el `roles=`
+  del `UserRepository` de la instancia quedaran desalineados.
+- `DELETE` unificado a `204 No Content` en los ocho, alineado con la mayoría
+  (cinco de ocho). Contalibra, Restolibra y VentaLibra devuelven hoy `200`
+  con `{"ok": true}`; sus frontends propios (no la pantalla compartida de
+  `libra-ui`, que no lee el cuerpo del borrado) tienen que dejar de esperar
+  ese cuerpo al adoptar la factory -- ver el riesgo anotado en el informe de
+  la tarea que creó este ADR.
+- **No incluye** el autoservicio "Mi Cuenta" (`PUT /api/usuarios/me/password`)
+  que tienen Contalibra y Restolibra: cambia la contraseña PROPIA sin pedir
+  la actual, con un guard distinto (cualquier usuario logueado, no sólo
+  admin) y no lo consume la pantalla compartida de `libra-ui`. Es una
+  funcionalidad de cuenta, ortogonal al ABM de usuarios; el equivalente ya
+  cubierto por este motor es `POST /auth/change-password`
+  (`session_auth.build_json_api_auth_router`), que sí pide la actual.
+- Consecuencia asumida: adoptar la factory es un cambio de contrato para
+  Contalibra/Restolibra más allá del código -- pasan de `nombre`/`activo` a
+  `name`/`active` en el cuerpo JSON que ve su propio frontend (no el de
+  `libra-ui`, que ya usaba este nombrado), así que sus `frontend/src/api.ts`
+  y `Usuarios.tsx` propios necesitan su propio ajuste, no sólo el backend.
+  No se resuelve en este ADR ni en `libraauth`: es trabajo de adopción de
+  cada producto, evaluado por separado.
+

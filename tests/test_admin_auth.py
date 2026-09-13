@@ -160,3 +160,152 @@ def test_ip_vacia_no_rompe_ni_bloquea():
     a = _auth(login_max_intentos=1)
     a.registrar_intento_fallido("")
     assert a.rate_limit_excedido("") is False
+
+
+# ── Sesion por inactividad y renovacion deslizante (ADR-017) ───────────────
+#
+# Mismo mecanismo y mismos siete casos que `test_session_auth.py` -- ver el
+# comentario largo ahi sobre por que el reloj se controla parcheando
+# `TimestampSigner.get_timestamp` y no con freezegun.
+
+from http.cookies import SimpleCookie
+
+import itsdangerous.timed
+from fastapi import Depends, FastAPI
+from fastapi import Response as FastApiResponse
+from fastapi.testclient import TestClient as FastAPITestClient
+
+from libraauth.session_auth import RENOVACION_MINIMA_SEGUNDOS
+
+
+class _RelojFalso:
+    def __init__(self):
+        self.ahora = 1_800_000_000
+
+    def avanzar(self, segundos: float) -> None:
+        self.ahora += segundos
+
+
+@pytest.fixture
+def reloj(monkeypatch):
+    r = _RelojFalso()
+    monkeypatch.setattr(
+        itsdangerous.timed.TimestampSigner,
+        "get_timestamp",
+        lambda self: int(r.ahora),
+    )
+    return r
+
+
+def _cookie_valor(set_cookie_header: str, nombre: str) -> str:
+    c = SimpleCookie()
+    c.load(set_cookie_header)
+    return c[nombre].value
+
+
+def _make_admin_sliding_app(admin_auth):
+    """Misma forma que la de `test_session_auth.py`: una ruta protegida por
+    `require_login` via `Depends`, tal como la usa `libracore.admin.app`
+    (y por lo tanto Contalibra y Restolibra) sin declarar `response` en la
+    ruta."""
+    app = FastAPI()
+
+    @app.get("/ping")
+    def ping(user: str = Depends(admin_auth.require_login)):
+        return {"user": user}
+
+    @app.post("/login")
+    def login(username: str, response: FastApiResponse):
+        admin_auth.create_session_cookie(response, username)
+        return {"ok": True}
+
+    @app.post("/logout")
+    def logout(response: FastApiResponse):
+        admin_auth.clear_session_cookie(response)
+        return {"ok": True}
+
+    return app
+
+
+def test_admin_sesion_usada_cada_hora_durante_10h_sigue_viva(reloj):
+    """(a) para AdminAuth."""
+    a = _auth()
+    client = FastAPITestClient(_make_admin_sliding_app(a), base_url="https://testserver")
+    assert client.post("/login", params={"username": "superadmin"}).status_code == 200
+
+    r = None
+    for _ in range(10):
+        reloj.avanzar(3600)
+        r = client.get("/ping")
+        assert r.status_code == 200, r.text
+    assert r.json()["user"] == "superadmin"
+
+
+def test_admin_sesion_sin_uso_8h_mas_1s_se_rechaza(reloj):
+    """(b) para AdminAuth. Literal `8 * 3600 + 1`, no la constante -- ver el
+    comentario de `test_sesion_sin_uso_8h_mas_1s_se_rechaza` en
+    test_session_auth.py: con la constante este test seria tautologico."""
+    a = _auth()
+    client = FastAPITestClient(_make_admin_sliding_app(a), base_url="https://testserver")
+    client.post("/login", params={"username": "superadmin"})
+
+    reloj.avanzar(8 * 3600 + 1)
+    r = client.get("/ping", follow_redirects=False)
+    assert r.status_code == 307
+    assert r.headers["location"] == "/login"
+
+
+def test_admin_renovacion_reemite_cookie_con_los_mismos_atributos(reloj):
+    """(c) para AdminAuth."""
+    a = _auth()
+    client = FastAPITestClient(_make_admin_sliding_app(a), base_url="https://testserver")
+    client.post("/login", params={"username": "superadmin"})
+
+    reloj.avanzar(RENOVACION_MINIMA_SEGUNDOS + 1)
+    r = client.get("/ping")
+    assert r.status_code == 200
+    set_cookie = r.headers["set-cookie"]
+    minuscula = set_cookie.lower()
+    assert "httponly" in minuscula
+    assert "secure" in minuscula
+    assert "samesite=lax" in minuscula
+    assert set_cookie.split("=", 1)[0] == a.cookie_name
+
+
+def test_admin_no_renueva_antes_de_n_minutos(reloj):
+    """(d) para AdminAuth."""
+    a = _auth()
+    client = FastAPITestClient(_make_admin_sliding_app(a), base_url="https://testserver")
+    client.post("/login", params={"username": "superadmin"})
+
+    reloj.avanzar(RENOVACION_MINIMA_SEGUNDOS - 1)
+    r = client.get("/ping")
+    assert r.status_code == 200
+    assert "set-cookie" not in r.headers
+
+
+def test_admin_logout_no_resucita_la_cookie_borrada(reloj):
+    """(e) para AdminAuth."""
+    a = _auth()
+    client = FastAPITestClient(_make_admin_sliding_app(a), base_url="https://testserver")
+    client.post("/login", params={"username": "superadmin"})
+
+    reloj.avanzar(RENOVACION_MINIMA_SEGUNDOS + 1)
+    r = client.post("/logout")
+    set_cookie = r.headers["set-cookie"]
+    assert _cookie_valor(set_cookie, a.cookie_name) == ""
+
+    r2 = client.get("/ping", follow_redirects=False)
+    assert r2.status_code == 307
+
+
+def test_admin_cookie_firmada_hace_9h_se_rechaza_aunque_falten_dias_para_los_3(reloj):
+    """(g) para AdminAuth: el default viejo eran 3 dias ABSOLUTOS; 9 horas
+    hubieran sido validas. Con la ventana de inactividad, no."""
+    a = _auth()
+    client = FastAPITestClient(_make_admin_sliding_app(a), base_url="https://testserver")
+    client.post("/login", params={"username": "superadmin"})
+
+    reloj.avanzar(9 * 3600)
+    r = client.get("/ping", follow_redirects=False)
+    assert r.status_code == 307

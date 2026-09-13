@@ -12,6 +12,7 @@ import hmac
 import os
 import threading
 from collections.abc import Callable
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, Header, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -33,6 +34,68 @@ from .crypto import ClaveDeCifradoAusente
 from .demo_codigos import DIAS_DEFECTO, USOS_DEFECTO, CodigoInvalido
 from .password_reset import EmailNotConfigured, InvalidResetToken
 from .smtp_settings import SIN_CAMBIOS
+
+# ── Sesion por inactividad (ADR-017, decidido por el humano el 2026-09-13) ──
+#
+# Hasta esta version `max_age` era la vida ABSOLUTA de la cookie, contada
+# desde el login: 7 dias en `SessionAuth`, 3 en `AdminAuth`. El humano pidio
+# que las sesiones se cierren "pasadas 8 horas SIN USO" -- una ventana de
+# INACTIVIDAD, no un plazo fijo. Las dos cosas se resuelven con el mismo
+# mecanismo (renovacion deslizante): `max_age` pasa a medir cuanto puede
+# pasar desde la ULTIMA firma, y cada pedido con sesion valida re-firma la
+# cookie si esa firma ya tiene mas de `RENOVACION_MINIMA_SEGUNDOS`. Ver
+# `_debe_renovar`, `_ya_tiene_set_cookie` y `SessionAuth.get_current_user`.
+#
+# Unico lugar de esta constante para las dos clases del paquete: la importa
+# tambien `admin_auth.py`, igual que ya hace con `_resolve_secret_key`.
+INACTIVIDAD_MAXIMA_SEGUNDOS = 8 * 3600
+
+#: Piso de la renovacion deslizante. Sin el, un usuario activo re-firmaria (y
+#: recibiria un Set-Cookie) en CADA pedido -- CPU de mas y una cookie que
+#: cambia en cada respuesta sin necesidad. 5 minutos es un orden de magnitud
+#: mas chico que la ventana de inactividad: no hay riesgo de que alguien haga
+#: un pedido cada 7 minutos durante 8 horas y la sesion se corte igual, porque
+#: cada pedido la vuelve a alargar 8 horas desde ese momento.
+RENOVACION_MINIMA_SEGUNDOS = 5 * 60
+
+
+def _debe_renovar(signer: URLSafeTimedSerializer, firmado_en: datetime) -> bool:
+    """Si una firma de esta antiguedad ya amerita re-emitir la cookie
+    (renovacion deslizante). `firmado_en` es el timestamp que trae el propio
+    token -- ver `URLSafeTimedSerializer.loads(..., return_timestamp=True)` --
+    y no cuando se creo la sesion la primera vez: cada renovacion lo corre
+    para adelante.
+
+    🔴 **El "ahora" sale del propio `signer`, no de `datetime.now()`.** Los
+    tests de este modulo controlan el reloj parcheando
+    `itsdangerous.timed.TimestampSigner.get_timestamp` -- el unico punto que
+    lee la hora al firmar y al validar. Comparar contra `datetime.now()` real
+    rompe eso en los dos sentidos: en los tests, "ahora" real y "ahora" fake
+    quedan en epocas distintas y la resta da un numero sin sentido (probado:
+    con el reloj fake mas de un dia en el futuro, `_debe_renovar` daba
+    siempre `False` porque `datetime.now() - firmado_en` es NEGATIVO); y aun
+    en produccion, un reloj de sistema corregido entre el login y el pedido
+    metería el mismo desvio."""
+    interno = signer.make_signer()
+    ahora = interno.timestamp_to_datetime(interno.get_timestamp())
+    return (ahora - firmado_en).total_seconds() >= RENOVACION_MINIMA_SEGUNDOS
+
+
+def _ya_tiene_set_cookie(response: Response, cookie_name: str) -> bool:
+    """Si `response` ya trae un `Set-Cookie` para `cookie_name`.
+
+    Evita renovar ENCIMA de una cookie que la misma respuesta ya esta
+    emitiendo por otro motivo -- el caso que importa es no resucitar la
+    cookie que un `logout` en curso acaba de borrar (`delete_cookie` tambien
+    escribe un `Set-Cookie`, con valor vacio y vencido, para el mismo
+    nombre). Login y demo no llegan a esta funcion porque no pasan `response`
+    a `get_current_user` -- ver esos handlers -- asi que esto es la segunda
+    linea de defensa, no la primera."""
+    prefijo = f"{cookie_name}=".encode("latin-1")
+    return any(
+        nombre == b"set-cookie" and valor.startswith(prefijo)
+        for nombre, valor in response.raw_headers
+    )
 
 
 def _resolve_secret_key(dev_fallback: str, missing_error: str) -> str:
@@ -57,7 +120,7 @@ class SessionAuth:
         get_user_by_username: Callable[[str], dict | None],
         check_credentials: Callable[[str, str], object],
         cookie_name: str = "libra_session",
-        max_age: int = 86400 * 7,
+        max_age: int = INACTIVIDAD_MAXIMA_SEGUNDOS,
     ):
         self.secret_key = _resolve_secret_key(
             dev_secret_fallback,
@@ -79,22 +142,49 @@ class SessionAuth:
     def clear_session_cookie(self, response):
         response.delete_cookie(self.cookie_name)
 
-    def get_current_user(self, request: Request) -> str | None:
+    def get_current_user(self, request: Request, response: Response = None) -> str | None:
+        """El username de la cookie de sesion, o `None` sin sesion valida.
+
+        `response` es opcional y, cuando llega, es lo que habilita la
+        **renovacion deslizante**: si la firma del token ya tiene mas de
+        `RENOVACION_MINIMA_SEGUNDOS`, se re-emite la cookie con timestamp
+        nuevo -- misma cookie, misma sesion, el reloj de inactividad vuelve a
+        `INACTIVIDAD_MAXIMA_SEGUNDOS`. Quien llama sin `response` (por
+        ejemplo `logout`, para leer el username antes de borrar la cookie)
+        simplemente no dispara ninguna renovacion.
+
+        Todas las dependencias de este modulo que FastAPI resuelve via
+        `Depends` (`require_auth`, `require_admin`, `require_role`,
+        `json_api_get_current_user` y los guards que cuelgan de ellas) le
+        pasan su propio `response`, inyectado por el framework aunque el
+        endpoint no lo declare -- por eso alcanza con subir el pin del motor
+        para que la renovacion llegue a cualquier producto que ya use estas
+        dependencias, sin tocarles una linea. Ver el ADR-017 y el docstring
+        de modulo."""
         token = request.cookies.get(self.cookie_name)
         if not token:
             return None
         try:
-            return self._signer.loads(token, max_age=self.max_age)
+            username, firmado_en = self._signer.loads(
+                token, max_age=self.max_age, return_timestamp=True
+            )
         except (BadSignature, SignatureExpired):
             return None
+        if (
+            response is not None
+            and not _ya_tiene_set_cookie(response, self.cookie_name)
+            and _debe_renovar(self._signer, firmado_en)
+        ):
+            self.create_session_cookie(response, username)
+        return username
 
-    def require_auth(self, request: Request) -> str:
-        user = self.get_current_user(request)
+    def require_auth(self, request: Request, response: Response = None) -> str:
+        user = self.get_current_user(request, response)
         if not user:
             raise HTTPException(status_code=307, headers={"Location": "/login"})
         return user
 
-    def require_admin(self, request: Request) -> dict:
+    def require_admin(self, request: Request, response: Response = None) -> dict:
         """Rol admin en las rutas HTML (redirige, no devuelve 403).
 
         Misma excepción de lectura que los guards JSON: el visitante de una
@@ -102,7 +192,7 @@ class SessionAuth:
         quedaba incoherente — veía la pantalla de Libros de IVA, que su API ya
         le permite, y el botón de exportar lo mandaba al dashboard.
         """
-        username = self.get_current_user(request)
+        username = self.get_current_user(request, response)
         if not username:
             raise HTTPException(status_code=307, headers={"Location": "/login"})
         user = self._get_user_by_username(username)
@@ -116,8 +206,8 @@ class SessionAuth:
         """Factory de dependencia: exige que el usuario logueado tenga uno
         de los roles indicados."""
 
-        def _dep(request: Request) -> dict:
-            username = self.get_current_user(request)
+        def _dep(request: Request, response: Response = None) -> dict:
+            username = self.get_current_user(request, response)
             if not username:
                 raise HTTPException(status_code=307, headers={"Location": "/login"})
             user = self._get_user_by_username(username)
@@ -309,11 +399,19 @@ def json_api_get_session_auth(request: Request) -> "SessionAuth":
 
 
 def json_api_get_current_user(
-    request: Request, auth: "SessionAuth" = Depends(json_api_get_session_auth),
+    request: Request,
+    auth: "SessionAuth" = Depends(json_api_get_session_auth),
+    response: Response = None,
 ) -> dict:
     """401 JSON (no redirect) si no hay sesion valida o el usuario esta
-    inactivo."""
-    username = auth.get_current_user(request)
+    inactivo.
+
+    `response` habilita la renovacion deslizante de la cookie (ver
+    `SessionAuth.get_current_user`): FastAPI lo inyecta solo por estar
+    anotado aca, sin que el endpoint que use esta dependencia lo declare.
+    Va ULTIMO a proposito: quien llamaba `json_api_get_current_user(request,
+    auth)` por posicion sigue andando igual (sin renovar)."""
+    username = auth.get_current_user(request, response)
     if username is None:
         raise HTTPException(401, "not authenticated")
     users = request.app.state.users
@@ -519,7 +617,7 @@ def _exigir_terminos(request: Request, usuario: dict | None) -> None:
     exigir_terminos(request, usuario)
 
 
-def json_api_require_panel_o_admin(request: Request) -> dict:
+def json_api_require_panel_o_admin(request: Request, response: Response = None) -> dict:
     """Credencial del panel del cliente **o** un admin de esta instancia.
 
     El admin sirve para que la pantalla del propio producto pueda consumir el
@@ -534,10 +632,14 @@ def json_api_require_panel_o_admin(request: Request) -> dict:
     Vive aca y no en libracore porque es autenticacion, y porque **libracore no
     depende de este paquete**: son motores peers. El router del resumen recibe
     esta funcion inyectada.
+
+    `response` es lo que permite la renovacion deslizante de la cookie (ver
+    `SessionAuth.get_current_user`); una request con token no la necesita
+    porque no trae cookie.
     """
     if token_de_panel_valido(request):
         return dict(PANEL_USER)
-    usuario = json_api_get_current_user(request, request.app.state.session_auth)
+    usuario = json_api_get_current_user(request, request.app.state.session_auth, response)
     # El token sale arriba; de aca en adelante es un usuario de la instancia, y
     # le corresponde el mismo gate de Terminos que a cualquier otra pantalla.
     _exigir_terminos(request, usuario)
@@ -546,7 +648,9 @@ def json_api_require_panel_o_admin(request: Request) -> dict:
     raise HTTPException(403, "No autorizado")
 
 
-def json_api_require_admin_o_servicio_o_panel(request: Request) -> dict:
+def json_api_require_admin_o_servicio_o_panel(
+    request: Request, response: Response = None
+) -> dict:
     """Como `json_api_require_admin_o_servicio`, y ademas la credencial del panel.
 
     Existe para **una sola cosa**: que el panel del cliente pueda dar de alta y
@@ -586,7 +690,7 @@ def json_api_require_admin_o_servicio_o_panel(request: Request) -> dict:
     # sesion de la instancia, con su gate de Terminos y la excepcion de lectura
     # de la demo. Se repite en vez de delegar porque delegar volveria a evaluar
     # el token de servicio, que ya se descarto arriba.
-    usuario = json_api_get_current_user(request, request.app.state.session_auth)
+    usuario = json_api_get_current_user(request, request.app.state.session_auth, response)
     _exigir_terminos(request, usuario)
     if usuario["role"] == "admin":
         return usuario
@@ -595,7 +699,7 @@ def json_api_require_admin_o_servicio_o_panel(request: Request) -> dict:
     raise HTTPException(403, "forbidden")
 
 
-def json_api_require_admin_o_servicio(request: Request) -> dict:
+def json_api_require_admin_o_servicio(request: Request, response: Response = None) -> dict:
     """Rol admin del producto **o** token de servicio valido.
 
     El token se chequea primero y a proposito: una request del backoffice no
@@ -604,7 +708,7 @@ def json_api_require_admin_o_servicio(request: Request) -> dict:
     """
     if token_de_servicio_valido(request):
         return dict(SERVICE_USER)
-    usuario = json_api_get_current_user(request, request.app.state.session_auth)
+    usuario = json_api_get_current_user(request, request.app.state.session_auth, response)
     # 🔴 **El gate de Terminos hace falta ACA aparte**, por lo mismo que la
     # excepcion de lectura de la demo: este guard **no pasa por
     # `json_api_require_role`**, y de el cuelga el router de usuarios de los ocho

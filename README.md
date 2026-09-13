@@ -379,6 +379,50 @@ a.create_session_cookie(response, username)
   el bloqueo por IP, y que la sesion en si sigue exigiendo el codigo. Ver
   ADR-016 en `DECISIONS.md`.
 
+## Sesion por inactividad de 8 horas, con renovacion deslizante (v0.43.0)
+
+`SessionAuth` (login del usuario final) y `AdminAuth` (backoffice de
+superadmin) cierran la sesion a las **8 horas sin uso**, no a un plazo fijo
+desde el login. "Uso" es cualquier pedido al servidor que pase por una de las
+dependencias de este paquete (`require_auth`, `require_admin`, `require_role`,
+`json_api_get_current_user` y los guards que cuelgan de ella; `require_login`
+del lado de `AdminAuth`): cada uno de esos pedidos, si la sesion sigue viva,
+re-firma la cookie con timestamp nuevo — misma cookie, mismos atributos, el
+reloj de las 8 horas vuelve a arrancar desde ese pedido. Una pantalla que se
+refresca sola (el KDS) sigue contando como uso mientras este abierta.
+
+**Llega solo con subir el pin, en casi todos los consumidores.** FastAPI
+inyecta un `Response` real en cualquier funcion usada con `Depends(...)` que
+lo declare, aunque el endpoint que la usa no lo declare el — asi que la
+renovacion viaja adentro de las dependencias de siempre, sin que el producto
+tenga que agregar nada. La excepcion es un consumidor que **envuelve**
+`SessionAuth.get_current_user` o `AdminAuth.current_user` en su propia
+dependencia sin declarar `response` y pasarlo: relevados, la API JSON de
+Contalibra y Restolibra (`get_current_user_json`) y el `admin_actual` de
+`libra-backoffice`. A esos les hace falta una linea propia (ver ADR-017).
+Sin esa linea no se rompe nada: la sesion sigue valida, pero no se renueva.
+
+```python
+from libraauth.session_auth import (
+    INACTIVIDAD_MAXIMA_SEGUNDOS,  # 8 * 3600 — default de `max_age`
+    RENOVACION_MINIMA_SEGUNDOS,   # 5 * 60 — piso entre una renovacion y la siguiente
+)
+```
+
+- No renueva en `logout` (no resucita la cookie que borra), ni encima de una
+  respuesta que ya trae su propio `Set-Cookie` para el mismo nombre.
+- La renovacion re-emite la cookie por `create_session_cookie`, la MISMA
+  funcion que usa el login: los atributos (`httponly`, `samesite=lax`,
+  `secure`, el nombre y el path) nunca se duplican en un segundo lugar.
+- 🔴 **Cambio de comportamiento:** antes de esta version `max_age` eran 7 dias
+  (`SessionAuth`) o 3 dias (`AdminAuth`) ABSOLUTOS desde el login. Una cookie
+  firmada hace 9 horas, que antes seguia siendo valida, ahora se rechaza
+  aunque falten dias para cumplir el plazo viejo.
+- Ver ADR-017 en `DECISIONS.md` para el detalle completo, la tabla de
+  consumidores y los riesgos relevados (peticiones concurrentes, cache
+  intermedia, y que un endpoint que devuelve su propio `Response` —un PDF,
+  una redireccion— no renueva la sesion).
+
 ## Schema: la cadena de Alembic (2026-09-11)
 
 Hasta aca las seis tablas de este motor las creaba solo
@@ -410,6 +454,100 @@ libraauth-migrar diferencias --prefijo P --base B  # mide, no cambia nada
   pone rojo el CI si los dos no dicen lo mismo.
 - `actividad_log` (`AuditoriaBase`) queda **afuera**: vive en la base del
   dominio, que no siempre es la de `usuarios`.
+
+## Router de usuarios unificado (v0.43.0, ADR-018)
+
+Un solo router de usuarios (`libraauth/usuarios.py`) para los ocho productos
+de la familia, en vez de que cada uno mantenga su propia copia. Reemplaza:
+
+| Producto | Router de referencia (antes de adoptar) |
+|---|---|
+| Gestiolibra, MedLibra | `app/routers/users.py`, prefijo `/users` |
+| VentaLibra | `app/routers/users.py`, prefijo `/users`, sin `Depends` propio |
+| LibraDesk | `app/routers/users.py`, prefijo `/api/usuarios` |
+| LibraCargo, LibraClub | `app/routers/usuarios.py`, prefijo `/api/usuarios` |
+| Contalibra, Restolibra | `app/web/api/usuarios.py` + `app/db_usuarios.py` (contrato `nombre`/`activo`, traducido por el adaptador) |
+
+### Modelos públicos (`libraauth/usuarios.py`)
+
+`UsuarioAlta`, `UsuarioEdicion`, `UsuarioClaveNueva`, `UsuarioSalida`. Son el
+mismo objeto de Python que usa `libraauth.testing` para armar los payloads
+del test de contrato, y los que el backoffice (`libra-backoffice`) importa en
+vez de redefinir `UsuarioIn`/`UsuarioUpdate` -- ver "Adoptarla" más abajo.
+
+### `build_users_router(...)`
+
+```python
+from libraauth.usuarios import build_users_router
+from app.auth import require_admin_o_servicio  # el guard que ya arma el producto
+
+app.include_router(build_users_router(
+    prefix="/api/usuarios",              # el que ya usa el producto -- no cambiarlo
+    roles=("admin", "staff"),            # el mismo roles= del UserRepository
+    admin_guard=require_admin_o_servicio,
+))
+```
+
+Endpoints: `GET`, `POST`, `GET /{id}`, `PUT /{id}`, `PUT /{id}/password`,
+`DELETE /{id}`. Protecciones -- unión de las que tenía cada producto, tabla
+completa en el docstring de `build_users_router` y en el ADR-018:
+
+| Protección | Código | Quién la tenía antes |
+|---|---|---|
+| Username duplicado | 409 | los ocho |
+| Rol inválido, alta | 422 | los ocho |
+| Rol inválido, edición | 422 | LibraDesk, VentaLibra, LibraCargo, LibraClub (Gestiolibra/MedLibra/Contalibra dejaban escapar un 500) |
+| Contraseña < 6, alta | 422 | sólo Contalibra/Restolibra |
+| Contraseña < 6, reset ajeno | 422 | **nuevo** -- ninguno lo exigía |
+| No desactivarte/degradarte vos mismo | 409 | LibraCargo, LibraClub |
+| No borrarte vos mismo | 409 | LibraCargo, LibraClub, Contalibra, Restolibra |
+| No degradar al único admin activo | 422 | Contalibra, Restolibra |
+| No desactivar al único admin activo | 422 | **nuevo** -- ninguno lo exigía |
+| No eliminar al único admin | 422 | Contalibra, Restolibra |
+
+`DELETE` responde siempre `204` (Contalibra/Restolibra/VentaLibra respondían
+`200` con `{"ok": true}`: sus frontends propios -- no `Usuarios` de
+`libra-ui`, que no mira el cuerpo del borrado -- tienen que dejar de esperar
+ese cuerpo).
+
+**No incluye** `PUT /api/usuarios/me/password` (autoservicio de "Mi Cuenta"
+de Contalibra/Restolibra): es otra funcionalidad, con otro guard (cualquier
+usuario logueado) y sin la contraseña actual -- el equivalente de este motor
+es `POST /auth/change-password`, que sí la pide.
+
+### Test de contrato (`libraauth.testing`)
+
+```python
+from libraauth.testing import verificar_contrato_de_usuarios
+
+def test_contrato_de_usuarios(admin_client):
+    verificar_contrato_de_usuarios(admin_client, "/api/usuarios", role="staff")
+```
+
+Corre el mismo ciclo que ejerce el backoffice (listar → alta → editar →
+releer por `GET /{id}` → borrar) contra la instancia de router de ESE
+producto, con los modelos públicos de arriba -- así el backoffice y el test
+de cada producto no pueden divergir entre sí.
+
+### Adoptarla en un producto
+
+1. Borrar `app/routers/users.py` (o `usuarios.py`, o el par
+   `app/web/api/usuarios.py` + las 12 funciones equivalentes de
+   `app/db_usuarios.py` en Contalibra/Restolibra) y su import en `main.py`/
+   `web/app.py`.
+2. `app.include_router(build_users_router(prefix=..., roles=..., admin_guard=...))`
+   con el prefijo, la tupla de roles y el guard que el producto YA usa (ver
+   la tabla de arriba) -- no elegir un default nuevo.
+3. Sumar `test_contrato_de_usuarios` (arriba) a la suite del producto; borrar
+   los tests propios del router viejo que quedan redundantes con los que ya
+   corre `libraauth` (los de las protecciones se prueban acá, una sola vez).
+4. Contalibra/Restolibra: su frontend propio (`frontend/src/api.ts`,
+   `Usuarios.tsx`) espera `nombre`/`activo` y un `DELETE` con cuerpo -- pasar
+   a `name`/`active` y a leer `204` sin cuerpo es trabajo de ESE producto, no
+   de esta adopción del backend.
+5. `libra-backoffice`: importar `UsuarioIn`/`UsuarioUpdate` (o construir los
+   suyos a partir de `UsuarioAlta`/`UsuarioEdicion`) de `libraauth.usuarios`
+   en vez de redefinirlos en `routers/config_instancia.py`.
 
 ## Desarrollo
 
