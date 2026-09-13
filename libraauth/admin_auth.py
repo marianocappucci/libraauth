@@ -45,6 +45,17 @@ ABIERTO—, un archivo de TOTP roto falla CERRADO: `totp_habilitado` da `True`
 y el login queda cerrado hasta borrar el archivo a mano desde el host, porque
 un segundo factor que se apaga solo porque el archivo se rompio es peor que
 un login cerrado que se arregla borrando un archivo (ver ADR-015).
+
+Desde la F4 (2026-09-13) el login puede hacerse en **dos pasos**, ademas del
+camino de un solo paso que sigue igual para los clientes viejos de
+`check_credentials`: `verificar_clave` valida solo usuario y contrasena;
+`emitir_desafio_totp` devuelve un token firmado de vida corta
+(`DESAFIO_TOTP_SEGUNDOS`) para el segundo paso; `validar_desafio_totp` lo
+verifica sin lanzar nunca; y `verificar_codigo_totp` valida el codigo TOTP
+contra ese desafio, compartiendo `ultimo_paso_totp` con `check_credentials` —
+un codigo usado en un camino no sirve en el otro. El desafio se firma con un
+salt propio, distinto del de la cookie de sesion: uno no puede colarse como
+el otro. Ver ADR-016.
 """
 import hmac
 import json
@@ -74,6 +85,15 @@ ESTADO_PATH_ENV = "ADMIN_PANEL_ESTADO_PATH"
 #: Segundos que un secreto PENDIENTE de `iniciar_totp` sigue confirmable con
 #: `confirmar_totp` antes de vencer (10 minutos).
 TOTP_PENDIENTE_SEGUNDOS = 600
+#: Segundos que un desafio de `emitir_desafio_totp` sigue valido antes de
+#: vencer (5 minutos): la ventana entre el paso 1 (usuario+contrasena) y el
+#: paso 2 (codigo TOTP) del login en dos pasos.
+DESAFIO_TOTP_SEGUNDOS = 300
+#: Salt propio del desafio TOTP, distinto del de la cookie de sesion (que no
+#: lleva salt explicito). Es lo que impide que un desafio sirva como cookie
+#: de sesion y al reves: `itsdangerous` deriva una clave distinta por salt,
+#: asi que un token firmado con uno no valida contra el otro.
+_TOTP_DESAFIO_SALT = "libraauth.admin.totp-desafio"
 
 
 class TotpNoEnrolable(RuntimeError):
@@ -297,6 +317,9 @@ class AdminAuth:
         self.login_max_intentos = login_max_intentos
         self.login_ventana_segundos = login_ventana_segundos
         self._signer = URLSafeTimedSerializer(self.secret_key)
+        self._signer_totp_desafio = URLSafeTimedSerializer(
+            self.secret_key, salt=_TOTP_DESAFIO_SALT
+        )
 
         secreto = os.environ.get(TOTP_SECRET_ENV, "") if totp_secret is None else totp_secret
         if secreto.strip():
@@ -397,6 +420,20 @@ class AdminAuth:
             )
             return None, True
 
+    def verificar_clave(self, username: str, password: str) -> bool:
+        """Solo usuario y contrasena, sin mirar el TOTP ni marcar nada — el
+        paso 1 del login en dos pasos, y la misma comparacion que usa
+        `check_credentials` (una sola implementacion).
+
+        Sin `ADMIN_PANEL_PASSWORD` configurada, `False` siempre (fail-closed):
+        si no, una instancia mal configurada dejaria entrar con password
+        vacia. Comparacion en tiempo constante en los dos campos."""
+        if not self.panel_pass:
+            return False
+        return hmac.compare_digest(
+            username or "", self.panel_user
+        ) and hmac.compare_digest(password or "", self.panel_pass)
+
     def check_credentials(self, username: str, password: str, codigo: str | None = None) -> bool:
         """Usuario y contrasena, y ademas el codigo TOTP si esta habilitado.
 
@@ -409,13 +446,7 @@ class AdminAuth:
         Con el archivo de TOTP roto, `False` siempre (fail CLOSED): ni la
         clave correcta ni ningun codigo abren el login hasta que se borre el
         archivo a mano desde el host."""
-        if not self.panel_pass:
-            # Sin contrasena configurada se rechaza todo (fail-closed): si no,
-            # una instancia mal configurada dejaria entrar con password vacia.
-            return False
-        clave_ok = hmac.compare_digest(
-            username or "", self.panel_user
-        ) and hmac.compare_digest(password or "", self.panel_pass)
+        clave_ok = self.verificar_clave(username, password)
         validador, roto = self._totp_activo()
         if roto:
             return False
@@ -423,6 +454,55 @@ class AdminAuth:
             return clave_ok
         paso = validador.paso_valido(codigo or "", ultimo_paso=self._estado.ultimo_paso_totp())
         if not clave_ok or paso is None:
+            return False
+        self._estado.marcar_paso_totp(paso)
+        return True
+
+    # ── login en dos pasos ───────────────────────────────────────────────────
+
+    def emitir_desafio_totp(self, username: str) -> str:
+        """Token firmado de vida corta (`DESAFIO_TOTP_SEGUNDOS`) para el paso 2
+        del login: probados usuario y contrasena (`verificar_clave`), este
+        desafio es lo que el cliente manda de vuelta junto con el codigo TOTP
+        a `validar_desafio_totp` / `verificar_codigo_totp`.
+
+        Firmado con salt propio (`_TOTP_DESAFIO_SALT`), distinto del que firma
+        la cookie de sesion: un desafio no puede colarse como cookie de
+        sesion, ni una cookie de sesion como desafio."""
+        return self._signer_totp_desafio.dumps({"u": username})
+
+    def validar_desafio_totp(self, desafio: str) -> str | None:
+        """El username del desafio, si la firma vale y no pasaron
+        `DESAFIO_TOTP_SEGUNDOS`. `None` ante firma mala, desafio vencido,
+        payload con otra forma, o entrada vacia/no-str. Nunca lanza."""
+        if not desafio or not isinstance(desafio, str):
+            return None
+        try:
+            payload = self._signer_totp_desafio.loads(
+                desafio, max_age=DESAFIO_TOTP_SEGUNDOS
+            )
+        except (BadSignature, SignatureExpired):
+            return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("u"), str):
+            return None
+        return payload["u"]
+
+    def verificar_codigo_totp(self, codigo: str) -> bool:
+        """Valida `codigo` contra el TOTP ACTIVO ahora (entorno o archivo, via
+        `_totp_activo`) — el paso 2 del login en dos pasos. Respeta
+        `ultimo_paso_totp` del estado de login y lo marca si vale: un codigo
+        sirve una sola vez, y ese contador es **compartido** con
+        `check_credentials` — el codigo usado en un camino no sirve en el
+        otro.
+
+        Sin TOTP activo, `False`: el paso 2 no existe sin segundo factor. Con
+        el archivo de TOTP roto, `False` (fail CLOSED, igual que
+        `check_credentials`)."""
+        validador, roto = self._totp_activo()
+        if roto or validador is None:
+            return False
+        paso = validador.paso_valido(codigo or "", ultimo_paso=self._estado.ultimo_paso_totp())
+        if paso is None:
             return False
         self._estado.marcar_paso_totp(paso)
         return True
