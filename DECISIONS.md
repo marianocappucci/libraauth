@@ -278,3 +278,45 @@ wiki (entidad `libraauth`).
 - Fuera de alcance: el login de la demo, que ya exige un código emitido por el
   backoffice, y el `/docs` de `libra-web-kit`.
 
+## ADR-015 — TOTP enrolable en runtime, guardado en archivo aparte
+
+- Estado: aceptada
+- Fecha: 2026-09-13
+- Contexto: el TOTP de ADR-009 solo se carga por `ADMIN_PANEL_TOTP_SECRET`
+  en el `.env`, así que activarlo exige editar el archivo y recrear el
+  contenedor — dos pasos manuales por instancia, y el humano pidió un
+  interruptor "habilitar doble factor" con QR en el backoffice, sin tocar
+  el `.env` ni reiniciar nada.
+- Decisión: el secreto enrolado vive en un archivo JSON aparte del estado de
+  login (`ADMIN_PANEL_TOTP_PATH`, o el hermano `totp.json` de
+  `ADMIN_PANEL_ESTADO_PATH` si esa es la única variable seteada), con la
+  misma escritura atómica que `_EstadoLogin` (tmp + `os.replace`) más
+  `chmod 0600`. `AdminAuth` suma `iniciar_totp` / `confirmar_totp` /
+  `desactivar_totp`: enrolar dos pasos (generar un secreto PENDIENTE con QR,
+  confirmarlo con un código dentro de los 10 minutos) para no activar un
+  secreto que el superadmin nunca llegó a cargar en el autenticador.
+- El entorno sigue mandando: con `ADMIN_PANEL_TOTP_SECRET` seteado,
+  `totp_origen` es `"entorno"` y enrolar o desactivar desde la app se
+  rechaza con `TotpNoEnrolable`. Es la variable que ya usan los ocho
+  backoffices vía `.env`; el archivo es un camino nuevo, no un reemplazo.
+- **Fail CLOSED, al revés que el resto del rate limiting de este paquete**
+  (que falla ABIERTO — ver ADR-009): un archivo de TOTP roto (ilegible, JSON
+  inválido, forma inesperada, o un `secreto` que no decodifica) deja
+  `totp_habilitado=True` con `check_credentials` devolviendo `False`
+  siempre. Es un cambio de política deliberado y acotado a este archivo: el
+  estado de login cuenta intentos (fallar cerrado ahí bloquearía a todos
+  porque se rompió el contador), pero el TOTP **es** el segundo factor —
+  apagarlo solo porque el archivo se corrompió deja el backoffice con un
+  factor menos sin que nadie lo decidiera. Recuperarse es borrar el archivo
+  a mano desde el host, a propósito: un login cerrado que se arregla
+  borrando un archivo es preferible a un 2FA que se cae solo y nadie nota.
+- Cada escritura de `confirmar_totp` y `desactivar_totp` se **relee** después
+  de guardar y compara contra lo esperado; si no coincide, `RuntimeError` —
+  nunca se responde `True` (2FA activado/desactivado) si no persistió.
+- Sin dependencia nueva: reusa `Totp` y `totp.generar_secreto` /
+  `totp.uri_otpauth` tal cual estaban.
+- Compatibilidad: sin `ADMIN_PANEL_TOTP_PATH` ni `ADMIN_PANEL_ESTADO_PATH`,
+  `AdminAuth` se comporta exactamente igual que antes de este ADR (no
+  enrolable, `totp_habilitado` solo por entorno). `tests/test_admin_auth.py`
+  y `tests/test_admin_auth_f2.py` no se tocaron.
+
