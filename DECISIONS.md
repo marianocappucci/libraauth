@@ -483,9 +483,11 @@ wiki (entidad `libraauth`).
   que además habla un contrato distinto puertas adentro (`nombre`/`activo`).
   Copiar en vez de compartir dejó a las ocho divergiendo en silencio: cinco
   de los ocho no protegían al único administrador activo de una edición que
-  lo degrada o desactiva; tres dejaban escapar un `ValueError` de rol
-  inválido en la EDICIÓN como `500` (Contalibra vía `db_usuarios.py`,
-  Gestiolibra y MedLibra vía el `except` que faltaba en su `PUT`); el
+  lo degrada o desactiva; Contalibra dejaba escapar un `ValueError` de rol
+  inválido en la EDICIÓN como `500` (vía `db_usuarios.py`, sin `except` en su
+  `PUT`) -- Gestiolibra y MedLibra no tenían este bug: su `UserUpdate.role`
+  ya era `Literal["admin", "staff"]`, así que Pydantic frenaba un rol
+  inválido con `422` antes de llegar al handler; el
   `DELETE` respondía `204` en cinco productos y `200` con cuerpo JSON en los
   otros tres; y el mínimo de contraseña (6 caracteres) sólo se exigía en el
   alta de Contalibra/Restolibra, en ningún reset de contraseña ajena. El
@@ -543,4 +545,12 @@ wiki (entidad `libraauth`).
   y `Usuarios.tsx` propios necesitan su propio ajuste, no sólo el backend.
   No se resuelve en este ADR ni en `libraauth`: es trabajo de adopción de
   cada producto, evaluado por separado.
+- Adenda (2026-09-14): `eliminar` sólo atrapaba `KeyError` -- borrar un
+  usuario con historial (una fila de otra tabla de la familia con FK a
+  `usuarios(id)`, como `turnos_caja.usuario_id`) chocaba con la FK y salía
+  como `500`. Ahora `UserRepository.delete()` traduce el `IntegrityError` a
+  `UsuarioConHistorial`, con `rollback()` de la sesión antes de propagarla
+  (en PostgreSQL, sin eso, el PRÓXIMO pedido sobre la misma sesión sale con
+  la transacción abortada), y el router responde `409` pidiendo desactivar
+  al usuario en vez de borrarlo.
 
