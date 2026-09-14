@@ -289,6 +289,64 @@ def test_el_log_de_actividad_acepta_un_id_de_texto_contra_postgres(tmp_path):
     assert filas[0]["entidad_id"] == "patient-1"
 
 
+def test_borrar_usuario_con_historial_da_409_y_no_aborta_la_transaccion(dos_motores):
+    """`UserRepository.delete()` traduce el `IntegrityError` de una FK real
+    -- acá `turnos_caja_pg_demo.usuario_id REFERENCES usuarios(id)`, imitando
+    `turnos_caja` de libracore -- a `UsuarioConHistorial`, con `rollback()`
+    antes de propagarla.
+
+    🔴 **Por qué hace falta PostgreSQL real y no alcanza con SQLite.** En
+    PostgreSQL un error deja la transacción de la sesión ABORTADA: sin el
+    rollback, el PRÓXIMO `execute`/`commit` sobre esa misma sesión sale con
+    `current transaction is aborted, commands ignored until end of
+    transaction block` -- no sólo el borrado que falló. SQLite no tiene ese
+    modo; ahí el bug no se manifiesta igual. La última aserción (`pg.list()`
+    después del `delete()` que falló) es la que ejercita justo eso: la MISMA
+    sesión, usada de nuevo.
+    """
+    from sqlalchemy import ForeignKey
+    from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+    from libraauth.models import Usuario
+    from libraauth.repository import UsuarioConHistorial
+
+    class _HistorialBase(DeclarativeBase):
+        pass
+
+    class TurnoCajaPg(_HistorialBase):
+        __tablename__ = "turnos_caja_pg_demo"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        usuario_id: Mapped[int] = mapped_column(ForeignKey(Usuario.id), nullable=False)
+
+    pg, _lite = dos_motores
+    engine = create_engine(POSTGRES_URL)
+    _HistorialBase.metadata.drop_all(engine)
+    _HistorialBase.metadata.create_all(engine)
+    try:
+        beto = pg.get_by_username("beto")
+        assert beto is not None
+        with Session(engine) as s:
+            s.add(TurnoCajaPg(usuario_id=int(beto["id"])))
+            s.commit()
+
+        with pytest.raises(UsuarioConHistorial):
+            pg.delete(beto["id"])
+
+        # No se borró.
+        assert pg.get_by_username("beto") is not None
+
+        # Contraprueba de la mutación: sin el rollback dentro de `delete()`,
+        # esta llamada siguiente sobre la MISMA sesión revienta con la
+        # transacción abortada en vez de devolver la lista.
+        filas = pg.list()
+        assert len(filas) == len(SEMILLA), filas
+    finally:
+        # `dos_motores` del PRÓXIMO test hace `Base.metadata.drop_all()` sobre
+        # esta misma base -- dejar la FK de esta tabla viva rompería ESE
+        # `drop_all` con `DependentObjectsStillExist`, no algo de este test.
+        _HistorialBase.metadata.drop_all(engine)
+
+
 def test_created_at_lo_escribe_la_base_en_los_dos_motores(dos_motores):
     """`created_at` es `server_default=func.now()`: lo pone el motor.
 

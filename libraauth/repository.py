@@ -31,6 +31,29 @@ class UsernameTaken(Exception):
     """
 
 
+class UsuarioConHistorial(Exception):
+    """El usuario tiene historial -- filas en otras tablas de la familia con
+    FK a `usuarios(id)` (`turnos_caja.usuario_id` en libracore, ventas,
+    movimientos de caja) -- y no se puede borrar.
+
+    `UserRepository.delete()` la levanta traduciendo el `IntegrityError` que
+    tira el motor al violar esa FK, con `session.rollback()` **antes** de
+    propagarla: en PostgreSQL un error deja la transaccion abortada, y sin el
+    rollback el PROXIMO pedido sobre la misma sesion sale con "current
+    transaction is aborted", no solo este borrado.
+
+    En un `DELETE` sobre `usuarios` esa FK es la UNICA causa posible de
+    `IntegrityError` -- la tabla no tiene otra constraint que la UNIQUE de
+    `username`, y esa no se viola borrando una fila -- asi que `delete()`
+    atrapa `IntegrityError` entero, sin mirar el SQLSTATE (23503 en
+    PostgreSQL) ni el texto del driver (que en SQLite es "FOREIGN KEY
+    constraint failed"): no hace falta distinguir, y evita otro
+    `str(exc.orig)` fragil como el de `UsernameTaken` (ver su docstring, que
+    SI necesita distinguir porque ahi `IntegrityError` puede venir de mas de
+    una causa).
+    """
+
+
 def _to_json_dict(u: Usuario) -> dict:
     # `email` se agrego en v0.3.0. Es aditivo: los consumidores que no lo
     # esperaban lo ignoran. Se sumo porque Restolibra/Contalibra lo crean, lo
@@ -144,7 +167,14 @@ class UserRepository:
         with self.session_factory() as session:
             u = session.get(Usuario, uid)
             session.delete(u)
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                # Ver `UsuarioConHistorial`: en un DELETE de `usuarios` esta
+                # es la unica causa posible -- no hace falta distinguir el
+                # SQLSTATE/mensaje del driver.
+                raise UsuarioConHistorial(user_id) from exc
 
     def _require_uid(self, user_id: str) -> int:
         """Convierte el id de la URL a int y confirma que exista — un id

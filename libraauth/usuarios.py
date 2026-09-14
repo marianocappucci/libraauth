@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
-from .repository import UsernameTaken
+from .repository import UsernameTaken, UsuarioConHistorial
 
 if TYPE_CHECKING:
     from .repository import UserRepository
@@ -195,10 +195,10 @@ def build_users_router(
     | Username duplicado → 409                       | los ocho                    |
     | Rol inválido → 422 en el ALTA                  | los ocho                    |
     | Rol inválido → 422 en la EDICIÓN               | LibraDesk, VentaLibra,       |
-    |                                                 | LibraCargo/LibraClub (por   |
+    |                                                 | LibraCargo, LibraClub,      |
+    |                                                 | Gestiolibra, MedLibra (por  |
     |                                                 | `Literal` en el modelo).    |
-    |                                                 | Gestiolibra, MedLibra y     |
-    |                                                 | Contalibra dejaban escapar  |
+    |                                                 | Contalibra dejaba escapar   |
     |                                                 | el `ValueError` (500).      |
     | Contraseña ≥ 6 en el ALTA                      | sólo Contalibra/Restolibra  |
     | Contraseña ≥ 6 en el RESET de otro usuario     | ninguno (sólo no-vacía)     |
@@ -215,8 +215,7 @@ def build_users_router(
     Las dos últimas filas de la tabla de "contraseña" y la de "desactivar al
     único admin activo" son estrictamente MÁS estrictas que lo que tenía
     cualquier producto -- nadie pierde una protección al adoptar esto, y
-    Gestiolibra/MedLibra/Contalibra ganan la del rol inválido en la edición
-    que tenían rota.
+    Contalibra gana la del rol inválido en la edición que tenía rota.
     """
     router = APIRouter(prefix=prefix, tags=tags or ["usuarios"],
                         dependencies=[Depends(admin_guard)])
@@ -376,6 +375,12 @@ def build_users_router(
             usuarios.delete(user_id)
         except KeyError:
             raise HTTPException(404, f"no existe el usuario {user_id}") from None
+        except UsuarioConHistorial:
+            raise HTTPException(
+                409,
+                "el usuario tiene historial (turnos, ventas u otros "
+                "registros); desactivalo en lugar de borrarlo",
+            ) from None
         return Response(status_code=204)
 
     return router
