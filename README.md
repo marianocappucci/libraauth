@@ -496,7 +496,7 @@ completa en el docstring de `build_users_router` y en el ADR-018:
 |---|---|---|
 | Username duplicado | 409 | los ocho |
 | Rol inválido, alta | 422 | los ocho |
-| Rol inválido, edición | 422 | LibraDesk, VentaLibra, LibraCargo, LibraClub (Gestiolibra/MedLibra/Contalibra dejaban escapar un 500) |
+| Rol inválido, edición | 422 | LibraDesk, VentaLibra, LibraCargo, LibraClub, Gestiolibra, MedLibra (por `Literal` en el modelo, ya frenaba en Pydantic) (Contalibra dejaba escapar un 500) |
 | Contraseña < 6, alta | 422 | sólo Contalibra/Restolibra |
 | Contraseña < 6, reset ajeno | 422 | **nuevo** -- ninguno lo exigía |
 | No desactivarte/degradarte vos mismo | 409 | LibraCargo, LibraClub |
@@ -509,6 +509,13 @@ completa en el docstring de `build_users_router` y en el ADR-018:
 `200` con `{"ok": true}`: sus frontends propios -- no `Usuarios` de
 `libra-ui`, que no mira el cuerpo del borrado -- tienen que dejar de esperar
 ese cuerpo).
+
+Borrar un usuario con historial (una fila de otra tabla con FK a
+`usuarios(id)`, como `turnos_caja.usuario_id` en libracore/ventas/movimientos
+de caja) responde `409` con un mensaje que pide desactivarlo en vez de
+borrarlo -- `UserRepository.delete()` traduce el `IntegrityError` de la FK a
+`UsuarioConHistorial` (`libraauth.repository`), con rollback de la sesión
+antes de propagarla.
 
 **No incluye** `PUT /api/usuarios/me/password` (autoservicio de "Mi Cuenta"
 de Contalibra/Restolibra): es otra funcionalidad, con otro guard (cualquier

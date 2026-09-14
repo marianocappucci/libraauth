@@ -9,11 +9,11 @@ identidad de token (`id=None`, como `SERVICE_USER`/`PANEL_USER` de
 import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import ForeignKey, create_engine, event
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from libraauth.models import Base
+from libraauth.models import Base, Usuario
 from libraauth.repository import UserRepository
 from libraauth.testing import verificar_contrato_de_usuarios
 from libraauth.usuarios import (
@@ -204,6 +204,102 @@ def test_borrado_ok_204_y_desaparece(client):
 
 def test_borrado_usuario_inexistente_404(client):
     assert client.delete("/usuarios/999999").status_code == 404
+
+
+# ── Borrar un usuario con historial (FK desde otra tabla) da 409 ───────────
+
+
+class _HistorialBase(DeclarativeBase):
+    pass
+
+
+class TurnoCaja(_HistorialBase):
+    """Tabla de prueba que imita `turnos_caja.usuario_id REFERENCES
+    usuarios(id)` -- el caso real de libracore/ventas/movimientos de caja
+    que motiva `UsuarioConHistorial` (ver `repository.py`).
+
+    `ForeignKey(Usuario.id)` y no la forma en string ("usuarios.id"): la
+    tabla vive en una `DeclarativeBase` propia, sin la `MetaData` de
+    `libraauth.models.Base` -- pasar la `Column` directamente resuelve la FK
+    sin necesitar que las dos tablas compartan `MetaData`."""
+
+    __tablename__ = "turnos_caja"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    usuario_id: Mapped[int] = mapped_column(ForeignKey(Usuario.id), nullable=False)
+
+
+def _app_con_historial():
+    """Igual que `_app()`, pero con `turnos_caja` creada en el mismo engine y
+    `PRAGMA foreign_keys=ON` -- SQLite no lo prende solo, y sin esto el
+    `INSERT` con FK a un usuario borrado no fallaría nunca."""
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def _fk_on(dbapi_con, _con_record):
+        dbapi_con.cursor().execute("PRAGMA foreign_keys=ON")
+
+    Base.metadata.create_all(engine)
+    _HistorialBase.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    repo = UserRepository(session_factory, roles=ROLES)
+
+    app = FastAPI()
+    app.state.users = repo
+    app.state.actor = {"id": None, "username": "@servicio", "role": "admin", "active": True}
+    app.include_router(build_users_router(prefix="/usuarios", roles=ROLES, admin_guard=_admin_guard))
+    return app, repo, session_factory
+
+
+def test_borrar_usuario_con_historial_da_409_con_el_mensaje():
+    app, repo, session_factory = _app_con_historial()
+    usuario = repo.create(username="cajera", name="Cajera", password="s3cret1", role="staff")
+    with session_factory() as s:
+        s.add(TurnoCaja(usuario_id=int(usuario["id"])))
+        s.commit()
+    client = TestClient(app)
+
+    r = client.delete(f"/usuarios/{usuario['id']}")
+
+    assert r.status_code == 409
+    assert "historial" in r.json()["detail"]
+    assert "desactiv" in r.json()["detail"]
+
+
+def test_borrar_usuario_con_historial_no_lo_borra():
+    app, repo, session_factory = _app_con_historial()
+    usuario = repo.create(username="cajera2", name="Cajera Dos", password="s3cret1", role="staff")
+    with session_factory() as s:
+        s.add(TurnoCaja(usuario_id=int(usuario["id"])))
+        s.commit()
+    client = TestClient(app)
+
+    client.delete(f"/usuarios/{usuario['id']}")
+
+    assert client.get(f"/usuarios/{usuario['id']}").status_code == 200
+
+
+def test_borrar_usuario_con_historial_no_deja_la_sesion_inservible():
+    """Sin el `rollback()` de `UserRepository.delete()`, un pedido siguiente
+    sobre la misma app puede salir mal -- en PostgreSQL, directamente con
+    "current transaction is aborted". Este test corre sobre la MISMA app
+    (mismo `session_factory`) que el borrado fallido, para probar que un
+    pedido posterior funciona."""
+    app, repo, session_factory = _app_con_historial()
+    usuario = repo.create(username="cajera3", name="Cajera Tres", password="s3cret1", role="staff")
+    with session_factory() as s:
+        s.add(TurnoCaja(usuario_id=int(usuario["id"])))
+        s.commit()
+    client = TestClient(app)
+
+    assert client.delete(f"/usuarios/{usuario['id']}").status_code == 409
+
+    r = client.get("/usuarios")
+    assert r.status_code == 200
+    assert any(u["id"] == usuario["id"] for u in r.json())
 
 
 # ── Protecciones: no te podés desactivar/degradar/borrar a vos mismo ───────
