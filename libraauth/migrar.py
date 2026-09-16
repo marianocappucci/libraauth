@@ -123,8 +123,23 @@ def _url_de_instancia_de_libracore(prefijo, *, core, entorno):
     return url_de_instancia(prefijo, core=core, entorno=entorno)
 
 
+def _comparte_base_segun_libracore(prefijo) -> bool:
+    """`libracore.db.url_de_instancia.comparte_base_con_el_dominio`, importada tarde.
+
+    Es la lista de productos de **una sola base**, y vive en LibraCore (desde
+    `v1.103.0`) para que `libracore-migrar` y este comando no puedan divergir.
+    Con una LibraCore anterior, o sin LibraCore, la respuesta es **no**: el
+    default seguro es fallar, no caer a la base del dominio.
+    """
+    try:
+        from libracore.db.url_de_instancia import comparte_base_con_el_dominio
+    except ImportError:
+        return False
+    return comparte_base_con_el_dominio(prefijo)
+
+
 def url_de_auth(prefijo: str | None = None, base: str | None = None, entorno=None,
-                resolver=None) -> str:
+                resolver=None, comparte_base=None) -> str:
     """La base donde viven las tablas de auth de esta instancia.
 
     El orden es:
@@ -132,18 +147,23 @@ def url_de_auth(prefijo: str | None = None, base: str | None = None, entorno=Non
     1. `LIBRAAUTH_MIGRAR_URL`, la salida de emergencia explicita.
     2. Con `prefijo`, **`base` es obligatorio** (ver el docstring del modulo):
        - `dominio`: `<PREFIJO>_DATABASE_URL` y sus nombres historicos.
-       - `core`: `<PREFIJO>_LIBRACORE_DATABASE_URL` y los suyos; **si no esta
-         definida, la del dominio**. Es la misma regla que
-         `libracore.migrar.url_de_core`: que la variable del core no exista es
-         la señal de que el producto no separa las bases (Contalibra,
-         Restolibra), y ahi las dos son la misma.
+       - `core`: `<PREFIJO>_LIBRACORE_DATABASE_URL` y los suyos. **Si no esta
+         definida, cae a la del dominio SOLO en un producto de una sola base**
+         (la lista de LibraCore: Contalibra, Restolibra, VentaLibra, LibraDesk).
+         En cualquier otro **falla**: en Gestiolibra o MedLibra, que llevan el
+         core aparte, la caida crearia las tablas de auth en la base del
+         dominio y devolveria exito. Es la misma regla que
+         `libracore.migrar.url_de_core` desde LibraCore `v1.103.0`
+         (2026-09-16); hasta ese dia las dos caian siempre.
        Un prefijo que no resuelve **falla**, no cae a `DATABASE_URL`.
     3. Sin `prefijo`: `DATABASE_URL`, que es el caso de un script en el host.
 
-    `resolver` existe para los tests: por defecto es la funcion de LibraCore.
+    `resolver` y `comparte_base` existen para los tests: por defecto son las
+    funciones de LibraCore.
     """
     env = os.environ if entorno is None else entorno
     resolver = resolver or _url_de_instancia_de_libracore
+    comparte_base = comparte_base or _comparte_base_segun_libracore
 
     explicita = (env.get("LIBRAAUTH_MIGRAR_URL") or "").strip()
     if explicita:
@@ -162,6 +182,16 @@ def url_de_auth(prefijo: str | None = None, base: str | None = None, entorno=Non
             del_core = resolver(prefijo, core=True, entorno=env)
             if del_core:
                 return del_core
+            if not comparte_base(prefijo):
+                raise SinURL(
+                    f"No hay base de LibraCore para el prefijo '{prefijo}' (--base "
+                    f"core): falta {prefijo.upper()}_LIBRACORE_DATABASE_URL (o su "
+                    "nombre historico). No se cae a la del dominio porque este "
+                    "producto no figura como de una sola base en LibraCore "
+                    "(`comparte_base_con_el_dominio`, desde v1.103.0): ahi las "
+                    "tablas de auth quedarian en la base equivocada sin fallar. "
+                    "Defini la variable, o pasa el destino por LIBRAAUTH_MIGRAR_URL."
+                )
         del_dominio = resolver(prefijo, core=False, entorno=env)
         if del_dominio:
             return del_dominio
