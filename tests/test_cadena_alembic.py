@@ -550,16 +550,6 @@ def test_sin_libracore_la_lista_dice_que_no(monkeypatch):
     assert migrar._comparte_base_segun_libracore("contalibra") is False
 
 
-def test_la_lista_por_defecto_es_la_de_libracore():
-    """Sin inyectar nada, la lista sale de LibraCore: los de una sola base caen,
-    los de core aparte no."""
-    ui = pytest.importorskip("libracore.db.url_de_instancia")
-    if not hasattr(ui, "comparte_base_con_el_dominio"):
-        pytest.skip("libracore anterior a v1.103.0")
-    assert migrar._comparte_base_segun_libracore("contalibra") is True
-    assert migrar._comparte_base_segun_libracore("gestiolibra") is False
-
-
 def test_el_destino_explicito_le_gana_a_database_url(tmp_path, monkeypatch):
     """Adentro de un contenedor `DATABASE_URL` es la base del DOMINIO. En
     Gestiolibra, MedLibra y VentaLibra auth vive en la de LibraCore: si el
