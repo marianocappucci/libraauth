@@ -461,6 +461,11 @@ def test_importar_libraauth_no_trae_alembic():
 # ── Resolucion del destino ───────────────────────────────────────────────────
 
 
+def _comparte_base(prefijo):
+    """Lo que hace `libracore.db.url_de_instancia.comparte_base_con_el_dominio`."""
+    return prefijo == "una"
+
+
 def _resolver(prefijo, *, core, entorno):
     """Lo que hace `libracore.db.url_de_instancia` con el nombre normalizado."""
     p = prefijo.upper()
@@ -475,8 +480,9 @@ DOS_BASES = {"GL_DATABASE_URL": "postgresql://dominio", "GL_LIBRACORE_DATABASE_U
     (DOS_BASES, "gl", "core", "postgresql://core"),
     # 🔴 LibraCargo/LibraClub: tienen base de LibraCore y auth va en la del dominio.
     (DOS_BASES, "gl", "dominio", "postgresql://dominio"),
-    # Contalibra/Restolibra: sin variable del core, "core" es la unica base.
-    ({"GL_DATABASE_URL": "postgresql://unica"}, "gl", "core", "postgresql://unica"),
+    # Contalibra/Restolibra: sin variable del core, "core" es la unica base
+    # (el prefijo "una" figura como de una sola base, ver `_comparte_base`).
+    ({"UNA_DATABASE_URL": "postgresql://unica"}, "una", "core", "postgresql://unica"),
     # La salida de emergencia gana a todo.
     ({**DOS_BASES, "LIBRAAUTH_MIGRAR_URL": "postgresql://explicita"}, "gl", "core",
      "postgresql://explicita"),
@@ -484,7 +490,8 @@ DOS_BASES = {"GL_DATABASE_URL": "postgresql://dominio", "GL_LIBRACORE_DATABASE_U
     ({"DATABASE_URL": "postgresql://host"}, None, None, "postgresql://host"),
 ])
 def test_url_de_auth(entorno, prefijo, base, esperada):
-    assert migrar.url_de_auth(prefijo, base, entorno=entorno, resolver=_resolver) == esperada
+    assert migrar.url_de_auth(prefijo, base, entorno=entorno, resolver=_resolver,
+                              comparte_base=_comparte_base) == esperada
 
 
 @pytest.mark.parametrize("entorno,prefijo,base", [
@@ -496,7 +503,61 @@ def test_url_de_auth(entorno, prefijo, base, esperada):
 ])
 def test_url_de_auth_falla_en_vez_de_adivinar(entorno, prefijo, base):
     with pytest.raises(migrar.SinURL):
-        migrar.url_de_auth(prefijo, base, entorno=entorno, resolver=_resolver)
+        migrar.url_de_auth(prefijo, base, entorno=entorno, resolver=_resolver,
+                           comparte_base=_comparte_base)
+
+
+# ── La caida de --base core al dominio (2026-09-16) ──────────────────────────
+
+
+def test_base_core_sin_variable_del_core_FALLA_en_un_producto_de_core_aparte():
+    """🔴 El defecto que se cierra, gemelo del de `libracore.migrar.url_de_core`.
+    Gestiolibra sin su variable del core: la regla vieja caia al dominio y
+    creaba las tablas de auth ahi, **sin fallar**."""
+    entorno = {"GL_DATABASE_URL": "postgresql://dominio"}
+    with pytest.raises(migrar.SinURL, match="una sola base"):
+        migrar.url_de_auth("gl", "core", entorno=entorno, resolver=_resolver,
+                           comparte_base=_comparte_base)
+
+
+def test_base_core_con_variable_del_core_no_consulta_la_lista():
+    """Control: el caso normal no depende de la lista."""
+    def explota(prefijo):
+        raise AssertionError("no tenia que consultarse")
+    assert migrar.url_de_auth("gl", "core", entorno=DOS_BASES, resolver=_resolver,
+                              comparte_base=explota) == "postgresql://core"
+
+
+def test_base_dominio_no_depende_de_la_lista():
+    """Control: `--base dominio` (LibraCargo, LibraClub, LibraDesk, Contalibra,
+    Restolibra) no cambia."""
+    entorno = {"GL_DATABASE_URL": "postgresql://dominio"}
+    assert migrar.url_de_auth("gl", "dominio", entorno=entorno, resolver=_resolver,
+                              comparte_base=lambda p: False) == "postgresql://dominio"
+
+
+def test_la_salida_de_emergencia_sigue_ganando_con_base_core():
+    entorno = {"GL_DATABASE_URL": "postgresql://dominio",
+               "LIBRAAUTH_MIGRAR_URL": "postgresql://explicita"}
+    assert migrar.url_de_auth("gl", "core", entorno=entorno, resolver=_resolver,
+                              comparte_base=lambda p: False) == "postgresql://explicita"
+
+
+def test_sin_libracore_la_lista_dice_que_no(monkeypatch):
+    """El default seguro: si no se puede preguntar, no se cae al dominio. Se
+    simula una LibraCore ausente (o anterior a v1.103.0) tapando el modulo."""
+    monkeypatch.setitem(sys.modules, "libracore.db.url_de_instancia", None)
+    assert migrar._comparte_base_segun_libracore("contalibra") is False
+
+
+def test_la_lista_por_defecto_es_la_de_libracore():
+    """Sin inyectar nada, la lista sale de LibraCore: los de una sola base caen,
+    los de core aparte no."""
+    ui = pytest.importorskip("libracore.db.url_de_instancia")
+    if not hasattr(ui, "comparte_base_con_el_dominio"):
+        pytest.skip("libracore anterior a v1.103.0")
+    assert migrar._comparte_base_segun_libracore("contalibra") is True
+    assert migrar._comparte_base_segun_libracore("gestiolibra") is False
 
 
 def test_el_destino_explicito_le_gana_a_database_url(tmp_path, monkeypatch):
