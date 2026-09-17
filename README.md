@@ -448,6 +448,24 @@ libraauth-migrar diferencias --prefijo P --base B  # mide, no cambia nada
   con columnas `TEXT`: eso lo mide `diferencias`.
 - **Adoptarla es opcional.** Subir el pin sin declararla no cambia nada: el
   arranque sigue con `create_all()` y alembic no se importa.
+
+### El arranque exige la cadena, en vez de crear las tablas (v0.45.0, 2026-09-17)
+
+Con la cadena adoptada en los ocho productos, el `create_all()` del arranque
+sólo tapa un camino que se olvidó de migrar. Se reemplaza por una guarda que
+**no crea nada**:
+
+```python
+from libraauth.migrar import exigir_schema_al_dia
+
+exigir_schema_al_dia(engine_de_auth, prefijo="libracargo", base="dominio")
+```
+
+Si `alembic_version_libraauth` no existe, está vacía o no está en la cabeza,
+levanta `SchemaDesactualizado` con el comando a correr (y, para una base sin
+versión, recuerda que la baseline adopta un respaldo anterior al 2026-09-16 sin
+tocar sus tablas). En las suites, `libraauth.testing.crear_schema_de_auth(url o
+engine)` deja la base como el deploy: la cadena en la cabeza.
 - **Todo cambio de schema es modelo + revision nueva**, en el mismo commit:
   `alembic revision --autogenerate -m "..."` parado en la raiz, con
   `DATABASE_URL` apuntando a una base en la cabeza. `test_modelo_y_cadena_coinciden`

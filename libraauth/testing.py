@@ -122,3 +122,30 @@ def verificar_contrato_de_usuarios(
 
     releido = client.get(f"{path}/{user_id}", **kw)
     assert releido.status_code == 404, (releido.status_code, releido.json())
+
+
+def crear_schema_de_auth(destino) -> str:
+    """Deja la base de auth como la deja el deploy: la cadena en la cabeza.
+
+    Reemplaza, en los tests, al `AuthBase.metadata.create_all(engine)` que los
+    productos usaban para armar las seis tablas. Desde v0.45.0 el arranque exige
+    la tabla de versión (`libraauth.migrar.exigir_schema_al_dia`), y
+    `create_all` no la crea. El resultado de la cadena es el mismo que el del
+    modelo —lo fija `test_modelo_y_cadena_coinciden`— más la versión.
+
+    `destino` es una URL o un `Engine`. Un SQLite **en memoria** no sirve: la
+    cadena abre su propia conexión y vería otra base vacía. Importa alembic
+    recién al llamarla (extra `[migrations]`).
+    """
+    from libraauth import migrar
+
+    url = destino
+    if not isinstance(destino, str):
+        url = destino.url.render_as_string(hide_password=False)
+    if url.startswith("sqlite") and (":memory:" in url or url.rstrip("/") in ("sqlite:", "sqlite://")):
+        raise ValueError(
+            "crear_schema_de_auth no puede migrar un SQLite en memoria: la cadena "
+            "abre otra conexión. Usá un archivo o un PostgreSQL."
+        )
+    migrar.upgrade(url)
+    return migrar.cabeza()
