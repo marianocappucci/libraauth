@@ -445,6 +445,92 @@ def test_el_modo_offline_falla_en_vez_de_mentir(tmp_path):
         command.upgrade(cfg, "head", sql=True)
 
 
+# ── La guarda del arranque (v0.45.0) ─────────────────────────────────────────
+
+
+def test_exigir_pasa_despues_de_la_cadena(fabrica):
+    url = fabrica()
+    migrar.upgrade(url)
+    assert migrar.exigir_schema_al_dia(_engine(url)) == HEAD
+
+
+def test_exigir_falla_sobre_una_base_sin_migrar_y_dice_el_comando(fabrica):
+    """🔴 El control negativo: una base vacía, sin tabla de versión."""
+    url = fabrica()
+    with pytest.raises(migrar.SchemaDesactualizado) as e:
+        migrar.exigir_schema_al_dia(_engine(url), prefijo="libracargo", base="dominio")
+    msg = str(e.value)
+    assert "libraauth-migrar upgrade --prefijo libracargo --base dominio" in msg
+    assert "anterior al 2026-09-16" in msg, "nombra el caso del respaldo viejo"
+    assert not _tablas(url) & TABLAS, "la guarda no crea nada"
+
+
+def test_exigir_falla_sobre_la_forma_de_create_all_sin_version(fabrica):
+    """Lo que dejaba el arranque de antes: las seis tablas, sin versión. Es
+    exactamente lo que la guarda tiene que rechazar, y la baseline adoptar."""
+    url = fabrica()
+    Base.metadata.create_all(_engine(url))
+    with pytest.raises(migrar.SchemaDesactualizado):
+        migrar.exigir_schema_al_dia(_engine(url))
+    migrar.upgrade(url)
+    assert migrar.exigir_schema_al_dia(_engine(url)) == HEAD
+
+
+def test_exigir_falla_sobre_una_revision_vieja(fabrica):
+    """La base registra una revisión que no es la cabeza."""
+    url = fabrica()
+    migrar.upgrade(url)
+    e = _engine(url)
+    with e.begin() as c:
+        c.execute(text(f"UPDATE {migrar.TABLA_DE_VERSION} SET version_num = '0000_vieja'"))
+    with pytest.raises(migrar.SchemaDesactualizado, match="0000_vieja"):
+        migrar.exigir_schema_al_dia(e, prefijo="gestiolibra", base="core")
+
+
+def test_exigir_falla_cuando_el_paquete_trae_una_cabeza_nueva(fabrica, monkeypatch):
+    """El caso real de mañana: sube el pin con una `0002` y el deploy no migró."""
+    url = fabrica()
+    migrar.upgrade(url)
+    monkeypatch.setattr(migrar, "cabeza", lambda: "0002_futura")
+    with pytest.raises(migrar.SchemaDesactualizado, match=f"{HEAD}.*0002_futura"):
+        migrar.exigir_schema_al_dia(_engine(url))
+
+
+def test_exigir_con_la_tabla_de_version_vacia_es_sin_migrar(fabrica):
+    url = fabrica()
+    migrar.upgrade(url)
+    e = _engine(url)
+    with e.begin() as c:
+        c.execute(text(f"DELETE FROM {migrar.TABLA_DE_VERSION}"))
+    assert migrar.revision_actual(e) is None
+    with pytest.raises(migrar.SchemaDesactualizado, match="no existe o está vacía"):
+        migrar.exigir_schema_al_dia(e)
+
+
+def test_la_cabeza_es_la_de_la_cadena():
+    assert migrar.cabeza() == HEAD
+
+
+def test_crear_schema_de_auth_con_url_y_con_engine(fabrica):
+    from libraauth.testing import crear_schema_de_auth
+
+    url = fabrica()
+    assert crear_schema_de_auth(url) == HEAD
+    assert TABLAS <= _tablas(url)
+    otra = fabrica()
+    assert crear_schema_de_auth(_engine(otra)) == HEAD
+    assert migrar.exigir_schema_al_dia(_engine(otra)) == HEAD
+
+
+def test_crear_schema_de_auth_rechaza_sqlite_en_memoria():
+    from libraauth.testing import crear_schema_de_auth
+
+    with pytest.raises(ValueError, match="en memoria"):
+        crear_schema_de_auth("sqlite:///:memory:")
+    with pytest.raises(ValueError, match="en memoria"):
+        crear_schema_de_auth(create_engine("sqlite://"))
+
+
 def test_importar_libraauth_no_trae_alembic():
     """Un producto que sube el pin sin adoptar la cadena no tiene por que tener
     alembic: importar el paquete —y hasta `migrar`— no lo carga. En un proceso

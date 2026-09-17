@@ -40,6 +40,11 @@ tocar. Por eso aca la base se nombra, no se deduce.
 🔑 **`script_location` se resuelve desde `__file__`, no desde el cwd**: es la
 diferencia entre andar en el repo y andar en `site-packages`.
 
+🔑 **El arranque ya no crea las tablas (2026-09-17, v0.45.0).** Los productos
+llaman a `exigir_schema_al_dia(engine)` en lugar de `create_all()`: si la cadena
+no corrió, la app no levanta y el error dice el comando. Para las suites está
+`libraauth.testing.crear_schema_de_auth`.
+
 **Nada de esto se importa al importar `libraauth`**, y alembic se importa recien
 al correr un comando: un producto que sube el pin sin adoptar la cadena no
 necesita alembic en su imagen y arranca exactamente igual que antes.
@@ -67,6 +72,10 @@ class SinURL(RuntimeError):
 
 class SinAlembic(RuntimeError):
     """Falta el extra `[migrations]`, que es quien trae alembic."""
+
+
+class SchemaDesactualizado(RuntimeError):
+    """La base de auth no está en la cabeza de la cadena: el arranque no sigue."""
 
 
 def _comandos():
@@ -231,6 +240,73 @@ def configuracion(destino: str):
     cfg.set_main_option("libraauth.url", normalizado.replace("%", "%%"))
     cfg.set_main_option("sqlalchemy.url", normalizado.replace("%", "%%"))
     return cfg
+
+
+def cabeza() -> str:
+    """La revisión cabeza de la cadena que viaja en este paquete.
+
+    Importa alembic recién acá, igual que `_comandos`: el producto que llama a
+    `exigir_schema_al_dia` en su arranque ya tiene el extra `[migrations]`
+    instalado —lo exige correr la cadena en el deploy—.
+    """
+    try:
+        from alembic.script import ScriptDirectory
+    except ModuleNotFoundError as e:  # pragma: no cover - depende del entorno
+        raise SinAlembic(
+            "Falta alembic para leer la cabeza de la cadena: instala "
+            "`libraauth[migrations]`."
+        ) from e
+    cabezas = ScriptDirectory(str(DIRECTORIO)).get_heads()
+    if len(cabezas) != 1:  # pragma: no cover - lo cubre test_una_sola_cabeza
+        raise RuntimeError(f"La cadena de libraauth tiene {len(cabezas)} cabezas: {cabezas}")
+    return cabezas[0]
+
+
+def revision_actual(engine) -> str | None:
+    """La revisión registrada en `alembic_version_libraauth`, o `None` si la
+    tabla no existe o está vacía. No crea nada."""
+    from sqlalchemy import inspect, text
+
+    if not inspect(engine).has_table(TABLA_DE_VERSION):
+        return None
+    with engine.connect() as conn:
+        fila = conn.execute(text(f"SELECT version_num FROM {TABLA_DE_VERSION}")).first()
+    return fila[0] if fila else None
+
+
+def exigir_schema_al_dia(engine, *, prefijo: str | None = None,
+                         base: str | None = None) -> str:
+    """Falla si la base de auth no está en la cabeza de la cadena. **No crea nada.**
+
+    Reemplaza al `AuthBase.metadata.create_all(engine)` que cada producto corría
+    al arrancar (2026-09-17). Desde que los ocho corren `libraauth-migrar` en el
+    deploy, en el `command:` de dev y en el alta, el `create_all` del arranque
+    sólo servía para **tapar** un camino que se olvidó de migrar: la app
+    levantaba con las tablas de la forma del modelo y sin versión, y el próximo
+    cambio de schema no tenía de dónde partir. Con esto la app no arranca y el
+    error dice qué correr — el mismo criterio de fallar cerrado de LibraCargo
+    con `init_core_schema()`.
+
+    `prefijo` y `base` sólo arman el comando del mensaje. Devuelve la revisión.
+    """
+    actual = revision_actual(engine)
+    esperada = cabeza()
+    if actual == esperada:
+        return actual
+    comando = (f"libraauth-migrar upgrade --prefijo {prefijo} --base {base}"
+               if prefijo and base else
+               "libraauth-migrar upgrade --prefijo <producto> --base core|dominio")
+    if actual is None:
+        raise SchemaDesactualizado(
+            f"La base de auth no tiene la cadena de libraauth ({TABLA_DE_VERSION} no "
+            f"existe o está vacía). Corré `{comando}` antes de arrancar. Si es una "
+            "base restaurada de un respaldo anterior al 2026-09-16, la baseline "
+            f"{esperada} la adopta sin tocar las tablas que ya tiene."
+        )
+    raise SchemaDesactualizado(
+        f"La base de auth está en la revisión {actual} y este libraauth espera "
+        f"{esperada}. Corré `{comando}` antes de arrancar."
+    )
 
 
 def upgrade(destino: str, revision: str = "head") -> None:
