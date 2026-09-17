@@ -44,13 +44,14 @@ from libraauth.models import (
     Base,
     DemoCodigo,
     PasswordResetToken,
+    SecretoInstancia,
     SmtpSettings,
     Usuario,
 )
 from libraauth.repository import UserRepository
 
 POSTGRES_URL = os.environ.get("LIBRAAUTH_POSTGRES_URL", "")
-HEAD = "0001_baseline_libraauth"
+HEAD = "0002_secretos_instancia"
 TABLAS = set(Base.metadata.tables)
 #: El id de la cabeza de LibraCore (`origin/develop`, 2026-09-11) — el id, no el
 #: nombre del archivo, que es mas largo. El valor da igual: lo que se mide es
@@ -149,7 +150,7 @@ def _filas(url, tablas=TABLAS):
         existentes = set(inspect(e).get_table_names())
         with e.connect() as c:
             return {
-                t: [tuple(f) for f in c.execute(text(f'SELECT * FROM "{t}" ORDER BY id'))]
+                t: [tuple(f) for f in c.execute(text(f'SELECT * FROM "{t}" ORDER BY 1'))]
                 for t in sorted(tablas & existentes)
             }
     finally:
@@ -166,7 +167,7 @@ def _version(url, tabla=migrar.TABLA_DE_VERSION):
 
 
 def _sembrar(url):
-    """Una fila en cada una de las seis tablas, por el ORM — como las escribe
+    """Una fila en cada una de las siete tablas, por el ORM — como las escribe
     un producto. Sin filas, "no se perdio nada" se cumple solo."""
     e = _engine(url)
     ahora = datetime(2026, 9, 11, 10, 30)
@@ -186,6 +187,10 @@ def _sembrar(url):
                            usos_max=10, usos=2, revocado=False),
                 AceptacionTerminos(usuario_id=u.id, username="ana", nombre="Ana",
                                    version="v1", hash_texto="c" * 64, aceptado_at=ahora),
+                # El valor es un blob de mentira a proposito: esta fixture mide
+                # que la fila sobreviva, no que se pueda descifrar.
+                SecretoInstancia(clave="mp_access_token", valor_cifrado="v1:blob",
+                                 actualizado_at=ahora),
             ])
             s.commit()
     finally:
