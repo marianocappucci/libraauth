@@ -522,6 +522,33 @@ def test_crear_schema_de_auth_con_url_y_con_engine(fabrica):
     assert migrar.exigir_schema_al_dia(_engine(otra)) == HEAD
 
 
+def test_crear_schema_de_auth_despues_de_un_drop_all_rehace_las_tablas(fabrica):
+    """🔴 El patrón de las suites: `drop_all` borra las seis tablas y deja la
+    versión en la cabeza. Sin la detección, el `upgrade` no hace nada."""
+    from libraauth.testing import crear_schema_de_auth
+
+    url = fabrica()
+    crear_schema_de_auth(url)
+    Base.metadata.drop_all(_engine(url))
+    assert not _tablas(url) & TABLAS
+    assert migrar.revision_actual(_engine(url)) == HEAD, "la versión sobrevive al drop_all"
+    assert crear_schema_de_auth(url) == HEAD
+    assert TABLAS <= _tablas(url)
+    assert migrar.exigir_schema_al_dia(_engine(url)) == HEAD
+
+
+def test_crear_schema_de_auth_dos_veces_no_toca_los_datos(fabrica):
+    """Control: con las tablas presentes no se descarta nada."""
+    from libraauth.testing import crear_schema_de_auth
+
+    url = fabrica()
+    crear_schema_de_auth(url)
+    _sembrar(url)
+    antes = _filas(url)
+    crear_schema_de_auth(url)
+    assert _filas(url) == antes
+
+
 def test_crear_schema_de_auth_rechaza_sqlite_en_memoria():
     from libraauth.testing import crear_schema_de_auth
 

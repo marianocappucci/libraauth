@@ -136,8 +136,18 @@ def crear_schema_de_auth(destino) -> str:
     `destino` es una URL o un `Engine`. Un SQLite **en memoria** no sirve: la
     cadena abre su propia conexión y vería otra base vacía. Importa alembic
     recién al llamarla (extra `[migrations]`).
+
+    🔴 **Es idempotente también después de un `drop_all` (v0.45.1).** Las suites
+    vacían auth con `AuthBase.metadata.drop_all(engine)`, que borra las seis
+    tablas pero NO `alembic_version_libraauth`. Sobre esa base la cadena ya
+    "está en la cabeza" y un `upgrade` no hace nada: las tablas quedarían
+    faltando. Si falta alguna tabla del modelo, se descarta la versión y se
+    vuelve a correr la cadena.
     """
+    from sqlalchemy import create_engine, inspect, pool, text
+
     from libraauth import migrar
+    from libraauth.models import Base
 
     url = destino
     if not isinstance(destino, str):
@@ -147,5 +157,14 @@ def crear_schema_de_auth(destino) -> str:
             "crear_schema_de_auth no puede migrar un SQLite en memoria: la cadena "
             "abre otra conexión. Usá un archivo o un PostgreSQL."
         )
+    engine = create_engine(migrar.normalizar_url(url), poolclass=pool.NullPool)
+    try:
+        existentes = set(inspect(engine).get_table_names())
+        if (migrar.TABLA_DE_VERSION in existentes
+                and not set(Base.metadata.tables) <= existentes):
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE {migrar.TABLA_DE_VERSION}"))
+    finally:
+        engine.dispose()
     migrar.upgrade(url)
     return migrar.cabeza()
