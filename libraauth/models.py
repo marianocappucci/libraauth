@@ -351,3 +351,90 @@ class AceptacionTerminos(Base):
     )
     ip: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     user_agent: Mapped[str] = mapped_column(String(400), nullable=False, default="")
+
+
+class SecretoInstancia(Base):
+    """Un secreto de terceros de la instancia, cifrado en reposo (v0.46.0).
+
+    **Por que existe, y por que aca.** Hasta el 2026-09-17 los tres secretos que
+    administra `libracore.config_manager` —el `mp_access_token` y el
+    `mp_webhook_secret` de MercadoPago, y la `email_smtp_password`— vivian en
+    `DATA_DIR/config.json`, en **texto plano**. No fue una decision: no hay en
+    el codigo ninguna razon tecnica para que estuvieran ahi y no en la base, y
+    la pagina del wiki que hace de censo de secretos en reposo ni siquiera los
+    nombraba. Lo que tapaba el hueco es que `mp_config_router` enmascara el
+    token en la respuesta HTTP — o sea que el problema se penso y se resolvio
+    **en la capa en que el dato se mira**, y en la capa en que se guarda no
+    habia nada.
+
+    La alternativa era cifrar adentro del propio JSON. Se descarto a proposito:
+    habria sido un **cuarto** mecanismo de cifrado en el parque, con su propio
+    formato, su propio ciclo de rotacion y su propia sonda. Aca ya viven el
+    AES-GCM con HKDF de `SECRET_KEY` (ver `crypto.py`), el ciclo de
+    `LIBRAAUTH_CLAVES_ANTERIORES` con `recifrar()`, y la sonda que pregunta si
+    la clave de hoy todavia puede leer lo guardado.
+
+    ## Por que ESTA si es una tabla clave/valor y `smtp_settings` no
+
+    `SmtpSettings` dice explicitamente que no es una tabla generica de pares
+    *"a proposito: son seis campos con tipo y semantica propia, y una tabla de
+    pares los volveria strings sueltos sin validacion"*. Eso sigue siendo
+    cierto alla y no se contradice aca, porque lo que entra en esta tabla es lo
+    contrario: **valores opacos y homogeneos**. Un access token, una firma de
+    webhook y una contrasena son, para este paquete, la misma cosa —un string
+    que se cifra, se guarda y se devuelve sin interpretar— y no hay ningun
+    campo que validar. Darle una columna propia a cada uno obligaria a cambiar
+    el schema de los ocho productos cada vez que aparece un secreto nuevo, que
+    es justo el caso que esta tabla tiene que absorber.
+
+    🔴 **Solo entran valores CIFRADOS.** No es un `config` generico: si algo no
+    es un secreto no va aca, va donde ya estaba. La columna se llama
+    `valor_cifrado` por la misma razon que `password_cifrada`: quien abra un
+    backup con un visor de SQLite tiene que ver de inmediato que ese valor no
+    sirve tal cual.
+
+    ## Que pasa al rotar `SECRET_KEY`
+
+    Lo mismo que con la contrasena SMTP, y esa es la ganancia entera de haber
+    movido el secreto aca: deja de poder descifrarse, `SecretosRepository.get()`
+    lo trata como "sin configurar" para que la app siga levantando, `estado()`
+    lo reporta como indescifrable para que la sonda lo vea, y declarar el valor
+    viejo en `LIBRAAUTH_CLAVES_ANTERIORES` mas un `recifrar()` cierra el ciclo
+    sin perder nada. En `config.json` no habia ninguna de esas cuatro cosas.
+
+    Vive en el mismo `Base` que `Usuario` por la razon de siempre: los
+    consumidores corren `Base.metadata.create_all(engine)` una sola vez, contra
+    el engine donde esta `usuarios`, asi que al subir el pin la tabla aparece
+    sola en el proximo arranque.
+
+    ⚠️ **Pero con eso solo no alcanza, aunque las tablas de arriba digan que
+    si.** Los docstrings de `DemoCodigo` y `AceptacionTerminos` cierran con *"de
+    eso sale que no necesita migracion"*, y era cierto cuando se escribieron:
+    este paquete no tenia cadena propia. Ahora la tiene, y
+    `test_modelo_y_cadena_coinciden` la compara contra estos modelos — o sea que
+    una tabla nueva **necesita su revision**, y esta la tiene en
+    `migrations/versions/0002_secretos_instancia.py`. Los dos caminos conviven:
+    cada uno crea la tabla solo si falta, y ninguno pisa al otro.
+    """
+
+    __tablename__ = "secretos_instancia"
+
+    #: El nombre del secreto. Es la PK: un secreto, una fila. Con un `id`
+    #: autoincremental un bug podria dejar dos filas para `mp_access_token` y
+    #: la app usaria cualquiera de las dos segun el orden de lectura — el mismo
+    #: motivo por el que `smtp_settings` tiene su `id` fijo en 1.
+    clave: Mapped[str] = mapped_column(String(100), primary_key=True)
+    #: El blob de `crypto.cifrar()`: `v1:<base64(nonce || ciphertext || tag)>`.
+    #: Texto y no `String(n)` — crece con el largo del secreto, y ponerle un
+    #: techo arbitrario solo puede truncar una credencial larga.
+    valor_cifrado: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    #: Cuando se guardo por ultima vez. **No** dice cuando se roto la clave que
+    #: lo cifra: eso lo contesta `estado()`, preguntandole a `crypto` si el
+    #: valor se lee con la vigente. Un timestamp no puede saberlo.
+    #:
+    #: Hora local por el mismo motivo que `auth_log.ts` y `aceptaciones_terminos`:
+    #: las tablas de este paquete se leen juntas cuando alguien reconstruye que
+    #: paso, y una en UTC quedaria tres horas corrida contra las otras.
+    actualizado_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.now, server_default=ahora_local()
+    )
