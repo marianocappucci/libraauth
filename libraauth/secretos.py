@@ -1,5 +1,5 @@
 """
-Almacen de secretos de terceros de la instancia, cifrados en reposo (v0.39.0).
+Almacen de secretos de terceros de la instancia, cifrados en reposo (v0.46.0).
 
 **Que problema resuelve.** El 2026-09-17 se midio que los tres secretos que
 administra `libracore.config_manager` —`mp_access_token`, `mp_webhook_secret` y

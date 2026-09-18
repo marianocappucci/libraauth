@@ -1,4 +1,4 @@
-"""Tests del almacen de secretos de instancia (v0.39.0).
+"""Tests del almacen de secretos de instancia (v0.46.0).
 
 Lo que estos tests existen para fijar, en orden de importancia:
 

@@ -354,7 +354,7 @@ class AceptacionTerminos(Base):
 
 
 class SecretoInstancia(Base):
-    """Un secreto de terceros de la instancia, cifrado en reposo (v0.39.0).
+    """Un secreto de terceros de la instancia, cifrado en reposo (v0.46.0).
 
     **Por que existe, y por que aca.** Hasta el 2026-09-17 los tres secretos que
     administra `libracore.config_manager` —el `mp_access_token` y el
