@@ -554,3 +554,33 @@ wiki (entidad `libraauth`).
   la transacción abortada), y el router responde `409` pidiendo desactivar
   al usuario en vez de borrarlo.
 
+## ADR-019 — Los campos numéricos de entrada rechazan booleanos, con una guarda propia
+
+- Estado: aceptada
+- Fecha: 2026-10-04
+- Contexto: `PUT /admin/smtp` aceptaba `{"port": true}`: Pydantic, en modo laxo,
+  convierte `true` en `1` y `false` en `0` en un campo `int` (un `bool` es un
+  `int` para Python), y el puerto `1` se guardaba en la configuración SMTP sin
+  que nadie lo validara -- el rango del puerto se mira en
+  `SmtpSettingsRepository.save`, ya con el número convertido, y `1` pasa.
+  Lo detectó la guardia de booleanos del motor (libracommerce, ADR-028). Medido
+  con Pydantic 2.13.5: los tres campos numéricos de entrada de este paquete
+  tenían el mismo defecto: `_SmtpSettingsIn.port`, `_DemoCodigoIn.dias` y
+  `_DemoCodigoIn.usos_max` (con `true` el alta de un código de demo "andaba" y
+  emitía uno de 1 día y 1 uso). Los modelos de `usuarios.py` y `terminos.py`
+  no tienen campos numéricos de entrada.
+- Decisión: una guarda mínima y PROPIA, `_sin_booleano()` en
+  `libraauth/session_auth.py`, enganchada con `@field_validator(..., mode="before")`
+  en esos tres campos. Rechaza un `bool` con «<campo> tiene que ser un número,
+  no un booleano» y sale por el `422` normal de Pydantic/FastAPI. Un entero, un
+  texto numérico (`"587"`) y el campo omitido siguen valiendo como antes; el
+  rango del puerto y el mínimo de `dias`/`usos_max` siguen donde estaban.
+- Por qué acá y no importando la del motor: `libraauth` es la capa de abajo --
+  `libracore` lo declara como dependencia -- y no puede importar de `libracore`
+  ni de `libracommerce`. Duplicar cinco líneas es más barato que invertir la
+  dependencia. Si el motor llegara a vivir en un paquete que `libraauth` pueda
+  consumir, esta guarda se reemplaza por la compartida.
+- Consecuencias: un cliente que mandaba `true`/`false` en estos campos (un
+  error, no un uso legítimo) ahora recibe `422`. Un modelo nuevo con un campo
+  numérico de entrada tiene que usar el mismo patrón; los tests de
+  `test_smtp_settings.py` y `test_demo_codigos.py` fijan los tres casos.

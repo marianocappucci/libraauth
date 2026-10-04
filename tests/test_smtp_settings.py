@@ -381,6 +381,43 @@ def test_put_con_host_vacio_da_422(session_factory):
     assert r.status_code == 422
 
 
+@pytest.mark.parametrize("valor", [True, False])
+def test_put_con_port_booleano_da_422_y_no_cambia_lo_guardado(session_factory, valor):
+    """🔴 Pydantic convertia `true` en el puerto 1 y `false` en el 0 antes de
+    que nadie lo mirara, y se guardaba. Se compara el GET de antes y de despues:
+    un 422 que igual escribiera seria el mismo defecto con otra cara."""
+    cliente = _app(session_factory)
+    cliente.put("/admin/smtp", json={
+        "host": "smtp.test", "port": 2525, "user": "cuenta",
+        "from_email": "a@b.com"}).raise_for_status()
+    antes = cliente.get("/admin/smtp").json()
+
+    r = cliente.put("/admin/smtp", json={"host": "smtp.otro", "port": valor})
+
+    assert r.status_code == 422, r.text
+    assert "port tiene que ser un número, no un booleano" in r.text
+    despues = cliente.get("/admin/smtp").json()
+    assert despues == antes
+    assert despues["port"] == 2525
+
+
+@pytest.mark.parametrize("valor, esperado", [(587, 587), ("587", 587), (2525, 2525)])
+def test_put_con_port_numerico_o_texto_numerico_sigue_andando(
+        session_factory, valor, esperado):
+    r = _app(session_factory).put(
+        "/admin/smtp", json={"host": "smtp.test", "port": valor})
+
+    assert r.status_code == 200, r.text
+    assert r.json()["port"] == esperado
+
+
+def test_put_sin_port_usa_el_587_de_siempre(session_factory):
+    r = _app(session_factory).put("/admin/smtp", json={"host": "smtp.test"})
+
+    assert r.status_code == 200, r.text
+    assert r.json()["port"] == 587
+
+
 def test_put_sin_clave_de_cifrado_da_500_y_no_guarda(session_factory, monkeypatch, tmp_path):
     """500 y no 422: no es un error de quien manda el formulario, es que a la
     instancia le falta el secreto del entorno. Lo que importa del test es la
