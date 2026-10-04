@@ -16,7 +16,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, Header, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 
@@ -303,11 +303,33 @@ class _DemoLoginRequest(BaseModel):
     codigo: str = ""
 
 
+def _sin_booleano(valor, campo: str):
+    """Rechaza un `bool` en un campo numerico de entrada.
+
+    🔴 Pydantic en modo laxo convierte `true` en `1` y `false` en `0` en un
+    campo `int`, y un `bool` es un `int` para Python: el valor entraba como un
+    numero valido y nadie lo veia. Sin esto, `{"port": true}` guardaba el
+    puerto 1. Se rechaza **antes** de la conversion (`mode="before"`), con el
+    `422` de siempre. Todo lo demas (un entero, un texto numerico como
+    `"587"`) pasa igual que antes. Es una guarda PROPIA de este paquete:
+    `libraauth` es la capa de abajo y no puede importar la del motor
+    (ver DECISIONS.md, ADR-019).
+    """
+    if isinstance(valor, bool):
+        raise ValueError(f"{campo} tiene que ser un número, no un booleano")
+    return valor
+
+
 class _DemoCodigoIn(BaseModel):
     """Alta de un codigo, desde el backoffice."""
     etiqueta: str = ""
     dias: int = DIAS_DEFECTO
     usos_max: int = USOS_DEFECTO
+
+    @field_validator("dias", "usos_max", mode="before")
+    @classmethod
+    def _numero_no_booleano(cls, valor, info):
+        return _sin_booleano(valor, info.field_name)
 
 
 # Solo para el par de endpoints de recuperacion (opt-in, ver
@@ -365,6 +387,11 @@ class _SmtpSettingsIn(BaseModel):
     password: str | None = None
     from_email: str = ""
     from_name: str = ""
+
+    @field_validator("port", mode="before")
+    @classmethod
+    def _port_no_booleano(cls, valor):
+        return _sin_booleano(valor, "port")
 
 
 #: Lo que contesta el router cuando el captcha falta o no vale. Un 400 y no un

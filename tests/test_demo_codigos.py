@@ -430,6 +430,35 @@ def test_el_backoffice_emite_con_el_token_de_servicio(repo, monkeypatch):
         "/auth/demo", json={"codigo": r.json()["codigo"]}).status_code == 200
 
 
+@pytest.mark.parametrize("campo", ["dias", "usos_max"])
+@pytest.mark.parametrize("valor", [True, False])
+def test_emitir_con_un_booleano_en_un_numero_da_422_y_no_emite(
+        repo, monkeypatch, campo, valor):
+    """🔴 `{"dias": true}` se convertia en 1 dia y salia un codigo valido: el
+    peor de los casos, porque el alta "andaba". Se mira tambien que no quede
+    ninguna fila."""
+    monkeypatch.setenv("LIBRA_SERVICE_TOKEN", "token-del-backoffice")
+    cliente = _cliente(repo, con_admin_router=True)
+    headers = {"X-Internal-Auth": "token-del-backoffice"}
+    antes = len(repo.listar())
+
+    r = cliente.post("/admin/demo-codigos", json={campo: valor}, headers=headers)
+
+    assert r.status_code == 422, r.text
+    assert f"{campo} tiene que ser un número, no un booleano" in r.text
+    assert len(repo.listar()) == antes
+
+
+def test_emitir_con_numeros_o_textos_numericos_sigue_andando(repo, monkeypatch):
+    monkeypatch.setenv("LIBRA_SERVICE_TOKEN", "token-del-backoffice")
+    cliente = _cliente(repo, con_admin_router=True)
+    headers = {"X-Internal-Auth": "token-del-backoffice"}
+
+    for cuerpo in ({"dias": 3, "usos_max": 5}, {"dias": "3", "usos_max": "5"}, {}):
+        r = cliente.post("/admin/demo-codigos", json=cuerpo, headers=headers)
+        assert r.status_code == 201, r.text
+
+
 def test_sin_token_no_se_emite(repo, monkeypatch):
     """La mitad que hace util al test de arriba."""
     monkeypatch.setenv("LIBRA_SERVICE_TOKEN", "token-del-backoffice")
