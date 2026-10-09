@@ -40,7 +40,7 @@ jobs:
     # de decir la verdad.
     services:
       postgres:
-        image: postgres:16-alpine
+        image: public.ecr.aws/docker/library/postgres:16-alpine
         env:
           POSTGRES_DB: libraauth
           POSTGRES_USER: libraauth_ci
