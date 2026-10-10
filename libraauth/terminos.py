@@ -35,7 +35,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 # FastAPI a nivel de modulo y NO dentro de `build_terminos_router`, por lo mismo
@@ -81,6 +81,42 @@ VERSION_PROXIMA: str | None = "1.1"
 PROXIMA_DESDE: str | None = "09-11-2026"
 ARCHIVO_PROXIMA: Path | None = Path(__file__).parent / "legal" / "terminos_v1_1.md"
 
+#: Argentina no tiene horario de verano: un desfase fijo, sin depender de la base de zonas de la imagen.
+_ZONA_AR = timezone(timedelta(hours=-3))
+
+
+def _hoy_argentina() -> date:
+    """El día de hoy en Argentina. Es el punto que los tests fijan (`monkeypatch`)."""
+    return datetime.now(_ZONA_AR).date()
+
+
+def _fecha(ddmmaaaa: str) -> date:
+    return datetime.strptime(ddmmaaaa, "%d-%m-%Y").date()
+
+
+def _rige_la_proxima(hoy: date | None = None) -> bool:
+    """`True` desde el `PROXIMA_DESDE` (00:00 de Argentina) en adelante (ADR-021).
+
+    🔑 **La versión vigente se decide por fecha, no al desplegar.** La 1.1 se publica con los 30 días de la cláusula 29.2 y
+    entra en vigencia sola ese día, en cada instancia, sin redeploy: el gate empieza a pedir la nueva aceptación aunque el
+    proceso venga corriendo desde antes."""
+    if not (VERSION_PROXIMA and PROXIMA_DESDE and ARCHIVO_PROXIMA):
+        return False
+    return (hoy or _hoy_argentina()) >= _fecha(PROXIMA_DESDE)
+
+
+def version_vigente(hoy: date | None = None) -> str:
+    """La versión que rige hoy: `VERSION_PROXIMA` desde su fecha, `VERSION_VIGENTE` antes. Usar esto y no la constante."""
+    return VERSION_PROXIMA if _rige_la_proxima(hoy) else VERSION_VIGENTE  # type: ignore[return-value]
+
+
+def vigente_desde(hoy: date | None = None) -> str:
+    return PROXIMA_DESDE if _rige_la_proxima(hoy) else VIGENTE_DESDE  # type: ignore[return-value]
+
+
+def _archivo_vigente(hoy: date | None = None) -> Path:
+    return ARCHIVO_PROXIMA if _rige_la_proxima(hoy) else ARCHIVO_TERMINOS  # type: ignore[return-value]
+
 #: Codigo que devuelve el gate en el `detail` del 403. El frontend matchea por
 #: esto y no por el texto del mensaje.
 CODIGO_PENDIENTE = "terminos_pendientes"
@@ -109,7 +145,7 @@ def texto_vigente() -> str:
     linea que la produce, y facil de perder si alguien cambia la lectura—. Aca
     es explicita, y por eso un test puede ponerse rojo si desaparece.
     """
-    crudo = ARCHIVO_TERMINOS.read_bytes().decode("utf-8")
+    crudo = _archivo_vigente().read_bytes().decode("utf-8")
     return crudo.replace("\r\n", "\n").replace("\r", "\n")
 
 
@@ -146,7 +182,8 @@ def _normalizado(archivo: Path) -> str:
 
 def texto_proximo() -> str | None:
     """El texto de la próxima versión (`VERSION_PROXIMA`), normalizado igual que el vigente; `None` si no hay una."""
-    return _normalizado(ARCHIVO_PROXIMA) if VERSION_PROXIMA and ARCHIVO_PROXIMA else None
+    # Una vez que rige, deja de ser «próxima»: es la vigente.
+    return _normalizado(ARCHIVO_PROXIMA) if VERSION_PROXIMA and ARCHIVO_PROXIMA and not _rige_la_proxima() else None
 
 
 def texto_html_proximo() -> str | None:
@@ -176,10 +213,12 @@ class TerminosRepository:
         self,
         session_factory: Callable[[], AbstractContextManager[Session]],
         *,
-        version: str = VERSION_VIGENTE,
+        version: str | None = None,
     ):
         self.session_factory = session_factory
-        self.version = version
+        # Sin `version` explícita, la que rige HOY (`version_vigente()`), resuelta en cada llamada: el día que entra la
+        # próxima, el gate vuelve a pedir aceptación sin reiniciar el proceso (ADR-021).
+        self._version_fija = version
         # Cache de "esta instancia ya acepto la version vigente". Se prende una
         # sola vez y no se vuelve a apagar: una aceptacion no se deshace, y la
         # unica forma de volver a pendiente es subir `VERSION_VIGENTE`, que llega
@@ -187,7 +226,11 @@ class TerminosRepository:
         #
         # Existe porque el gate corre en CADA request gateada: sin cache seria una
         # consulta mas por request para leer un booleano que casi siempre es True.
-        self._aceptada = False
+        self._aceptada_en: str | None = None
+
+    @property
+    def version(self) -> str:
+        return self._version_fija or version_vigente()
 
     def aceptacion_vigente(self) -> dict | None:
         """La aceptacion de la version vigente, o None si la instancia no tiene."""
@@ -200,11 +243,13 @@ class TerminosRepository:
             return _a_dict(fila) if fila else None
 
     def esta_aceptada(self) -> bool:
-        if self._aceptada:
+        # La cache es POR VERSIÓN: «ya aceptó la 1.0» no dice nada de la 1.1.
+        version = self.version
+        if self._aceptada_en == version:
             return True
         hay = self.aceptacion_vigente() is not None
         if hay:
-            self._aceptada = True
+            self._aceptada_en = version
         return hay
 
     def registrar(
@@ -219,16 +264,17 @@ class TerminosRepository:
         segunda aceptacion de la misma version no es un error del que haya que
         avisar: es alguien que apreto dos veces.
         """
+        version = self.version
         ya = self.aceptacion_vigente()
         if ya is not None:
-            self._aceptada = True
+            self._aceptada_en = version
             return ya
         with self.session_factory() as session:
             fila = AceptacionTerminos(
                 usuario_id=usuario_id,
                 username=(username or "")[:100],
                 nombre=(nombre or "")[:200],
-                version=self.version,
+                version=version,
                 hash_texto=hash_vigente(),
                 aceptado_at=datetime.now(),
                 ip=(ip or "")[:64],
@@ -237,7 +283,7 @@ class TerminosRepository:
             session.add(fila)
             session.commit()
             session.refresh(fila)
-            self._aceptada = True
+            self._aceptada_en = version
             return _a_dict(fila)
 
     def historial(self) -> list[dict]:
@@ -337,7 +383,7 @@ def exigir_terminos(request: Request, user: dict | None = None) -> None:
             status_code=403,
             detail={
                 "code": CODIGO_PENDIENTE,
-                "version": VERSION_VIGENTE,
+                "version": version_vigente(),
                 "mensaje": (
                     "Los Términos y Condiciones del Servicio están pendientes de "
                     "aceptación por el responsable de la cuenta."
@@ -405,8 +451,8 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
         repo = _repo(request)
         aceptacion = repo.aceptacion_vigente()
         return {
-            "version": VERSION_VIGENTE,
-            "vigente_desde": VIGENTE_DESDE,
+            "version": version_vigente(),
+            "vigente_desde": vigente_desde(),
             "hash_texto": hash_vigente(),
             # 🔴 `exige_aceptacion()` y no solo `aceptacion is None`: en una demo
             # no hay contrato que aceptar, y **el frontend bloquea la aplicacion
@@ -441,11 +487,11 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
                 status_code=403,
                 detail="Sólo el responsable de la cuenta puede aceptar los Términos.",
             )
-        if data.version != VERSION_VIGENTE:
+        if data.version != version_vigente():
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"La versión vigente es {VERSION_VIGENTE} y se intentó aceptar "
+                    f"La versión vigente es {version_vigente()} y se intentó aceptar "
                     f"{data.version}. Recargá la página para ver el texto actual."
                 ),
             )
