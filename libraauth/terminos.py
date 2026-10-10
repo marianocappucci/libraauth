@@ -69,6 +69,18 @@ VIGENTE_DESDE = "22-08-2026"
 #: hatchling se lleva todo lo que cuelga del paquete, asi que el `.md` viaja.
 ARCHIVO_TERMINOS = Path(__file__).parent / "legal" / "terminos_v1.md"
 
+#: **La próxima versión**, publicada pero todavía NO vigente (cláusula 29.2: se publica en el sitio y se notifica con
+#: treinta días de anticipación). Mientras está acá no cambia nada adentro del sistema: el gate y el hash que se guarda
+#: como prueba siguen siendo los de `VERSION_VIGENTE`. Sólo la publica `libra_web_kit.legal_gen`, al lado de la
+#: vigente. El día que entra en vigencia se pasa a `VERSION_VIGENTE`/`VIGENTE_DESDE`/`ARCHIVO_TERMINOS` y estas tres
+#: vuelven a `None`: recién ahí el sistema pide la nueva aceptación (cláusula 29.3).
+#:
+#: 1.1 (decisión del dueño, 2026-10-10): la cláusula 5.1 pasa de «más IVA» a «precio final con el IVA incluido» para
+#: los ocho productos. Única diferencia con la 1.0.
+VERSION_PROXIMA: str | None = "1.1"
+PROXIMA_DESDE: str | None = "09-11-2026"
+ARCHIVO_PROXIMA: Path | None = Path(__file__).parent / "legal" / "terminos_v1_1.md"
+
 #: Codigo que devuelve el gate en el `detail` del 403. El frontend matchea por
 #: esto y no por el texto del mensaje.
 CODIGO_PENDIENTE = "terminos_pendientes"
@@ -125,6 +137,32 @@ def texto_html() -> str:
 def hash_vigente() -> str:
     """sha256 hex del texto vigente. Es la huella de la clausula 30.3."""
     return hashlib.sha256(texto_vigente().encode("utf-8")).hexdigest()
+
+
+def _normalizado(archivo: Path) -> str:
+    """El mismo tratamiento que `texto_vigente`: binario y CRLF/CR a LF a mano, para que el hash no dependa del checkout."""
+    return archivo.read_bytes().decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def texto_proximo() -> str | None:
+    """El texto de la próxima versión (`VERSION_PROXIMA`), normalizado igual que el vigente; `None` si no hay una."""
+    return _normalizado(ARCHIVO_PROXIMA) if VERSION_PROXIMA and ARCHIVO_PROXIMA else None
+
+
+def texto_html_proximo() -> str | None:
+    """La próxima versión en HTML, con el mismo convertidor que `texto_html`; `None` si no hay una."""
+    texto = texto_proximo()
+    if texto is None:
+        return None
+    import markdown  # local: solo lo necesita quien va a mostrar el texto
+
+    return markdown.markdown(texto, extensions=["tables", "sane_lists"])
+
+
+def hash_proximo() -> str | None:
+    """sha256 hex de la próxima versión: el que se va a guardar como prueba cuando entre en vigencia."""
+    texto = texto_proximo()
+    return hashlib.sha256(texto.encode("utf-8")).hexdigest() if texto is not None else None
 
 
 class TerminosRepository:

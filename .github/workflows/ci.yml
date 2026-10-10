@@ -38,25 +38,19 @@ jobs:
     # O sea: este CI prueba contra lo que hay en produccion. Si algun dia los
     # sidecars cambian de imagen, hay que cambiarla ACA tambien o el gate deja
     # de decir la verdad.
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: libraauth
-          POSTGRES_USER: libraauth_ci
-          POSTGRES_PASSWORD: libraauth_ci_only
-        options: >-
-          --health-cmd "pg_isready -U libraauth_ci -d libraauth"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-
     env:
       LIBRAAUTH_POSTGRES_URL: postgresql+psycopg://libraauth_ci:libraauth_ci_only@localhost:5432/libraauth
 
     steps:
+      # El PostgreSQL sale de la Action compartida de libra-web-kit (`postgres-ci-v1`, desde el espejo de ECR;
+      # reglas/ci.md del wiki), con los mismos datos y el mismo healthcheck que el `services:` de antes.
+      - name: PostgreSQL de la suite
+        uses: marianocappucci/libra-web-kit/.github/actions/postgres-ci@postgres-ci-v1
+        with:
+          variante: alpine
+          base: libraauth
+          usuario: libraauth_ci
+          clave: libraauth_ci_only
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
