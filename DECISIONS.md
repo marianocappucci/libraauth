@@ -604,3 +604,24 @@ El sistema no tenía versiones con fecha futura: subir `VERSION_VIGENTE` corta e
 - **El 09-11-2026** se pasa a `VERSION_VIGENTE = "1.1"`, `VIGENTE_DESDE = "09-11-2026"` y `ARCHIVO_TERMINOS = terminos_v1_1.md`, y las tres de la próxima vuelven a `None`. Se corta un tag nuevo, se sube el pin en los ocho productos y se despliega. Ese día el sistema pide la nueva aceptación. La 1.0 queda en el repo: es la prueba de lo que aceptó cada cliente.
 
 **No cubre.** Un aviso adentro del sistema antes de la vigencia; el aviso a los clientes actuales lo manda el dueño.
+
+## ADR-021 — La versión vigente de los términos se decide por fecha: la 1.1 entra sola el 09-11-2026 (2026-10-10)
+
+**Pedido del dueño.** Que la 1.1 (ADR-020) «se active sola el 09-11», sin depender de un deploy ese día y respetando los 30
+días de aviso de la cláusula 29.2.
+
+**Problema.** La vigente era una constante leída al importar. Además, `TerminosRepository` fijaba la versión al construirse
+y guardaba en memoria «ya aceptó» sin decir de qué versión: un proceso que viniera corriendo desde antes del 09-11 habría
+seguido dando por aceptada la 1.0.
+
+**Decisión.**
+- `version_vigente(hoy)` y `vigente_desde(hoy)` devuelven la próxima desde `PROXIMA_DESDE` (00:00 de Argentina, `-03:00`
+  fijo) y la anterior antes de esa fecha. `texto_vigente`, `hash_vigente`, el gate, el estado y `/aceptar` usan esas
+  funciones. `texto_proximo` devuelve `None` una vez que la próxima rige. `VERSION_VIGENTE` queda como la versión base.
+- `TerminosRepository(version=None)` resuelve la versión en cada llamada, y la memoria del «ya aceptó» guarda **qué**
+  versión: el 09-11 el mismo proceso vuelve a cortar con 403, pide la 1.1 y guarda la fila nueva con su hash.
+- Los tests fijan el día (`_hoy_argentina`) antes del cambio y prueban el paso explícitamente. Si no, desde el 09-11 se
+  habrían roto solos todos los que aceptan `VERSION_VIGENTE`.
+
+**No cubre.** Las páginas públicas de los sitios son HTML estático: el 09-11 hay que regenerarlas (`generate_legal.py`)
+para que `terminos.html` pase a mostrar la 1.1.

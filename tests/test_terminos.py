@@ -17,6 +17,7 @@ Lo que fijan estos tests, en orden de lo que se rompe sin que se note:
 6. Que las tres cláusulas que el contrato existe para sentar sigan en el texto.
 """
 import hashlib
+from datetime import date
 
 import pytest
 from fastapi import Depends, FastAPI
@@ -75,6 +76,11 @@ def _entorno(monkeypatch):
     # no abra excepciones que este archivo no está midiendo.
     monkeypatch.delenv("DEMO_MODE", raising=False)
     monkeypatch.delenv("DEMO_USERNAME", raising=False)
+    # 🔴 La versión vigente se decide por fecha (ADR-021): sin fijar el día, desde el 09-11-2026 todos los tests que aceptan
+    # `VERSION_VIGENTE` (1.0) darían 409 solos. Se fija ANTES del cambio; los tests del cambio mueven el día ellos.
+    import libraauth.terminos as _t
+
+    monkeypatch.setattr(_t, "_hoy_argentina", lambda: date(2026, 10, 10))
 
 
 @pytest.fixture
@@ -479,3 +485,59 @@ def test_sin_proxima_version_las_funciones_devuelven_none(monkeypatch):
 
     monkeypatch.setattr(t, "VERSION_PROXIMA", None)
     assert t.texto_proximo() is None and t.hash_proximo() is None and t.texto_html_proximo() is None
+
+
+# ── La 1.1 entra en vigencia sola el 09-11-2026 (ADR-021) ───────────────────────
+
+def test_la_version_vigente_cambia_el_dia_de_la_proxima(monkeypatch):
+    import libraauth.terminos as t
+
+    assert t.version_vigente(date(2026, 11, 8)) == "1.0" and t.vigente_desde(date(2026, 11, 8)) == "22-08-2026"
+    assert t.version_vigente(date(2026, 11, 9)) == "1.1" and t.vigente_desde(date(2026, 11, 9)) == "09-11-2026"
+    monkeypatch.setattr(t, "_hoy_argentina", lambda: date(2026, 11, 9))
+    assert "precio final con el IVA incluido" in t.texto_vigente()
+    assert t.hash_vigente() == hashlib.sha256(t.texto_vigente().encode("utf-8")).hexdigest()
+    # Una vez que rige, deja de ser «próxima».
+    assert t.texto_proximo() is None and t.hash_proximo() is None
+
+
+def test_una_instancia_que_ya_acepto_la_1_0_vuelve_a_pedir_aceptacion_el_09_11(sessions, monkeypatch):
+    """El mismo proceso (misma app, misma cache del repositorio) que aceptó la 1.0 corta otra vez desde el día de la 1.1, y
+    la nueva fila guarda la 1.1 con su hash. Sin redeploy."""
+    import libraauth.terminos as t
+
+    app = _app(sessions)
+    cliente = _logueado(app)
+    assert cliente.post("/terminos/aceptar", json={"version": "1.0"}).status_code == 200
+    assert cliente.get("/clientes").status_code == 200
+
+    monkeypatch.setattr(t, "_hoy_argentina", lambda: date(2026, 11, 9))
+    r = cliente.get("/clientes")
+    assert r.status_code == 403 and r.json()["detail"]["version"] == "1.1"
+    estado = cliente.get("/terminos").json()
+    assert estado["pendiente"] is True and estado["version"] == "1.1" and estado["vigente_desde"] == "09-11-2026"
+    assert cliente.post("/terminos/aceptar", json={"version": "1.0"}).status_code == 409
+
+    r = cliente.post("/terminos/aceptar", json={"version": "1.1"})
+    assert r.status_code == 200 and r.json()["pendiente"] is False
+    assert cliente.get("/clientes").status_code == 200
+    filas = app.state.terminos.historial()
+    assert [f["version"] for f in filas] == ["1.1", "1.0"]
+    assert filas[0]["hash_texto"] == t.hash_vigente() != filas[1]["hash_texto"]
+
+
+def test_el_dia_anterior_sigue_rigiendo_la_1_0(sessions, monkeypatch):
+    import libraauth.terminos as t
+
+    monkeypatch.setattr(t, "_hoy_argentina", lambda: date(2026, 11, 8))
+    cliente = _logueado(_app(sessions))
+    assert cliente.get("/terminos").json()["version"] == "1.0"
+    assert cliente.post("/terminos/aceptar", json={"version": "1.1"}).status_code == 409
+
+
+def test_un_repositorio_con_version_fija_no_cambia_por_fecha(sessions, monkeypatch):
+    import libraauth.terminos as t
+
+    monkeypatch.setattr(t, "_hoy_argentina", lambda: date(2027, 1, 1))
+    assert t.TerminosRepository(sessions, version="1.0").version == "1.0"
+    assert t.TerminosRepository(sessions).version == "1.1"
