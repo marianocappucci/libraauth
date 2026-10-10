@@ -436,3 +436,46 @@ def test_el_texto_conserva_las_clausulas_que_lo_justifican(frase):
 def test_el_texto_no_tiene_placeholders_sin_resolver():
     """Un `{{...}}` que sobreviva se publica tal cual en las ocho webs."""
     assert "{{" not in texto_vigente()
+
+
+# ── La próxima versión (1.1): publicada, todavía no vigente (cláusula 29.2) ──────
+
+def test_la_proxima_version_no_cambia_lo_vigente():
+    """Publicar la 1.1 no pide nada adentro del sistema: el gate y la prueba siguen siendo los de la 1.0."""
+    import libraauth.terminos as t
+
+    assert t.VERSION_VIGENTE == "1.0"
+    assert t.ARCHIVO_TERMINOS.name == "terminos_v1.md"
+    assert t.VERSION_PROXIMA == "1.1" and t.PROXIMA_DESDE == "09-11-2026"
+    assert t.hash_proximo() != t.hash_vigente()
+
+
+def test_el_hash_de_la_proxima_es_el_sha256_de_su_texto_normalizado():
+    import libraauth.terminos as t
+
+    crudo = t.ARCHIVO_PROXIMA.read_bytes().decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    assert t.texto_proximo() == crudo
+    assert t.hash_proximo() == hashlib.sha256(crudo.encode("utf-8")).hexdigest()
+    assert "<h2>5. Precio, impuestos y forma de pago</h2>" in t.texto_html_proximo()
+
+
+def test_la_1_1_cambia_solo_el_encabezado_y_la_clausula_5_1():
+    """Decisión del dueño (2026-10-10): «más IVA» pasa a «precio final con el IVA incluido». Ninguna otra cláusula cambia."""
+    import difflib
+
+    import libraauth.terminos as t
+
+    cambios = [l for l in difflib.unified_diff(t.texto_vigente().splitlines(), t.texto_proximo().splitlines(), lineterm="", n=0)
+               if l[:1] in "+-" and not l.startswith(("+++", "---"))]
+    quitadas = [l[1:] for l in cambios if l.startswith("-")]
+    agregadas = [l[1:] for l in cambios if l.startswith("+")]
+    assert quitadas == ["**Versión 1.0 — vigente desde el 22-08-2026**", "pesos argentinos, **más IVA** y todo otro tributo que corresponda."]
+    assert "pesos argentinos, como **precio final con el IVA incluido** cuando corresponda," in agregadas
+    assert "más IVA" not in t.texto_proximo()
+
+
+def test_sin_proxima_version_las_funciones_devuelven_none(monkeypatch):
+    import libraauth.terminos as t
+
+    monkeypatch.setattr(t, "VERSION_PROXIMA", None)
+    assert t.texto_proximo() is None and t.hash_proximo() is None and t.texto_html_proximo() is None

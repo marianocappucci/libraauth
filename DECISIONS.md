@@ -584,3 +584,23 @@ wiki (entidad `libraauth`).
   error, no un uso legítimo) ahora recibe `422`. Un modelo nuevo con un campo
   numérico de entrada tiene que usar el mismo patrón; los tests de
   `test_smtp_settings.py` y `test_demo_codigos.py` fijan los tres casos.
+
+## ADR-020 — Términos 1.1 publicados como «próxima versión», todavía no vigentes (2026-10-10)
+
+**Pedido del dueño.** Los precios de la suite son finales con el IVA incluido, como ya decía la landing de VentaLibra. La
+cláusula 5.1 de los términos (comunes a los ocho productos) decía «más IVA». Se decidió cambiarla para todos.
+
+**Restricciones del propio contrato.**
+- **29.2:** una modificación se publica en el sitio y se notifica con 30 días corridos de anticipación.
+- **29.3:** recién al entrar en vigencia el sistema pide la nueva aceptación.
+- **29.4:** el precio sólo cambia por acuerdo expreso; el aviso a cada cliente actual lo cubre.
+
+El sistema no tenía versiones con fecha futura: subir `VERSION_VIGENTE` corta en el acto a los ocho productos.
+
+**Decisión.**
+- `terminos_v1_1.md`: la 1.0 tal cual, con dos cambios. El encabezado dice «Versión 1.1 — vigente desde el 09-11-2026», más una línea que explica el cambio. La 5.1 pasa a «como precio final con el IVA incluido cuando corresponda, más todo otro tributo que corresponda». Un test fija que no haya otra diferencia.
+- `VERSION_PROXIMA`, `PROXIMA_DESDE` y `ARCHIVO_PROXIMA`, con `texto_proximo()`, `texto_html_proximo()` y `hash_proximo()`, que usan la misma normalización a LF y el mismo convertidor que la vigente.
+- **No cambia nada adentro del sistema:** el gate y el hash de la prueba siguen siendo los de la 1.0. Sólo los usa `libra_web_kit.legal_gen` para publicar la 1.1 al lado de la vigente, con su hash verificable.
+- **El 09-11-2026** se pasa a `VERSION_VIGENTE = "1.1"`, `VIGENTE_DESDE = "09-11-2026"` y `ARCHIVO_TERMINOS = terminos_v1_1.md`, y las tres de la próxima vuelven a `None`. Se corta un tag nuevo, se sube el pin en los ocho productos y se despliega. Ese día el sistema pide la nueva aceptación. La 1.0 queda en el repo: es la prueba de lo que aceptó cada cliente.
+
+**No cubre.** Un aviso adentro del sistema antes de la vigencia; el aviso a los clientes actuales lo manda el dueño.
