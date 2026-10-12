@@ -52,7 +52,9 @@ import) — el resto orbita alrededor de él.
   registro falla ("seguro" = tolerante a error).
 - **`auditoria.py`** (`AuditoriaBase`, `ActividadLog`, `configurar_auditoria`,
   `agregar_middleware_de_usuario`): auditoría genérica de actividad con diff
-  legible, montable como middleware.
+  legible, montable como middleware. Desde v0.49.0 también `registrador_dbapi`
+  (el mismo formato para productos sin ORM) y las piezas puras `fila_de_auditoria`,
+  `diff_de_valores` y `etiqueta_de_valores` que comparten los dos caminos (ADR-022).
 - **`bootstrap.py`** (`ensure_default_admin`, `ensure_demo_user`,
   `ensure_admin_user`): siembra idempotente del admin y el usuario demo al
   arrancar.

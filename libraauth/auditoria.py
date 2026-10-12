@@ -38,6 +38,15 @@ El INSERT final va por Core (`table.insert()`) y no por el ORM: agregar objetos
 a la sesion dentro de `after_flush` no los incluiria en el flush en curso, y
 ademas dispararia el listener de nuevo.
 
+**Hay un segundo camino para los productos SIN ORM (v0.49.0).** Los que escriben con
+SQL crudo sobre `libracore`/`libracommerce` (Contalibra, Restolibra, VentaLibra, y
+`libracore.db.clients` en cualquiera) no tienen `flush` del que colgarse. Para ellos
+`registrador_dbapi(...)` devuelve un callable `(conn, cambio)` que arma **la misma fila**
+—mismo formato, mismas reglas— y la inserta con la conexion de la escritura, sin commit.
+Los dos caminos comparten las funciones puras de abajo (`diff_de_valores`,
+`etiqueta_de_valores`, `fila_de_auditoria`) y un test fija que, ante el mismo cambio,
+dejan filas iguales. Ver ADR-022.
+
 Uso tipico en el `create_app()` del producto:
 
     from libraauth.auditoria import (
@@ -53,10 +62,11 @@ Uso tipico en el `create_app()` del producto:
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager
 from contextvars import ContextVar
 from datetime import datetime
+from typing import Any
 
 # FastAPI a nivel de modulo y NO dentro de `build_logs_router`: este archivo
 # tiene `from __future__ import annotations`, asi que todas las anotaciones son
@@ -182,14 +192,25 @@ ATRIBUTOS_ETIQUETA = (
 ATRIBUTOS_ARMADO = ("tipo", "type", "marca", "brand", "modelo", "model")
 
 
-def _etiqueta(obj) -> str:
+def etiqueta_de_valores(leer: Callable[[str], object]) -> str:
+    """El texto que describe la fila, a partir de una funcion `atributo -> valor`.
+
+    Es `_etiqueta` sin saber de donde salen los valores: el camino del ORM le pasa
+    `getattr(obj, ...)` y el del DB-API le pasa el `get` de un dict. Una sola regla de
+    armado para los dos, que es lo que evita que la etiqueta de una fila cambie segun
+    por que camino entro.
+    """
     for attr in ATRIBUTOS_ETIQUETA:
-        valor = getattr(obj, attr, None)
+        valor = leer(attr)
         if valor:
             return str(valor)[:200]
-    partes = [str(getattr(obj, a, "") or "") for a in ATRIBUTOS_ARMADO]
+    partes = [str(leer(a) or "") for a in ATRIBUTOS_ARMADO]
     armado = " ".join(p for p in partes if p).strip()
     return armado[:200] if armado else ""
+
+
+def _etiqueta(obj) -> str:
+    return etiqueta_de_valores(lambda attr: getattr(obj, attr, None))
 
 
 # Nombre publico de `_etiqueta`, para el producto que quiera reusarla dentro de
@@ -200,12 +221,16 @@ def etiqueta_por_defecto(obj) -> str:
     return _etiqueta(obj)
 
 
-def _valor_legible(valor):
+def valor_legible(valor):
+    """El valor de una columna como va al JSON del diff: texto, numero, bool o None."""
     if isinstance(valor, datetime):
         return valor.strftime("%Y-%m-%d %H:%M:%S")
     if valor is None or isinstance(valor, (str, int, float, bool)):
         return valor
     return str(valor)
+
+
+_valor_legible = valor_legible
 
 
 def ts_legible(valor) -> str:
@@ -233,6 +258,88 @@ def ts_legible(valor) -> str:
     if isinstance(valor, datetime):
         return valor.strftime("%Y-%m-%d %H:%M:%S")
     return str(valor)
+
+
+def diff_de_valores(
+    antes: Mapping[str, Any],
+    despues: Mapping[str, Any],
+    *,
+    ocultas: Iterable[str] = (),
+    ignoradas: Iterable[str] = (),
+    nombres_de_columna: Mapping[str, Iterable[str]] | None = None,
+    resumir: Callable[[Any], Any] | None = None,
+) -> dict:
+    """`{atributo: [antes, despues]}` de lo que cambio entre dos fotos de la fila.
+
+    Es el nucleo del diff, sin saber de donde salen las fotos: el ORM las arma con el
+    historial de cada atributo y el DB-API con dos `SELECT`. **Compara el valor crudo**
+    (antes de volverlo legible) y recien despues lo formatea, igual que siempre.
+
+    - Una clave que falta en una de las dos fotos vale `None`; el orden es el de
+      `despues` y despues las que solo estan en `antes`.
+    - `ocultas` se compara contra la clave y contra `nombres_de_columna[clave]`: un
+      atributo `password` mapeado a la columna `pwd`, o una columna `password_hash`
+      mapeada a otro nombre, se tapan igual. Una oculta que cambio entra como
+      `[OCULTO, OCULTO]`; una que no cambio no entra (ruido).
+    - `ignoradas` no entran nunca (ni siquiera tapadas): lo que el propio sistema
+      recalcula en cada guardado.
+    - `resumir` es un gancho para valores que no se leen en un diff (una coleccion de
+      items): se aplica al valor antes de volverlo legible y no cambia la comparacion.
+    """
+    ocultas = frozenset(ocultas)
+    ignoradas = frozenset(ignoradas)
+    nombres_de_columna = nombres_de_columna or {}
+    claves = list(despues) + [k for k in antes if k not in despues]
+    cambios = {}
+    for clave in claves:
+        if clave in ignoradas:
+            continue
+        previo, nuevo = antes.get(clave), despues.get(clave)
+        if previo == nuevo:
+            continue
+        if clave in ocultas or frozenset(nombres_de_columna.get(clave, ())) & ocultas:
+            cambios[clave] = [OCULTO, OCULTO]
+            continue
+        if resumir is not None:
+            previo, nuevo = resumir(previo), resumir(nuevo)
+        cambios[clave] = [valor_legible(previo), valor_legible(nuevo)]
+    return cambios
+
+
+def fila_de_auditoria(
+    *,
+    entidad: str,
+    accion: str,
+    entidad_id: object = None,
+    etiqueta: str = "",
+    cambios: Mapping[str, Any] | None = None,
+    usuario: str | None = None,
+    ts: datetime | None = None,
+) -> dict:
+    """La fila de `actividad_log`, con el formato del log y sin escribir nada.
+
+    Es **la unica definicion del formato**: el listener del ORM y `registrador_dbapi`
+    pasan por aca, y `libracommerce` la usa a traves del registrador. Quien arma una
+    fila a mano esta armando una segunda copia del formato, y las copias divergen
+    (la de `libracommerce` ya lo hizo: otras columnas ocultas, otro tipo de `entidad_id`).
+
+    - `descripcion` es `«<Entidad> — <etiqueta>»` (la entidad con `_` como espacio y la
+      primera mayuscula), recortada a 500; sin etiqueta, solo el titulo.
+    - `usuario` sale del `ContextVar` `usuario_actual` si no se pasa, recortado a 100.
+    - `entidad_id` va como **texto** (ver `ActividadLog.entidad_id`); un `0` es un id.
+    - `cambios` es el JSON del diff, o `None` si esta vacio: el alta y la baja no llevan.
+    - `ts` es un `datetime` local, igual que `auth_log`.
+    """
+    titulo = entidad.replace("_", " ").capitalize()
+    return {
+        "ts": ts or datetime.now(),
+        "usuario": (usuario if usuario is not None else usuario_actual.get())[:100],
+        "accion": accion,
+        "entidad": entidad,
+        "entidad_id": None if entidad_id is None else str(entidad_id),
+        "descripcion": (f"{titulo} — {etiqueta}" if etiqueta else titulo)[:500],
+        "cambios": json.dumps(cambios, ensure_ascii=False) if cambios else None,
+    }
 
 
 def _diff(obj, ocultas: frozenset) -> dict:
@@ -266,21 +373,15 @@ def _diff(obj, ocultas: frozenset) -> dict:
     dos a la vez, y cual eligieron no esta escrito en ningun lado.
     """
     estado = inspect(obj)
-    cambios = {}
+    antes, despues, columnas = {}, {}, {}
     for attr in inspect(type(obj)).column_attrs:
         historial = estado.attrs[attr.key].history
         if not historial.has_changes():
             continue
-        antes = historial.deleted[0] if historial.deleted else None
-        despues = historial.added[0] if historial.added else None
-        if antes == despues:
-            continue
-        nombres_de_columna = {c.name for c in attr.columns}
-        if attr.key in ocultas or nombres_de_columna & set(ocultas):
-            cambios[attr.key] = [OCULTO, OCULTO]
-            continue
-        cambios[attr.key] = [_valor_legible(antes), _valor_legible(despues)]
-    return cambios
+        antes[attr.key] = historial.deleted[0] if historial.deleted else None
+        despues[attr.key] = historial.added[0] if historial.added else None
+        columnas[attr.key] = {c.name for c in attr.columns}
+    return diff_de_valores(antes, despues, ocultas=ocultas, nombres_de_columna=columnas)
 
 
 def configurar_auditoria(
@@ -324,20 +425,16 @@ def configurar_auditoria(
         return type(obj).__name__ in auditables
 
     def _fila(obj, accion: str, cambios: dict | None) -> dict:
-        entidad = auditables[type(obj).__name__]
-        etiqueta = armar_etiqueta(obj)
-        titulo = entidad.replace("_", " ").capitalize()
-        return {
-            "ts": datetime.now(),
-            "usuario": usuario_actual.get()[:100],
-            "accion": accion,
-            "entidad": entidad,
-            # Se completa en after_flush para las creaciones: en before_flush el
-            # INSERT todavia no corrio y el id no existe.
-            "_obj": obj,
-            "descripcion": (f"{titulo} — {etiqueta}" if etiqueta else titulo)[:500],
-            "cambios": json.dumps(cambios, ensure_ascii=False) if cambios else None,
-        }
+        fila = fila_de_auditoria(
+            entidad=auditables[type(obj).__name__],
+            accion=accion,
+            etiqueta=armar_etiqueta(obj),
+            cambios=cambios,
+        )
+        # Se completa en after_flush para las creaciones: en before_flush el
+        # INSERT todavia no corrio y el id no existe.
+        fila["_obj"] = obj
+        return fila
 
     def _antes_del_flush(session: Session, flush_context, instances):  # noqa: ARG001
         if session.info.get("auditoria") is False:
@@ -383,6 +480,124 @@ def configurar_auditoria(
         event.listen(session_factory, "before_flush", _antes_del_flush)
     if not event.contains(session_factory, "after_flush", _despues_del_flush):
         event.listen(session_factory, "after_flush", _despues_del_flush)
+
+
+def crear_tabla_actividad_log(bind) -> None:
+    """Crea `actividad_log` si no existe, para un producto que no arma `AuditoriaBase`.
+
+    `bind` es un `Engine` o una `Connection` de SQLAlchemy contra la base **donde
+    escribe la conexion cruda** (la de `libracore`/`libracommerce`), que no siempre es la
+    del dominio. Es lo mismo que hace LibraDesk con `AuditoriaBase.metadata.create_all`,
+    sin obligar al que usa `registrador_dbapi` a importar el `Base` ni a conocer el
+    nombre de la tabla. Idempotente: no toca una tabla que ya existe.
+
+    ⚠️ Una tabla que ya existe **no se corrige**: si la creo `libracommerce` con su DDL
+    (`entidad_id INTEGER`, `ts TEXT`) queda asi, y el registrador escribe igual —el id va
+    como texto y el `ts` como texto ISO, que las dos columnas aceptan—. Ver ADR-022.
+    """
+    ActividadLog.__table__.create(bind, checkfirst=True)
+
+
+# Los valores de una fila de `actividad_log` en el orden del INSERT del registrador.
+_COLUMNAS_DEL_INSERT = ("ts", "usuario", "accion", "entidad", "entidad_id", "descripcion", "cambios")
+
+
+def registrador_dbapi(
+    entidades: Mapping[str, str],
+    *,
+    atributos: Mapping[str, Mapping[str, str]] | None = None,
+    columnas_ocultas: Iterable[str] = (),
+    columnas_ignoradas: Iterable[str] = (),
+    etiqueta: Callable[[str, Mapping[str, Any]], str] | None = None,
+    resumir: Callable[[Any], Any] | None = None,
+) -> Callable[[Any, Any], None]:
+    """El registrador para un producto sin ORM: el equivalente de `configurar_auditoria`.
+
+    Devuelve un callable `(conn, cambio) -> None` que arma la fila **con el mismo
+    formato que el listener del ORM** y la inserta con `conn.execute(...)`. Es la forma
+    que espera `libracore.auditoria.configurar_auditoria` y la que arma
+    `libracommerce.db.auditoria.RepositorioAuditado`, asi que el producto lo construye
+    una vez y se lo pasa a los dos.
+
+    `cambio` se lee por duck typing: `tabla`, `accion` (`crear`/`editar`/`borrar`), `id`,
+    `antes` y `despues` (mapeos `columna -> valor`, o `None`). No se importa ningun
+    tipo de `libracore`.
+
+    - `entidades`: `{tabla: nombre logico}`. **Lista blanca**, como en el ORM: un cambio
+      de otra tabla no deja fila.
+    - `atributos`: `{tabla: {columna: atributo}}`. Renombra las claves del diff al
+      vocabulario del producto, que es lo que la pantalla de logs sabe mostrar (en
+      LibraDesk la columna `name` de `clients` es el atributo `nombre`). Una columna
+      que no esta en el mapa conserva su nombre.
+    - `columnas_ocultas` se SUMA a `COLUMNAS_OCULTAS` y se compara contra las dos formas
+      del nombre —columna y atributo—, igual que en el ORM.
+    - `columnas_ignoradas`: columnas que nunca entran al diff (las que el sistema
+      recalcula, como `created_at`). Se nombran como estan en la fila.
+    - `etiqueta(tabla, valores)` reemplaza el armado del texto de la fila (`""` = sin
+      etiqueta); si devuelve `None` se usan las reglas del ORM (`ATRIBUTOS_ETIQUETA`, con el
+      fallback tipo/marca/modelo) sobre los valores ya renombrados, que tambien son el
+      default sin `etiqueta`. Asi un producto puede resolver solo las tablas que conoce.
+    - `resumir` se pasa a `diff_de_valores`.
+
+    Reglas que comparte con el ORM: el alta y la baja no llevan `cambios`; una edicion
+    **sin nada distinto no deja fila** (salvo la que llega sin `antes`, que se registra sin
+    detalle); el usuario sale de `usuario_actual` (default
+    «Sistema»); `entidad_id` va como texto.
+
+    **No hace commit ni abre transaccion**: el INSERT va en la conexion y la transaccion
+    de la escritura auditada, asi que ambas quedan o se caen juntas. Si el INSERT falla,
+    la excepcion sube.
+
+    El INSERT usa placeholders `?` y el `ts` como texto `YYYY-MM-DD HH:MM:SS`: es lo que
+    entienden `sqlite3` y el `ConnectionWrapper` de `libracore` (que traduce a `%s`), y
+    sirve tanto para la columna `DateTime` de `ActividadLog` como para la `TEXT` que crea
+    `libracommerce`. Una conexion que espere `%s` o `:nombre` tiene que envolverse.
+    """
+    atributos = {t: dict(m) for t, m in (atributos or {}).items()}
+    ocultas = COLUMNAS_OCULTAS | frozenset(columnas_ocultas)
+    ignoradas = frozenset(columnas_ignoradas)
+
+    def _renombrar(tabla: str, valores: Mapping[str, Any] | None) -> dict:
+        mapa = atributos.get(tabla, {})
+        return {mapa.get(col, col): v for col, v in (valores or {}).items() if col not in ignoradas}
+
+    def registrar(conn, cambio) -> None:
+        tabla = cambio.tabla
+        if tabla not in entidades:
+            return
+        mapa = atributos.get(tabla, {})
+        antes = _renombrar(tabla, cambio.antes)
+        despues = _renombrar(tabla, cambio.despues)
+        cambios = None
+        if cambio.accion == EDITAR and cambio.antes is not None:
+            # Todas las formas del nombre de una clave del diff: la columna de la que
+            # viene (cuando se renombro) y ella misma.
+            columnas = {mapa.get(c, c): {c} for c in (cambio.despues or {}) if c not in ignoradas}
+            cambios = diff_de_valores(
+                antes, despues, ocultas=ocultas, nombres_de_columna=columnas, resumir=resumir,
+            )
+            if not cambios:
+                return
+        # Una edicion SIN foto de antes (`cambio.antes is None`) no se puede comparar: se
+        # registra el hecho sin detalle, que es mejor que no registrarlo.
+        #
+        # Con la baja se describe lo que se borro; con el resto, como quedo.
+        valores = antes if cambio.accion == BORRAR else despues
+        texto = etiqueta(tabla, valores) if etiqueta else None
+        if texto is None:
+            texto = etiqueta_de_valores(valores.get)
+        fila = fila_de_auditoria(
+            entidad=entidades[tabla], accion=cambio.accion, entidad_id=cambio.id,
+            etiqueta=texto, cambios=cambios,
+        )
+        fila["ts"] = fila["ts"].strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            "INSERT INTO actividad_log (" + ", ".join(_COLUMNAS_DEL_INSERT) + ") VALUES ("
+            + ", ".join("?" * len(_COLUMNAS_DEL_INSERT)) + ")",
+            tuple(fila[c] for c in _COLUMNAS_DEL_INSERT),
+        )
+
+    return registrar
 
 
 def agregar_middleware_de_usuario(app) -> None:
