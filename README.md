@@ -156,6 +156,31 @@ Tres cosas mas que conviene saber:
 - **Se puede apagar por sesion** con `session.info["auditoria"] = False`, para un
   seed o una migracion de datos, que no son actividad de nadie.
 
+### Productos sin ORM: `registrador_dbapi` (v0.49.0)
+
+Un producto que escribe con SQL crudo sobre `libracore`/`libracommerce` no tiene
+`flush` del que colgarse. `registrador_dbapi` arma **la misma fila** (mismo formato,
+mismas reglas) y la inserta con la conexion de la escritura, **sin commit**:
+
+```python
+from libraauth.auditoria import crear_tabla_actividad_log, registrador_dbapi
+
+crear_tabla_actividad_log(engine_de_la_base_donde_escribe_la_conexion)  # idempotente
+registrador = registrador_dbapi(
+    {"clients": "cliente"},                       # {tabla: nombre logico}, lista blanca
+    atributos={"clients": {"name": "nombre"}},    # columna -> atributo del producto
+    columnas_ocultas={"cuit_dni"},                # se SUMA a COLUMNAS_OCULTAS
+)
+libracore.auditoria.configurar_auditoria(registrador)           # clientes del motor
+RepositorioAuditado(repo, conn, registrador=registrador)        # libracommerce
+```
+
+El callable es `(conn, cambio)` y lee `cambio.tabla/accion/id/antes/despues` por duck
+typing, asi `libraauth` no importa nada de `libracore`. Las piezas del formato son
+publicas para quien arme filas por otro lado: `fila_de_auditoria`, `diff_de_valores`,
+`etiqueta_de_valores`, `valor_legible`. Los valores se informan como los devuelve la
+base (un `activo` entero es `[1, 0]`, no `[True, False]`). Ver ADR-022.
+
 ## Recuperacion de contrasena por correo (v0.5.0)
 
 Opt-in: son dos endpoints mas en el router y un servicio propio, y **no se

@@ -625,3 +625,43 @@ seguido dando por aceptada la 1.0.
 
 **No cubre.** Las páginas públicas de los sitios son HTML estático: el 09-11 hay que regenerarlas (`generate_legal.py`)
 para que `terminos.html` pase a mostrar la 1.1.
+
+## ADR-022 — El formato del log de actividad es uno solo y tiene dos caminos de escritura: el flush del ORM y `registrador_dbapi` (2026-10-12)
+
+**Pedido del dueño.** Que la auditoría de escrituras viva en el motor: que el CRUD de clientes de LibraDesk pueda pasar por
+`libracore.db.clients` sin perder el log, que lo usen también VentaLibra, Contalibra y Restolibra, y que el log de
+`libracommerce` deje de ser una segunda copia del formato.
+
+**Problema.** El formato de `actividad_log` estaba definido dos veces: acá, colgado del `flush` de SQLAlchemy, y en
+`libracommerce.db.auditoria`, para el SQL crudo. La copia ya había divergido: tapaba menos columnas (sin `password_cifrada`,
+`token_hash` ni `secret_key`: el valor de una contraseña SMTP cambiada habría quedado copiado en el diff), ignoraba
+`created_at` y declaraba `entidad_id INTEGER`. Y `libracore` no tiene SQLAlchemy ni auditoría: sus clientes sólo se auditaban si
+el producto los escribía por su propio ORM, que es por lo que LibraDesk no podía adoptar `db/clients.py`.
+
+**Decisión.**
+- **Funciones puras que definen el formato**, y el listener del ORM pasa por ellas con salida idéntica a la de antes:
+  `fila_de_auditoria` (descripción `«<Entidad> — <etiqueta>»`, usuario del `ContextVar`, `entidad_id` como texto),
+  `diff_de_valores` (compara el valor crudo; `[antes, después]` sólo de lo cambiado; ocultas tapadas con `[OCULTO, OCULTO]`;
+  ignoradas fuera; gancho `resumir`) y `etiqueta_de_valores` (la regla de `ATRIBUTOS_ETIQUETA` sobre una función
+  `atributo -> valor`).
+- **`registrador_dbapi(entidades, *, atributos, columnas_ocultas, columnas_ignoradas, etiqueta, resumir)`** devuelve un
+  callable `(conn, cambio)`. `cambio` se lee por duck typing (`tabla`, `accion`, `id`, `antes`, `despues`), así que `libracore`
+  y `libracommerce` lo usan sin que este paquete importe de ellos ni ellos de este. Inserta con `?`, el `ts` como texto
+  `YYYY-MM-DD HH:MM:SS` y **sin commit**: la fila vive y muere con la transacción de la escritura. Una edición que llega
+  **sin foto de `antes`** (un repositorio que no sabe leer el estado previo) se registra sin detalle: el hecho queda, el
+  diff no se inventa. Una `etiqueta` propia que devuelve `None` cae en el armado por defecto, para resolver sólo las tablas
+  que el producto conoce.
+- **Las claves del diff son atributos del ORM, no columnas** (el caso `nombre` → `name` de LibraDesk): `atributos` renombra, y
+  las ocultas se comparan contra las dos formas del nombre, como en el ORM.
+- **Una tabla para el que no tiene `AuditoriaBase`:** `crear_tabla_actividad_log(bind)`, idempotente, con un `Engine` o una
+  `Connection`. No hay DDL crudo aparte a propósito: una tercera definición de la tabla es lo que se quiere evitar.
+- **Un test de paridad** (`tests/test_registrador_dbapi.py`) hace el mismo alta, edición, desactivación y baja por los dos
+  caminos y exige filas iguales salvo `id` y `ts`; el de PostgreSQL entra al gate del CI.
+
+**Lo que no resuelve.**
+- La tabla que ya existe no se corrige. Contalibra, Restolibra y VentaLibra la tienen por el DDL de `libracommerce`
+  (`entidad_id INTEGER`, `ts TEXT`); el registrador entra igual (el id va como texto y PostgreSQL lo asigna al entero, medido).
+  Sólo falla si algún día un id no numérico se audita ahí.
+- Un valor se informa como lo devuelve la base: una columna entera que el ORM mapea a `Boolean` da `[1, 0]` por DB-API y
+  `[True, False]` por el ORM. La pantalla lo muestra igual; si importara, el producto normaliza antes de pasar el cambio.
+- La etiqueta del camino DB-API sólo ve las columnas de la fila, no propiedades ni relaciones del modelo.
