@@ -26,6 +26,16 @@ Se diferencia de `SessionAuth` (mismo paquete) en tres cosas, todas a proposito:
   memoria: fallar abierto, como el resto del rate limiting de este paquete —
   dejar a todos afuera porque falla el que cuenta es peor que no contar.
 
+**Varios procesos (ADR-023).** Con `uvicorn --workers N` el estado en memoria es
+**por proceso**: el limite de 5 intentos pasa a ser 5 por worker y el anti-replay
+del TOTP deja de verse entre ellos. Con `ADMIN_PANEL_ESTADO_PATH` el estado va al
+archivo y cada leer-modificar-escribir corre bajo un `flock` sobre
+`<estado>.lock` (el mismo patron que `arca_wsaa._cerrojo` de LibraCore), asi que
+todos los procesos cuentan sobre el mismo dato; y "este codigo TOTP sirve una sola
+vez" se decide adentro del cerrojo (`reclamar_paso_totp`), no con un leer y un
+marcar separados. Sin `ESTADO_PATH` y con `WEB_CONCURRENCY` > 1, el arranque avisa
+por log.
+
 Y desde esa misma F2 tiene un **segundo factor TOTP opcional** (ver `totp.py`):
 con `ADMIN_PANEL_TOTP_SECRET` en el entorno, `check_credentials` exige ademas
 el codigo de 6 digitos del autenticador, y cada codigo sirve una sola vez. Es
@@ -57,6 +67,8 @@ un codigo usado en un camino no sirve en el otro. El desafio se firma con un
 salt propio, distinto del de la cookie de sesion: uno no puede colarse como
 el otro. Ver ADR-016.
 """
+import contextlib
+import fcntl
 import hmac
 import json
 import logging
@@ -102,6 +114,14 @@ DESAFIO_TOTP_SEGUNDOS = 300
 _TOTP_DESAFIO_SALT = "libraauth.admin.totp-desafio"
 
 
+def _procesos_declarados() -> int:
+    """`WEB_CONCURRENCY` (la variable que lee uvicorn para su `--workers`), o 1 si falta o no es un entero."""
+    try:
+        return max(1, int(os.environ.get("WEB_CONCURRENCY", "1")))
+    except ValueError:
+        return 1
+
+
 class TotpNoEnrolable(RuntimeError):
     """`iniciar_totp` / `confirmar_totp` / `desactivar_totp` no se pueden usar
     ahora. El mensaje dice cual de los tres motivos es:
@@ -119,6 +139,65 @@ def _estado_vacio() -> dict:
     return {"intentos": {}, "ultimo_paso_totp": 0}
 
 
+#: Cuanto espera el cerrojo entre procesos antes de seguir sin el. La seccion critica son decenas de bytes y
+#: un `os.replace`: si pasan segundos, el que lo tiene esta colgado, y dejar a todos sin login es peor.
+_ESPERA_DEL_CERROJO = 5.0
+
+
+@contextlib.contextmanager
+def _cerrojo(path: Path | None):
+    """`flock` exclusivo sobre `<path>.lock`, **entre procesos** (y entre hilos: cada uno abre su descriptor).
+
+    Es el patron de `libracore.arca_wsaa._cerrojo`: `flock` sin bloquear y con reintento, y un limite de espera. Si
+    no hay `path` (estado en memoria) no hace nada. Si el archivo `.lock` no se puede abrir, o el cerrojo no se
+    consigue en `_ESPERA_DEL_CERROJO` segundos, avisa por log y sigue SIN cerrojo: como el resto del rate limiting
+    de este paquete, falla abierto (el login no se cae porque falle el que lo cuenta).
+    """
+    if path is None:
+        yield
+        return
+    fd = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(f"{path}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as e:
+        _log.warning("sin cerrojo entre procesos para %s (%s): se sigue sin el", path, e)
+        yield
+        return
+    tomado = False
+    try:
+        limite = time.monotonic() + _ESPERA_DEL_CERROJO
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                tomado = True
+                break
+            except BlockingIOError:
+                if time.monotonic() > limite:
+                    _log.warning("el cerrojo de %s no se libero en %.0f s: se sigue sin el", path, _ESPERA_DEL_CERROJO)
+                    break
+                time.sleep(0.005)
+        yield
+    finally:
+        if tomado:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _escribir_atomico(path: Path, texto: str, modo: int | None = None) -> None:
+    """Escribe `texto` en `path` reemplazandolo de una vez. El temporal es **propio de cada proceso e hilo**: con el
+    nombre fijo `<archivo>.tmp` de antes, dos procesos escribiendo a la vez se pisaban el temporal."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(texto, encoding="utf-8")
+        if modo is not None:
+            os.chmod(tmp, modo)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 class _EstadoLogin:
     """Intentos fallidos por IP y ultimo contador TOTP aceptado.
 
@@ -126,12 +205,22 @@ class _EstadoLogin:
     escritura lo reemplaza entero (tmp + `os.replace`, atomico en el mismo
     filesystem). Son decenas de bytes y un login cada tanto: no vale la pena
     cachear, y leer siempre del archivo es lo que hace que dos procesos —o el
-    mismo despues de reiniciar— vean lo mismo."""
+    mismo despues de reiniciar— vean lo mismo.
+
+    **Cada leer-modificar-escribir corre bajo `_exclusivo()`**: un lock de hilo
+    y, con archivo, un `flock` sobre `<path>.lock` que lo extiende a los demas
+    procesos. Sin el, dos workers leian el mismo estado, sumaban cada uno su
+    intento y el ultimo en escribir pisaba al otro (se perdian intentos fallidos)."""
 
     def __init__(self, path: str | os.PathLike | None):
         self.path = Path(path) if path else None
         self._lock = threading.Lock()
         self._mem = _estado_vacio()
+
+    @contextlib.contextmanager
+    def _exclusivo(self):
+        with self._lock, _cerrojo(self.path):
+            yield
 
     def _leer(self) -> dict:
         if self.path is None:
@@ -155,9 +244,7 @@ class _EstadoLogin:
             return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(json.dumps(data), encoding="utf-8")
-            os.replace(tmp, self.path)
+            _escribir_atomico(self.path, json.dumps(data))
         except OSError as e:
             # Se avisa UNA vez y se sigue en memoria: el rate limiting no se
             # apaga, pero deja de sobrevivir al reinicio, que es lo que el log
@@ -179,12 +266,12 @@ class _EstadoLogin:
         return {ip: marcas for ip, marcas in podados.items() if marcas}
 
     def intentos_vigentes(self, ip: str, ventana: float, ahora: float) -> int:
-        with self._lock:
+        with self._lock:                      # sólo lee: el archivo siempre está completo (reemplazo atómico)
             data = self._leer()
             return len(self._vigentes(data, ventana, ahora).get(ip, []))
 
     def registrar_fallido(self, ip: str, ventana: float, ahora: float) -> None:
-        with self._lock:
+        with self._exclusivo():
             data = self._leer()
             intentos = self._vigentes(data, ventana, ahora)
             intentos.setdefault(ip, []).append(ahora)
@@ -196,10 +283,25 @@ class _EstadoLogin:
             return int(self._leer()["ultimo_paso_totp"])
 
     def marcar_paso_totp(self, paso: int) -> None:
-        with self._lock:
+        with self._exclusivo():
             data = self._leer()
             data["ultimo_paso_totp"] = max(int(data["ultimo_paso_totp"]), int(paso))
             self._guardar(data)
+
+    def reclamar_paso_totp(self, paso: int) -> bool:
+        """Anota `paso` como usado **si todavia no lo estaba**; `True` si fue este llamado el que lo reclamo.
+
+        Es el anti-replay del TOTP hecho atomico: antes eran `ultimo_paso_totp()` (para validar) y despues
+        `marcar_paso_totp()`, y entre las dos dos procesos aceptaban el mismo codigo. Aca la comparacion y la
+        escritura son una sola seccion critica, de modo que el mismo paso lo acepta un solo proceso.
+        """
+        with self._exclusivo():
+            data = self._leer()
+            if int(paso) <= int(data["ultimo_paso_totp"]):
+                return False
+            data["ultimo_paso_totp"] = int(paso)
+            self._guardar(data)
+            return True
 
 
 def _totp_archivo_vacio() -> dict:
@@ -277,13 +379,10 @@ class _EstadoTotp:
         if self.path is None:
             return False
         data = {"secreto": secreto, "pendiente": pendiente}
-        with self._lock:
+        with self._lock, _cerrojo(self.path):
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = self.path.with_name(self.path.name + ".tmp")
-                tmp.write_text(json.dumps(data), encoding="utf-8")
-                os.chmod(tmp, 0o600)
-                os.replace(tmp, self.path)
+                _escribir_atomico(self.path, json.dumps(data), modo=0o600)
             except OSError as e:
                 _log.error("no se pudo guardar el archivo de TOTP en %s (%s)", self.path, e)
                 return False
@@ -338,6 +437,14 @@ class AdminAuth:
 
         ruta_estado = os.environ.get(ESTADO_PATH_ENV, "") if estado_path is None else estado_path
         self._estado = _EstadoLogin(ruta_estado or None)
+        procesos = _procesos_declarados()
+        if procesos > 1 and not ruta_estado:
+            _log.warning(
+                "WEB_CONCURRENCY=%d pero %s no esta seteado: el limite de intentos de login y el anti-replay del "
+                "TOTP se cuentan POR PROCESO (cada worker tiene su memoria), o sea %d veces mas intentos y un "
+                "codigo reutilizable una vez por worker. Setear %s a un archivo en un volumen compartido.",
+                procesos, ESTADO_PATH_ENV, procesos, ESTADO_PATH_ENV,
+            )
 
         # Ruta del archivo TOTP enrolable en runtime: ADMIN_PANEL_TOTP_PATH si
         # esta; si no (y solo si totp_path no vino explicitamente en "" -
@@ -461,8 +568,9 @@ class AdminAuth:
         paso = validador.paso_valido(codigo or "", ultimo_paso=self._estado.ultimo_paso_totp())
         if not clave_ok or paso is None:
             return False
-        self._estado.marcar_paso_totp(paso)
-        return True
+        # El `paso_valido` de arriba filtra rapido; quien decide es el reclamo atomico: con varios procesos,
+        # dos pedidos con el mismo codigo pasan el filtro, y sólo uno reclama el paso.
+        return self._estado.reclamar_paso_totp(paso)
 
     # ── login en dos pasos ───────────────────────────────────────────────────
 
@@ -510,8 +618,7 @@ class AdminAuth:
         paso = validador.paso_valido(codigo or "", ultimo_paso=self._estado.ultimo_paso_totp())
         if paso is None:
             return False
-        self._estado.marcar_paso_totp(paso)
-        return True
+        return self._estado.reclamar_paso_totp(paso)
 
     # ── enrolamiento TOTP en runtime ─────────────────────────────────────────
 

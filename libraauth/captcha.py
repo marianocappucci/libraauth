@@ -23,22 +23,40 @@ asi que esto **no** es un consumidor mas de la rotacion.
 
 **Anti-replay.** Un desafio resuelto sirve una sola vez. Sin eso, se resuelve
 uno y se lo reusa para cada contrasena durante toda su vigencia, y el costo
-por intento desaparece. Los usados viven en memoria del proceso hasta que
-vencen: los productos corren un solo proceso de uvicorn por contenedor (medido
-el 2026-09-11, `CMD uvicorn ...` sin `--workers`). Un reinicio vacia la lista,
-y lo peor que eso habilita es reusar un desafio de antes del reinicio mientras
-siga vigente.
+por intento desaparece. Donde viven los usados es una costura (`usados=`,
+ADR-023):
+
+- `UsadosEnMemoria` (el default, lo de siempre): en el proceso. **Alcanza con un
+  solo proceso por contenedor** (`CMD uvicorn ...` sin `--workers`, medido el
+  2026-09-11). Con `--workers N` cada proceso tiene su lista y un desafio
+  resuelto sirve **una vez por worker**: N veces mas barato el ataque.
+- `UsadosEnBase(session_factory)`: en la tabla `libraauth_captcha_usados`
+  (migracion `0003`), con un `INSERT ... ON CONFLICT DO NOTHING` por desafio:
+  si inserto, es la primera vez; si no, es un replay. Lo ve cualquier proceso, y
+  sobrevive a un reinicio. Es lo que hay que usar apenas un producto corre con
+  `WEB_CONCURRENCY` > 1.
+
+Con la lista en memoria, un reinicio la vacia, y lo peor que eso habilita es
+reusar un desafio de antes del reinicio mientras siga vigente.
 """
 import base64
 import json
+import random
 import secrets
 import threading
 import time
 from collections.abc import Callable
+from contextlib import AbstractContextManager
+from typing import Protocol
 
 from altcha import create_challenge, verify_solution
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from sqlalchemy import delete, insert
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from .models import CaptchaUsado
 
 ALGORITMO = "PBKDF2/SHA-256"
 
@@ -74,12 +92,106 @@ def _derivar(material: bytes, info: bytes) -> str:
     ).derive(material).hex()
 
 
+class UsadosDeCaptcha(Protocol):
+    """Donde se anotan los desafios ya resueltos. La costura de `Captcha(usados=...)`."""
+
+    def usar(self, firma: str, vence: float, ahora: float) -> bool:
+        """Anota `firma` (valida hasta `vence`, en segundos desde la epoca). `True` si **era la primera vez**,
+        `False` si ya estaba anotada (un replay). Atomico: dos llamadas simultaneas con la misma firma, desde
+        donde sea, devuelven `True` una sola vez."""
+        ...
+
+
+class UsadosEnMemoria:
+    """Los desafios usados, en el proceso: el default de siempre. Ver el docstring del modulo."""
+
+    def __init__(self) -> None:
+        self._usados: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        return len(self._usados)
+
+    def usar(self, firma: str, vence: float, ahora: float) -> bool:
+        with self._lock:
+            for usada in [f for f, v in self._usados.items() if v < ahora]:
+                del self._usados[usada]
+            if firma in self._usados:
+                return False
+            self._usados[firma] = vence
+        return True
+
+
+class UsadosEnBase:
+    """Los desafios usados, en la tabla `libraauth_captcha_usados`: compartidos por todos los procesos de la instancia.
+
+    `session_factory` es el mismo que recibe el `UserRepository` del producto (cualquier callable que devuelva un
+    `Session` como context manager). La tabla la crea la migracion `0003_captcha_usados`.
+
+    **Una sola sentencia decide, y es atomica:** `INSERT ... ON CONFLICT DO NOTHING` sobre la PK (la firma). Si inserto
+    una fila, la firma era nueva; si no, ya estaba. No hay un `SELECT` antes (dos procesos lo contestarian los dos).
+
+    **Poda probabilistica.** Cada `usar` borra los vencidos con probabilidad `poda` (2 % por defecto): la tabla no
+    crece sin tope y ningun login paga un `DELETE` extra casi nunca. Un desafio vive 10 minutos y el login se hace
+    de a uno por vez: la tabla tiene decenas de filas, no importa cuando se poda. `azar` existe para los tests.
+
+    **Si la base falla**, `usar` levanta: el captcha no se puede validar y el login responde 500 en lugar de dejar pasar
+    un desafio sin anotar (que permitiria el replay). Es lo contrario del rate limiting, que falla abierto: aca el
+    costo del error es justamente lo que el captcha existe para cobrar.
+    """
+
+    def __init__(
+        self,
+        session_factory: Callable[[], AbstractContextManager[Session]],
+        *,
+        poda: float = 0.02,
+        azar: Callable[[], float] = random.random,
+    ) -> None:
+        self._sessions = session_factory
+        self._poda = poda
+        self._azar = azar
+
+    def usar(self, firma: str, vence: float, ahora: float) -> bool:
+        with self._sessions() as session:
+            nuevo = self._insertar(session, firma, vence)
+            if self._azar() < self._poda:
+                session.execute(delete(CaptchaUsado.__table__).where(CaptchaUsado.__table__.c.vence < ahora))
+            session.commit()
+        return nuevo
+
+    @staticmethod
+    def _insertar(session: Session, firma: str, vence: float) -> bool:
+        dialecto = session.get_bind().dialect.name
+        if dialecto in ("postgresql", "sqlite"):
+            if dialecto == "postgresql":
+                from sqlalchemy.dialects.postgresql import insert as insert_propio
+            else:
+                from sqlalchemy.dialects.sqlite import insert as insert_propio
+            tabla = CaptchaUsado.__table__
+            # `RETURNING` y no `rowcount`: con psycopg 3 el `rowcount` de este INSERT vuelve -1. Si inserto, devuelve
+            # la fila; si el conflicto lo descarto, no devuelve nada.
+            sentencia = (insert_propio(tabla).values(firma=firma, vence=vence)
+                         .on_conflict_do_nothing().returning(tabla.c.firma))
+            return session.execute(sentencia).first() is not None
+        # Otro dialecto: el INSERT pelado y la PK deciden, dentro de un savepoint para no abortar la transaccion.
+        try:
+            with session.begin_nested():
+                session.execute(insert(CaptchaUsado.__table__).values(firma=firma, vence=vence))
+        except IntegrityError:
+            return False
+        return True
+
+
 class Captcha:
     """Emite desafios y verifica sus soluciones, una sola vez cada una.
 
     `costo`, `contador_min` y `contador_rango` existen para los tests, que no
     pueden gastar un segundo de CPU por cada login. `reloj` tambien: con el se
     emite un desafio ya vencido sin esperar diez minutos.
+
+    `usados` es donde se anotan los desafios ya resueltos (ver el docstring del
+    modulo): `UsadosEnMemoria()` por defecto, `UsadosEnBase(session_factory)` para
+    un producto que corre con varios procesos.
     """
 
     def __init__(
@@ -91,6 +203,7 @@ class Captcha:
         contador_rango: int = CONTADOR_RANGO,
         vigencia_segundos: int = VIGENCIA_SEGUNDOS,
         reloj: Callable[[], float] = time.time,
+        usados: UsadosDeCaptcha | None = None,
     ):
         if not secret_key:
             raise ValueError("Captcha necesita el SECRET_KEY de la instancia.")
@@ -102,8 +215,7 @@ class Captcha:
         self._contador_rango = contador_rango
         self._vigencia = vigencia_segundos
         self._reloj = reloj
-        self._usados: dict[str, float] = {}
-        self._lock = threading.Lock()
+        self._usados = usados if usados is not None else UsadosEnMemoria()
 
     def emitir(self) -> dict:
         """El desafio, en la forma que el widget espera (`parameters` + `signature`)."""
@@ -136,11 +248,4 @@ class Captcha:
             vence = float(desafio["parameters"]["expiresAt"])
         except Exception:
             return False
-        with self._lock:
-            ahora = self._reloj()
-            for usada in [f for f, v in self._usados.items() if v < ahora]:
-                del self._usados[usada]
-            if firma in self._usados:
-                return False
-            self._usados[firma] = vence
-        return True
+        return self._usados.usar(firma, vence, self._reloj())

@@ -19,6 +19,7 @@ from datetime import datetime
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -438,3 +439,26 @@ class SecretoInstancia(Base):
     actualizado_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.now, server_default=ahora_local()
     )
+
+
+class CaptchaUsado(Base):
+    """Un desafio de captcha ya resuelto: la tabla de `captcha.UsadosEnBase` (v0.50.0, ADR-023).
+
+    **Por que existe.** El anti-replay del captcha ALTCHA (un desafio resuelto sirve una sola vez) vivia en la memoria
+    del proceso. Con `uvicorn --workers N` cada worker tenia su lista, y un desafio resuelto servia una vez **por
+    worker**. Esta tabla es la lista compartida: `INSERT ... ON CONFLICT DO NOTHING` sobre la PK decide, atomicamente y
+    sin importar cual proceso lo recibe, quien fue el primero.
+
+    - `firma`: la firma HMAC del desafio (hex de 64 caracteres), que lo identifica. Es la PK: un desafio, una fila.
+    - `vence`: cuando vence el desafio, en segundos desde la epoca (el mismo `expiresAt` que lleva el desafio, ya
+      sin sentido pasado ese instante: sin eso un desafio vencido no pasa de todos modos, asi que la fila se puede
+      borrar). Es lo que usa la poda.
+
+    No tiene FK ni `ts`: es un cerrojo de corta vida, no un registro. Tabla nueva, asi que `create_all()` la crea sola
+    donde el producto todavia lo use, y la cadena de Alembic (`0003_captcha_usados`) donde no.
+    """
+
+    __tablename__ = "libraauth_captcha_usados"
+
+    firma: Mapped[str] = mapped_column(String(128), primary_key=True)
+    vence: Mapped[float] = mapped_column(Float, nullable=False, index=True)

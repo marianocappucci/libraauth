@@ -42,6 +42,7 @@ from libraauth.models import (
     AceptacionTerminos,
     AuthEvent,
     Base,
+    CaptchaUsado,
     DemoCodigo,
     PasswordResetToken,
     SecretoInstancia,
@@ -51,7 +52,7 @@ from libraauth.models import (
 from libraauth.repository import UserRepository
 
 POSTGRES_URL = os.environ.get("LIBRAAUTH_POSTGRES_URL", "")
-HEAD = "0002_secretos_instancia"
+HEAD = "0003_captcha_usados"
 TABLAS = set(Base.metadata.tables)
 #: El id de la cabeza de LibraCore (`origin/develop`, 2026-09-11) — el id, no el
 #: nombre del archivo, que es mas largo. El valor da igual: lo que se mide es
@@ -167,7 +168,7 @@ def _version(url, tabla=migrar.TABLA_DE_VERSION):
 
 
 def _sembrar(url):
-    """Una fila en cada una de las siete tablas, por el ORM — como las escribe
+    """Una fila en cada una de las ocho tablas, por el ORM — como las escribe
     un producto. Sin filas, "no se perdio nada" se cumple solo."""
     e = _engine(url)
     ahora = datetime(2026, 9, 11, 10, 30)
@@ -191,6 +192,7 @@ def _sembrar(url):
                 # que la fila sobreviva, no que se pueda descifrar.
                 SecretoInstancia(clave="mp_access_token", valor_cifrado="v1:blob",
                                  actualizado_at=ahora),
+                CaptchaUsado(firma="d" * 64, vence=2_000_000_000.0),
             ])
             s.commit()
     finally:
@@ -403,19 +405,59 @@ def test_diferencias_ve_la_forma_de_libracore_y_nada_ajeno(fabrica):
 # ── Downgrade ────────────────────────────────────────────────────────────────
 
 
-def test_la_baseline_no_se_baja_y_no_borra_nada(fabrica):
-    """Mismo criterio que LibraCore y LibraCommerce: el rollback de la baseline es
-    el backup. Se ejercita para ver que el rechazo no deja la base a medio borrar."""
+def test_la_0003_se_baja_y_se_vuelve_a_subir_sin_tocar_el_resto(fabrica):
+    """La tabla del captcha es un cerrojo de vida corta (10 minutos): bajarla no pierde nada que importe, a diferencia
+    de `0002` (los secretos) y la baseline. Es el rollback de ESTA version sola."""
     url = fabrica()
     migrar.upgrade(url)
     _sembrar(url)
+    otras = TABLAS - {"libraauth_captcha_usados"}
+    filas_antes = _filas(url, otras)
+
+    command.downgrade(migrar.configuracion(url), "0002_secretos_instancia")
+
+    assert "libraauth_captcha_usados" not in _tablas(url)
+    assert _version(url) == ["0002_secretos_instancia"]
+    assert _filas(url, otras) == filas_antes
+
+    migrar.upgrade(url)
+    assert "libraauth_captcha_usados" in _tablas(url)
+    assert _version(url) == [HEAD]
+
+
+def test_la_0003_sobre_una_base_que_ya_tiene_la_tabla_no_la_toca(fabrica):
+    """El `create_all()` del arranque puede haberla creado antes: la revision termina sin tocar nada."""
+    url = fabrica()
+    e = _engine(url)
+    Base.metadata.create_all(e)
+    e.dispose()
+    antes = _foto(url, {"libraauth_captcha_usados"})
+    assert antes, "la tabla tiene que existir antes de la migracion"
+
+    migrar.upgrade(url)
+
+    assert _foto(url, {"libraauth_captcha_usados"}) == antes
+    assert _version(url) == [HEAD]
+
+
+def test_la_baseline_no_se_baja_y_no_borra_nada(fabrica):
+    """Mismo criterio que LibraCore y LibraCommerce: el rollback de la baseline es
+    el backup. Se ejercita para ver que el rechazo no deja la base a medio borrar.
+
+    Desde la `0003`, `downgrade base` desde la cabeza baja primero la `0003` (que se puede bajar) y recien
+    despues choca con la `0002`: por eso se parte de ahi, que es donde queda la base en SQLite (el DDL de SQLite
+    no es transaccional; el de PostgreSQL deshace todo)."""
+    url = fabrica()
+    migrar.upgrade(url)
+    _sembrar(url)
+    command.downgrade(migrar.configuracion(url), "0002_secretos_instancia")
     filas_antes = _filas(url)
 
     with pytest.raises(RuntimeError, match="no se baja"):
         command.downgrade(migrar.configuracion(url), "base")
 
     assert _filas(url) == filas_antes
-    assert _version(url) == [HEAD]
+    assert _version(url) == ["0002_secretos_instancia"]
 
 
 # ── La cadena como paquete ───────────────────────────────────────────────────

@@ -112,6 +112,13 @@ proveedor externo, sin cookies y sin tocar la CSP—. El widget va en
 - Fuera del router (el backoffice): `Captcha(secret_key)`, con `emitir()` y
   `verificar(payload)`. Tiene que ser **uno por proceso**: la lista de
   desafios usados vive adentro.
+- **Con varios procesos (`uvicorn --workers N`), los usados van a la base**
+  (ADR-023): `build_json_api_auth_router(captcha=True,
+  captcha_usados=UsadosEnBase(session_factory))` (o `Captcha(secret,
+  usados=UsadosEnBase(session_factory))` en `app.state.captcha`). Es la tabla
+  `libraauth_captcha_usados` (migracion `0003`) con un `INSERT ... ON CONFLICT DO
+  NOTHING`: lo ve cualquier worker y sobrevive al reinicio. Sin eso, el default
+  (`UsadosEnMemoria`) hace que un desafio resuelto sirva **una vez por worker**.
 
 ## Log de actividad (v0.9.0)
 
@@ -310,7 +317,7 @@ unica forma de comprobar que la config anda es pedir un reset de verdad.
 | Variable | Efecto |
 |---|---|
 | `ADMIN_PANEL_TOTP_SECRET` | Secreto base32 del autenticador. Con esto seteado, `check_credentials(username, password, codigo=...)` exige ademas el codigo TOTP de 6 digitos; cada codigo sirve una sola vez. |
-| `ADMIN_PANEL_ESTADO_PATH` | Archivo JSON donde viven los intentos fallidos por IP y el ultimo codigo usado. Con esto, el bloqueo por 5 intentos en 15 minutos **sobrevive al reinicio del contenedor**. |
+| `ADMIN_PANEL_ESTADO_PATH` | Archivo JSON donde viven los intentos fallidos por IP y el ultimo codigo usado. Con esto, el bloqueo por 5 intentos en 15 minutos **sobrevive al reinicio del contenedor**. **Con `WEB_CONCURRENCY` > 1 es obligatoria en la practica** (ADR-023): sin ella cada worker cuenta por su cuenta, y el arranque lo avisa por log. Con ella, cada actualizacion corre bajo un `flock` sobre `<archivo>.lock`, asi que todos los procesos suman sobre el mismo dato y un codigo TOTP lo acepta uno solo. |
 
 Enrolar al superadmin:
 
