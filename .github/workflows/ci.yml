@@ -120,9 +120,12 @@ jobs:
           # Alembic (2026-09-11): su mitad PostgreSQL se saltea sin la URL, y
           # es la mitad que dice algo sobre las bases del parque. Y el del
           # registrador DB-API (2026-10-12): sus tests de PostgreSQL son los que
-          # miran que el INSERT entre en las dos variantes de la tabla.
+          # miran que el INSERT entre en las dos variantes de la tabla. Y los dos de los
+          # varios procesos (2026-10-13, ADR-023): el anti-replay del captcha compartido y el
+          # bloqueo por IP, probados con dos procesos de verdad contra PostgreSQL.
           pytest tests/test_postgres_real.py tests/test_rate_limiting_ts_texto.py \
             tests/test_cadena_alembic.py tests/test_registrador_dbapi.py \
+            tests/test_captcha_usados.py tests/test_login_rate_limiting_varios_procesos.py \
             -q --no-cov -p no:cacheprovider \
             | tee /tmp/pg_gate.txt
 

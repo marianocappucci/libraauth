@@ -29,7 +29,7 @@ from .auth_events import (
     contar_fallidos_seguro,
     registrar_seguro,
 )
-from .captcha import Captcha
+from .captcha import Captcha, UsadosDeCaptcha
 from .crypto import ClaveDeCifradoAusente
 from .demo_codigos import DIAS_DEFECTO, USOS_DEFECTO, CodigoInvalido
 from .password_reset import EmailNotConfigured, InvalidResetToken
@@ -402,7 +402,7 @@ CAPTCHA_INVALIDO = "Falta la verificación «No soy un robot», o venció. Volv�
 _captcha_lock = threading.Lock()
 
 
-def _captcha_de(request: Request) -> Captcha:
+def _captcha_de(request: Request, usados: UsadosDeCaptcha | None = None) -> Captcha:
     """El `Captcha` de la app: uno solo por proceso.
 
     Si el producto no dejo uno en `app.state.captcha`, se arma con el
@@ -410,13 +410,19 @@ def _captcha_de(request: Request) -> Captcha:
     uno por request: la lista de desafios usados vive adentro, y dos
     instancias la partirian en dos — un desafio resuelto serviria una vez en
     cada una.
+
+    `usados` (el `captcha_usados=` de `build_json_api_auth_router`) es donde se
+    anotan los desafios resueltos: con `UsadosEnBase`, **compartidos entre los
+    procesos** de la instancia. Sin eso, la lista vive en memoria y con varios
+    workers cada uno tiene la suya. Un `app.state.captcha` que el producto
+    armo a mano manda sobre esto.
     """
     captcha = getattr(request.app.state, "captcha", None)
     if captcha is None:
         with _captcha_lock:
             captcha = getattr(request.app.state, "captcha", None)
             if captcha is None:
-                captcha = Captcha(json_api_get_session_auth(request).secret_key)
+                captcha = Captcha(json_api_get_session_auth(request).secret_key, usados=usados)
                 request.app.state.captcha = captcha
     return captcha
 
@@ -839,6 +845,7 @@ def build_json_api_auth_router(
     prefix: str = "/auth",
     get_extras: Callable[[Request, dict], dict] | None = None,
     captcha: bool = False,
+    captcha_usados: UsadosDeCaptcha | None = None,
 ) -> APIRouter:
     """Router `/auth` (login/logout/me) para SPAs sin backoffice
     server-rendered propio. Espera `request.app.state.users`/
@@ -893,6 +900,13 @@ def build_json_api_auth_router(
     pantalla de libra-ui que lo resuelve: prenderlo sin ella dejaria a todos
     afuera. El bloqueo por IP sigue cortando antes, y un captcha que falta o
     no vale es un 400 que **no** cuenta como intento fallido.
+
+    `captcha_usados` (ADR-023) es donde el captcha anota los desafios ya resueltos
+    (un desafio sirve una sola vez). Por defecto, la memoria del proceso: **con
+    `uvicorn --workers N` hay que pasar `UsadosEnBase(session_factory)`**, o cada
+    worker tiene su lista y un desafio resuelto sirve una vez por worker. Requiere
+    la tabla `libraauth_captcha_usados` (migracion `0003`). Si el producto arma su
+    propio `Captcha` en `app.state.captcha`, esto no se usa.
     """
     # 🔑 `prefix` configurable, como ya lo aceptan `build_smtp_settings_router`
     # y `build_demo_codigos_router`. El default `/auth` es lo que ya usan los
@@ -943,7 +957,7 @@ def build_json_api_auth_router(
             primero que lo usara se lo gastaria al resto.
             """
             response.headers["Cache-Control"] = "no-store"
-            return _captcha_de(request).emitir()
+            return _captcha_de(request, captcha_usados).emitir()
 
     @router.post("/login", response_model=_UserOut)
     def login(data: _LoginRequest, request: Request, response: Response):
@@ -975,7 +989,7 @@ def build_json_api_auth_router(
         # un desafio resuelto. Si falta o no vale no se anota nada: no se llego
         # a probar ninguna contrasena, y contarlo dejaria bloquear gratis una
         # IP compartida.
-        if captcha and not _captcha_de(request).verificar(data.captcha):
+        if captcha and not _captcha_de(request, captcha_usados).verificar(data.captcha):
             raise HTTPException(400, CAPTCHA_INVALIDO)
         users = request.app.state.users
         user = users.check_credentials(data.username, data.password)
@@ -1198,7 +1212,7 @@ def build_json_api_auth_router(
             """
             # Sin captcha, este endpoint manda correos en nombre de la
             # instancia a quien se quiera y a la velocidad que se quiera.
-            if captcha and not _captcha_de(request).verificar(data.captcha):
+            if captcha and not _captcha_de(request, captcha_usados).verificar(data.captcha):
                 raise HTTPException(400, CAPTCHA_INVALIDO)
             servicio = request.app.state.password_reset
             try:
