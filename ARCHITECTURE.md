@@ -44,6 +44,8 @@ import) — el resto orbita alrededor de él.
 - **`terminos.py`** (`TerminosRepository`): términos y condiciones versionados
   por hash (`hash_vigente`, `exige_aceptacion`, `hay_terminos_pendientes`) — un
   producto puede exigir la aceptación de la versión vigente antes de operar.
+  Si hay una próxima versión anunciada (`proxima_anunciada`), `GET /terminos` la
+  suma como `proxima` y `POST /aceptar` admite aceptarla por adelantado (ADR-024).
 - **`demo_codigos.py`** (`DemoCodigoRepository`): códigos de acceso demo de un
   solo uso, hasheados.
 - **`auth_events.py`** (`AuthEventRepository`): registro de accesos e intentos
