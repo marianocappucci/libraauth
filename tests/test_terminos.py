@@ -532,7 +532,12 @@ def test_el_dia_anterior_sigue_rigiendo_la_1_0(sessions, monkeypatch):
     monkeypatch.setattr(t, "_hoy_argentina", lambda: date(2026, 11, 8))
     cliente = _logueado(_app(sessions))
     assert cliente.get("/terminos").json()["version"] == "1.0"
-    assert cliente.post("/terminos/aceptar", json={"version": "1.1"}).status_code == 409
+    # Aceptar la 1.1 el día anterior es la aceptación por adelantado (ADR-024): se registra, pero no rige todavía, y la
+    # vigente (1.0) sigue pendiente. Antes de ADR-024 esto era un 409.
+    assert cliente.post("/terminos/aceptar", json={"version": "1.1"}).status_code == 200
+    estado = cliente.get("/terminos").json()
+    assert estado["version"] == "1.0" and estado["pendiente"] is True
+    assert cliente.get("/clientes").status_code == 403
 
 
 def test_un_repositorio_con_version_fija_no_cambia_por_fecha(sessions, monkeypatch):
@@ -541,3 +546,220 @@ def test_un_repositorio_con_version_fija_no_cambia_por_fecha(sessions, monkeypat
     monkeypatch.setattr(t, "_hoy_argentina", lambda: date(2027, 1, 1))
     assert t.TerminosRepository(sessions, version="1.0").version == "1.0"
     assert t.TerminosRepository(sessions).version == "1.1"
+
+
+# ── Aceptar la próxima versión por adelantado (ADR-024) ───────────────────────────
+#
+# El responsable acepta la 1.1 antes del 09-11 desde adentro del sistema (cláusulas 29.2 y 29.4). Lo que se fija, en orden de
+# lo que más duele si falla: que el 09-11 esa instancia NO vuelva a quedar pendiente, que la fila sea una prueba completa,
+# que sólo la acepte quien puede (30.5), que una demo no vea el aviso y que nada de lo que ya existía cambie.
+
+def test_el_estado_anuncia_la_proxima_con_su_hash_y_el_resumen(sessions):
+    import libraauth.terminos as t
+
+    cliente = _logueado(_app(sessions))
+    estado = cliente.get("/terminos").json()
+    assert estado["proxima"] == {
+        "version": "1.1",
+        "vigente_desde": "09-11-2026",
+        "hash_texto": t.hash_proximo(),
+        "aceptada": False,
+        "aceptada_por": None,
+        "aceptada_at": None,
+        "resumen_del_cambio": "El abono mensual pasa a ser precio final con IVA incluido.",
+        "texto": None,
+        "texto_html": None,
+    }
+    # Los campos de siempre no cambian: la vigente sigue siendo la 1.0 y sigue pendiente.
+    assert estado["version"] == "1.0" and estado["pendiente"] is True
+    assert estado["hash_texto"] == t.hash_vigente() != estado["proxima"]["hash_texto"]
+
+
+def test_el_texto_de_la_proxima_viaja_solo_con_texto_1(sessions):
+    import libraauth.terminos as t
+
+    cliente = _logueado(_app(sessions))
+    liviano = cliente.get("/terminos").json()["proxima"]
+    assert liviano["texto"] is None and liviano["texto_html"] is None
+    completo = cliente.get("/terminos", params={"texto": 1}).json()["proxima"]
+    assert completo["texto"] == t.texto_proximo()
+    assert "precio final con el IVA incluido" in completo["texto_html"]
+    # No se mezcla con el de la vigente.
+    assert cliente.get("/terminos", params={"texto": 1}).json()["texto"] == t.texto_vigente()
+
+
+def test_sin_proxima_anunciada_el_estado_trae_proxima_null(sessions, monkeypatch):
+    import libraauth.terminos as t
+
+    monkeypatch.setattr(t, "VERSION_PROXIMA", None)
+    cliente = _logueado(_app(sessions))
+    estado = cliente.get("/terminos").json()
+    assert "proxima" in estado and estado["proxima"] is None
+    assert estado["version"] == "1.0"
+    assert cliente.post("/terminos/aceptar", json={"version": "1.1"}).status_code == 409
+
+
+def test_aceptar_la_proxima_registra_version_hash_quien_e_ip_y_aparece_en_el_historial(sessions):
+    import libraauth.terminos as t
+
+    app = _app(sessions)
+    cliente = TestClient(app, base_url="https://testserver", client=("172.18.0.19", 50000))
+    assert cliente.post("/auth/login", json={"username": "admin", "password": "adminpw"}).status_code == 200
+
+    r = cliente.post(
+        "/terminos/aceptar", json={"version": "1.1"},
+        headers={"X-Forwarded-For": "203.0.113.7", "User-Agent": "pytest-adelanto"},
+    )
+    assert r.status_code == 200, r.text
+    estado = r.json()
+    # La respuesta es el estado de siempre más el bloque: la vigente sigue pendiente, la próxima ya figura aceptada.
+    assert estado["version"] == "1.0" and estado["pendiente"] is True
+    assert estado["proxima"]["aceptada"] is True
+    assert estado["proxima"]["aceptada_por"] == "Admin" and estado["proxima"]["aceptada_at"]
+
+    (fila,) = cliente.get("/terminos/historial").json()
+    assert fila["version"] == "1.1" and fila["hash_texto"] == t.hash_proximo()
+    assert fila["username"] == "admin" and fila["nombre"] == "Admin"
+    assert fila["ip"] == "203.0.113.7" and fila["user_agent"] == "pytest-adelanto"
+    # Aceptar la próxima no destraba nada de lo vigente.
+    assert cliente.get("/clientes").status_code == 403
+
+
+def test_aceptar_la_proxima_dos_veces_no_duplica_la_fila(sessions):
+    app = _app(sessions)
+    cliente = _logueado(app)
+    for _ in range(2):
+        assert cliente.post("/terminos/aceptar", json={"version": "1.1"}).status_code == 200
+    assert [f["version"] for f in app.state.terminos.historial()] == ["1.1"]
+
+
+def test_aceptar_la_proxima_no_pisa_la_cache_de_la_vigente(sessions):
+    """`esta_aceptada` es sobre la vigente: aceptar la 1.1 no puede dejar pasar el gate de la 1.0."""
+    app = _app(sessions)
+    cliente = _logueado(app)
+    cliente.post("/terminos/aceptar", json={"version": "1.1"})
+    assert app.state.terminos.esta_aceptada() is False
+    assert cliente.get("/clientes").status_code == 403
+    assert cliente.post("/terminos/aceptar", json={"version": "1.0"}).status_code == 200
+    assert cliente.get("/clientes").status_code == 200
+    # Y las dos quedan: la 1.0 aceptada hoy, la 1.1 por adelantado.
+    assert sorted(f["version"] for f in app.state.terminos.historial()) == ["1.0", "1.1"]
+
+
+def test_un_operador_no_puede_aceptar_la_proxima(sessions):
+    """Cláusula 30.5: la misma regla de roles que la vigente. Ve el anuncio (el estado es de lectura) pero no acepta."""
+    app = _app(sessions)
+    ana = _logueado(app, "ana", "anapw")
+    estado = ana.get("/terminos").json()
+    assert estado["puede_aceptar"] is False and estado["proxima"]["aceptada"] is False
+    assert ana.post("/terminos/aceptar", json={"version": "1.1"}).status_code == 403
+    assert app.state.terminos.historial() == []
+
+
+def test_una_version_que_no_es_ni_la_vigente_ni_la_proxima_da_409(sessions):
+    cliente = _logueado(_app(sessions))
+    for version in ("0.9", "1.2", "2.0", ""):
+        r = cliente.post("/terminos/aceptar", json={"version": version})
+        assert r.status_code == 409, version
+    assert "1.0" in r.json()["detail"] and "1.1" in r.json()["detail"]
+
+
+def test_el_09_11_una_instancia_que_ya_acepto_la_proxima_no_queda_pendiente(sessions, monkeypatch):
+    """🔴 El punto de todo el cambio. Sin esto, aceptar por adelantado no sirve de nada: el gate volvería a cortar igual."""
+    import libraauth.terminos as t
+
+    app = _app(sessions)
+    cliente = _logueado(app)
+    # Hoy (10-10) la instancia acepta la 1.0 que rige y la 1.1 por adelantado.
+    assert cliente.post("/terminos/aceptar", json={"version": "1.0"}).status_code == 200
+    assert cliente.post("/terminos/aceptar", json={"version": "1.1"}).status_code == 200
+    assert cliente.get("/clientes").status_code == 200
+
+    monkeypatch.setattr(t, "_hoy_argentina", lambda: date(2026, 11, 9))
+    # El mismo proceso, el mismo repositorio, sin redeploy: la 1.1 rige y ya está aceptada.
+    r = cliente.get("/clientes")
+    assert r.status_code == 200, r.text
+    estado = cliente.get("/terminos").json()
+    assert estado["version"] == "1.1" and estado["vigente_desde"] == "09-11-2026"
+    assert estado["pendiente"] is False
+    assert estado["aceptada_por"] == "Admin" and estado["aceptada_at"]
+    # La prueba es la fila hecha por adelantado, con el hash del texto que rige ese día.
+    assert estado["hash_texto"] == t.hash_vigente()
+    filas = app.state.terminos.historial()
+    assert [f["version"] for f in filas] == ["1.1", "1.0"]
+    assert filas[0]["hash_texto"] == t.hash_vigente()
+    # Y ya no hay «próxima»: pasó a ser la vigente.
+    assert estado["proxima"] is None
+    assert cliente.post("/terminos/aceptar", json={"version": "1.1"}).status_code == 200  # idempotente
+    assert len(app.state.terminos.historial()) == 2
+
+
+def test_el_09_11_sin_la_aceptacion_adelantada_la_instancia_sigue_pendiente(sessions, monkeypatch):
+    """Control negativo del anterior: el verde de arriba se explicaría igual por un gate que ya no corta."""
+    import libraauth.terminos as t
+
+    cliente = _logueado(_app(sessions))
+    cliente.post("/terminos/aceptar", json={"version": "1.0"})
+    monkeypatch.setattr(t, "_hoy_argentina", lambda: date(2026, 11, 9))
+    assert cliente.get("/clientes").status_code == 403
+    assert cliente.get("/terminos").json()["pendiente"] is True
+
+
+def test_si_la_proxima_ya_rige_aceptarla_es_aceptar_la_vigente(sessions, monkeypatch):
+    """El 09-11 deja de existir el camino «por adelantado»: es el de siempre, y el bloque `proxima` desaparece."""
+    import libraauth.terminos as t
+
+    monkeypatch.setattr(t, "_hoy_argentina", lambda: date(2026, 11, 9))
+    app = _app(sessions)
+    cliente = _logueado(app)
+    assert cliente.get("/terminos").json()["proxima"] is None
+    assert cliente.post("/terminos/aceptar", json={"version": "1.1"}).status_code == 200
+    assert cliente.get("/clientes").status_code == 200
+    assert t.proxima_anunciada() is None
+
+
+def test_en_una_demo_no_hay_aviso_ni_se_acepta_la_proxima(sessions, monkeypatch):
+    """Una demo no es una instancia de cliente (`exige_aceptacion`): nadie firma por nadie, ni hoy ni por adelantado."""
+    _demo(monkeypatch)
+    app = _app(sessions)
+    admin = _logueado(app, "admin", "adminpw")
+    assert admin.get("/terminos").json()["proxima"] is None
+    assert admin.get("/terminos", params={"texto": 1}).json()["proxima"] is None
+    assert admin.post("/terminos/aceptar", json={"version": "1.1"}).status_code == 409
+    assert app.state.terminos.historial() == []
+    # Control: fuera de la demo, el mismo admin sí ve el anuncio.
+    monkeypatch.delenv("DEMO_MODE", raising=False)
+    monkeypatch.delenv("DEMO_USERNAME", raising=False)
+    assert _logueado(_app(sessions), "admin", "adminpw").get("/terminos").json()["proxima"] is not None
+
+
+def test_el_texto_de_la_1_1_esta_congelado_desde_que_se_anuncia():
+    """La prueba de una aceptación adelantada es (versión, hash) y el 09-11 `aceptacion_vigente` la encuentra POR VERSIÓN.
+
+    Si alguien tocara el texto de la 1.1 después de que un cliente la aceptó, esa fila diría haber aceptado un texto que
+    ya no es el que rige, sin ningún síntoma. Este test es el aviso: cambiar el contenido exige una versión nueva (1.2),
+    como ya dice el comentario de `VERSION_VIGENTE`, y recién ahí se actualiza este hash."""
+    import libraauth.terminos as t
+
+    assert t.hash_proximo() == "72b7eb3b9a0797596c3671d08a9dc4f1aa5677e4b1b68ee83e520528130fe113"
+
+
+def test_con_el_prefijo_api_terminos_de_contalibra_y_restolibra_tambien_anda(sessions):
+    """Contalibra y Restolibra montan el router en `/api/terminos` (`build_terminos_router(prefix=...)`); el frontend
+    lo sabe por `terminosPath`. El bloque `proxima` y la aceptación viajan por el mismo prefijo, sin ruta aparte."""
+    app = FastAPI()
+    usuarios = _Usuarios()
+    app.state.users = usuarios
+    app.state.session_auth = SessionAuth(
+        dev_secret_fallback="dev",
+        get_user_by_username=usuarios.get_by_username,
+        check_credentials=usuarios.check_credentials,
+    )
+    app.state.terminos = TerminosRepository(sessions)
+    app.include_router(build_json_api_auth_router())
+    app.include_router(build_terminos_router(prefix="/api/terminos"))
+    cliente = _logueado(app)
+
+    assert cliente.get("/api/terminos").json()["proxima"]["aceptada"] is False
+    assert cliente.post("/api/terminos/aceptar", json={"version": "1.1"}).json()["proxima"]["aceptada"] is True
+    assert [f["version"] for f in cliente.get("/api/terminos/historial").json()] == ["1.1"]
