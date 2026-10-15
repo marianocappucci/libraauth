@@ -56,6 +56,8 @@ dev = [
     # La suite ejercita la cadena (tests/test_cadena_alembic.py).
     "alembic>=1.13",
     "pytest-cov>=6",
+    # `-n 4` en el CI (reglas/ci.md del wiki); la base por worker vive en tests/conftest.py.
+    "pytest-xdist>=3.8",
     "ruff>=0.13",
     "pytest>=8.0",
     "httpx>=0.27",
