@@ -70,9 +70,9 @@ VIGENTE_DESDE = "22-08-2026"
 ARCHIVO_TERMINOS = Path(__file__).parent / "legal" / "terminos_v1.md"
 
 #: **La próxima versión**, publicada pero todavía NO vigente (cláusula 29.2: se publica en el sitio y se notifica con
-#: treinta días de anticipación). Mientras está acá no cambia nada adentro del sistema: el gate y el hash que se guarda
-#: como prueba siguen siendo los de `VERSION_VIGENTE`. Sólo la publica `libra_web_kit.legal_gen`, al lado de la
-#: vigente. El día que entra en vigencia se pasa a `VERSION_VIGENTE`/`VIGENTE_DESDE`/`ARCHIVO_TERMINOS` y estas tres
+#: treinta días de anticipación). Mientras está acá el gate y el hash que se guarda como prueba siguen siendo los de
+#: `VERSION_VIGENTE`; la publica `libra_web_kit.legal_gen`, al lado de la vigente, y el estado de `GET /terminos` la
+#: anuncia como `proxima`, que el responsable puede aceptar por adelantado (ADR-024). El día que entra en vigencia se pasa a `VERSION_VIGENTE`/`VIGENTE_DESDE`/`ARCHIVO_TERMINOS` y estas tres
 #: vuelven a `None`: recién ahí el sistema pide la nueva aceptación (cláusula 29.3).
 #:
 #: 1.1 (decisión del dueño, 2026-10-10): la cláusula 5.1 pasa de «más IVA» a «precio final con el IVA incluido» para
@@ -80,6 +80,10 @@ ARCHIVO_TERMINOS = Path(__file__).parent / "legal" / "terminos_v1.md"
 VERSION_PROXIMA: str | None = "1.1"
 PROXIMA_DESDE: str | None = "09-11-2026"
 ARCHIVO_PROXIMA: Path | None = Path(__file__).parent / "legal" / "terminos_v1_1.md"
+
+#: Una línea con lo que cambia, para el aviso de adentro del sistema (ADR-024). Va junto a la versión porque es del mismo
+#: anuncio: el día que la próxima rige deja de mostrarse, igual que `VERSION_PROXIMA`. Texto plano, sin HTML.
+RESUMEN_PROXIMA: str | None = "El abono mensual pasa a ser precio final con IVA incluido."
 
 #: Argentina no tiene horario de verano: un desfase fijo, sin depender de la base de zonas de la imagen.
 _ZONA_AR = timezone(timedelta(hours=-3))
@@ -202,6 +206,24 @@ def hash_proximo() -> str | None:
     return hashlib.sha256(texto.encode("utf-8")).hexdigest() if texto is not None else None
 
 
+def proxima_anunciada() -> dict | None:
+    """La próxima versión anunciada que todavía NO rige, o `None` (ADR-024).
+
+    Es lo que ofrece el estado como `proxima` y lo que `POST /aceptar` admite además de la vigente. Una vez que la
+    próxima rige deja de ser «próxima» y esto devuelve `None`: pasa a ser la vigente (`version_vigente`).
+    **No mira si la instancia exige aceptación**: eso es de la instancia (`exige_aceptacion`), no del anuncio.
+    """
+    hash_texto = hash_proximo()
+    if hash_texto is None or not (VERSION_PROXIMA and PROXIMA_DESDE):
+        return None
+    return {
+        "version": VERSION_PROXIMA,
+        "vigente_desde": PROXIMA_DESDE,
+        "hash_texto": hash_texto,
+        "resumen_del_cambio": RESUMEN_PROXIMA or None,
+    }
+
+
 class TerminosRepository:
     """Lectura y escritura de la prueba de aceptacion.
 
@@ -232,15 +254,23 @@ class TerminosRepository:
     def version(self) -> str:
         return self._version_fija or version_vigente()
 
-    def aceptacion_vigente(self) -> dict | None:
-        """La aceptacion de la version vigente, o None si la instancia no tiene."""
+    def aceptacion_de(self, version: str) -> dict | None:
+        """La aceptacion de ESA version, o None si la instancia no la tiene."""
         with self.session_factory() as session:
             fila = session.execute(
                 select(AceptacionTerminos)
-                .where(AceptacionTerminos.version == self.version)
+                .where(AceptacionTerminos.version == version)
                 .order_by(AceptacionTerminos.id.desc())
             ).scalars().first()
             return _a_dict(fila) if fila else None
+
+    def aceptacion_vigente(self) -> dict | None:
+        """La aceptacion de la version vigente, o None si la instancia no tiene.
+
+        🔑 **Busca por versión, sin mirar cuándo se aceptó.** Por eso una aceptación adelantada de la próxima (ADR-024)
+        vale sola el día que esa versión pasa a regir: la fila ya está, con su versión y su hash.
+        """
+        return self.aceptacion_de(self.version)
 
     def esta_aceptada(self) -> bool:
         # La cache es POR VERSIÓN: «ya aceptó la 1.0» no dice nada de la 1.1.
@@ -269,13 +299,45 @@ class TerminosRepository:
         if ya is not None:
             self._aceptada_en = version
             return ya
+        fila = self._guardar(
+            version=version, hash_texto=hash_vigente(), usuario_id=usuario_id,
+            username=username, nombre=nombre, ip=ip, user_agent=user_agent,
+        )
+        self._aceptada_en = version
+        return fila
+
+    def registrar_proxima(
+        self, *, usuario_id: int | None, username: str, nombre: str,
+        ip: str = "", user_agent: str = "",
+    ) -> dict:
+        """Deja la fila probatoria de la PRÓXIMA versión, aceptada por adelantado (ADR-024). Idempotente igual que `registrar`.
+
+        Es la misma fila que una aceptación normal —versión, hash del texto, quién, IP, cuándo— y se lee en el mismo
+        `historial`. **No toca la memoria de `esta_aceptada`**: aceptar la 1.1 no dice nada de la vigente. Levanta
+        `ValueError` si ya no hay próxima (rige desde hoy, o se quitó): quien llama contesta 409.
+        """
+        proxima = proxima_anunciada()
+        if proxima is None:
+            raise ValueError("No hay una próxima versión anunciada.")
+        ya = self.aceptacion_de(proxima["version"])
+        if ya is not None:
+            return ya
+        return self._guardar(
+            version=proxima["version"], hash_texto=proxima["hash_texto"], usuario_id=usuario_id,
+            username=username, nombre=nombre, ip=ip, user_agent=user_agent,
+        )
+
+    def _guardar(
+        self, *, version: str, hash_texto: str, usuario_id: int | None, username: str, nombre: str,
+        ip: str, user_agent: str,
+    ) -> dict:
         with self.session_factory() as session:
             fila = AceptacionTerminos(
                 usuario_id=usuario_id,
                 username=(username or "")[:100],
                 nombre=(nombre or "")[:200],
                 version=version,
-                hash_texto=hash_vigente(),
+                hash_texto=hash_texto,
                 aceptado_at=datetime.now(),
                 ip=(ip or "")[:64],
                 user_agent=(user_agent or "")[:400],
@@ -283,7 +345,6 @@ class TerminosRepository:
             session.add(fila)
             session.commit()
             session.refresh(fila)
-            self._aceptada_en = version
             return _a_dict(fila)
 
     def historial(self) -> list[dict]:
@@ -392,6 +453,23 @@ def exigir_terminos(request: Request, user: dict | None = None) -> None:
         )
 
 
+class _ProximaVersion(BaseModel):
+    """El anuncio de la próxima versión dentro del estado (ADR-024). Sin próxima, el estado trae `proxima: null`."""
+
+    version: str
+    vigente_desde: str
+    hash_texto: str
+    #: Si esta instancia ya la aceptó por adelantado. El aviso del frontend se esconde con esto.
+    aceptada: bool
+    aceptada_por: str | None = None
+    aceptada_at: str | None = None
+    #: Una línea con lo que cambia (`RESUMEN_PROXIMA`).
+    resumen_del_cambio: str | None = None
+    #: Sólo con `?texto=1`, por la misma razón que los de la vigente: ~30 KB que el gate no necesita en cada carga.
+    texto: str | None = None
+    texto_html: str | None = None
+
+
 class _EstadoTerminos(BaseModel):
     version: str
     vigente_desde: str
@@ -411,12 +489,15 @@ class _EstadoTerminos(BaseModel):
     #: Markdown y no en su lugar: el Markdown es lo que se hashea y lo que se
     #: puede verificar, el HTML es lo que la pantalla dibuja.
     texto_html: str | None = None
+    #: La próxima versión anunciada que todavía no rige, o `None` (ADR-024). Los campos de arriba no cambian por esto.
+    proxima: _ProximaVersion | None = None
 
 
 class _AceptarRequest(BaseModel):
-    #: La version que el usuario tenia delante. Se compara con la vigente y se
-    #: rechaza si no coinciden: sin esto, una pestania abierta desde antes de un
-    #: deploy podria aceptar una version que ya no es la que se le mostro.
+    #: La version que el usuario tenia delante. Se compara con la vigente (o con la
+    #: proxima anunciada, ADR-024) y se rechaza si no coincide con ninguna: sin esto,
+    #: una pestania abierta desde antes de un deploy podria aceptar una version que
+    #: ya no es la que se le mostro.
     version: str
 
 
@@ -447,6 +528,24 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
             )
         return repo
 
+    def _proxima_para_esta_instancia() -> dict | None:
+        """El anuncio, o `None` si no hay o si esta instancia no tiene contrato que aceptar (una demo, ADR-024)."""
+        return proxima_anunciada() if exige_aceptacion() else None
+
+    def _bloque_proxima(repo: TerminosRepository, incluir_texto: bool) -> dict | None:
+        anuncio = _proxima_para_esta_instancia()
+        if anuncio is None:
+            return None
+        aceptacion = repo.aceptacion_de(anuncio["version"])
+        return {
+            **anuncio,
+            "aceptada": aceptacion is not None,
+            "aceptada_por": (aceptacion or {}).get("nombre") or (aceptacion or {}).get("username"),
+            "aceptada_at": (aceptacion or {}).get("aceptado_at"),
+            "texto": texto_proximo() if incluir_texto else None,
+            "texto_html": texto_html_proximo() if incluir_texto else None,
+        }
+
     def _estado(request: Request, user: dict, incluir_texto: bool) -> dict:
         repo = _repo(request)
         aceptacion = repo.aceptacion_vigente()
@@ -465,6 +564,7 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
             "aceptada_at": (aceptacion or {}).get("aceptado_at"),
             "texto": texto_vigente() if incluir_texto else None,
             "texto_html": texto_html() if incluir_texto else None,
+            "proxima": _bloque_proxima(repo, incluir_texto),
         }
 
     @router.get("", response_model=_EstadoTerminos)
@@ -487,21 +587,34 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
                 status_code=403,
                 detail="Sólo el responsable de la cuenta puede aceptar los Términos.",
             )
-        if data.version != version_vigente():
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"La versión vigente es {version_vigente()} y se intentó aceptar "
-                    f"{data.version}. Recargá la página para ver el texto actual."
-                ),
-            )
-        repo.registrar(
+        ident = dict(
             usuario_id=_id_int(user.get("id")),
             username=user.get("username", ""),
             nombre=user.get("name", ""),
             ip=ip_del_request(request),
             user_agent=request.headers.get("user-agent", ""),
         )
+        anuncio = _proxima_para_esta_instancia()
+        if data.version == version_vigente():
+            repo.registrar(**ident)
+        elif anuncio is not None and data.version == anuncio["version"]:
+            # Aceptación por adelantado (ADR-024): la misma fila y la misma regla de roles. El día que esta versión
+            # rige, `aceptacion_vigente` la encuentra y la instancia no vuelve a quedar pendiente.
+            try:
+                repo.registrar_proxima(**ident)
+            except ValueError:  # pasó a regir entre la lectura de arriba y el registro
+                raise HTTPException(
+                    status_code=409, detail="La versión cambió mientras se aceptaba. Recargá la página.",
+                ) from None
+        else:
+            proxima_txt = f" y la próxima es {anuncio['version']}" if anuncio else ""
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"La versión vigente es {version_vigente()}{proxima_txt} y se intentó aceptar "
+                    f"{data.version}. Recargá la página para ver el texto actual."
+                ),
+            )
         # Sin texto: quien acaba de aceptar ya lo tiene en pantalla.
         return _estado(request, user, False)
 

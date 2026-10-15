@@ -101,8 +101,12 @@ jobs:
               sys.exit("el servicio no contesto como PostgreSQL")
           PY
 
+      # `-n 4` (pytest-xdist, 4 = vCPU del runner; reglas/ci.md del wiki): una base de
+      # PostgreSQL por worker (`<base>_gwN`, tests/conftest.py). `--cov` y su piso no se
+      # tocan: coverage combina los workers solo. El paso del gate de abajo sigue en
+      # serie a proposito: corre pocos archivos y es el que dice si PostgreSQL se probo.
       - name: Run tests
-        run: pytest -v --cov --cov-report=term-missing
+        run: pytest -v -n 4 --cov --cov-report=term-missing
 
       # Contraprueba del salteo: que los tests contra PostgreSQL real hayan
       # CORRIDO. Un `-m pytest` que colecta cero por un skip sale con codigo 0 y

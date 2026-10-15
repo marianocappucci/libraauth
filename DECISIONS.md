@@ -689,3 +689,63 @@ el producto los escribía por su propio ORM, que es por lo que LibraDesk no pod�
 - No hay un helper de `create_engine` en este paquete (cada producto arma el suyo), así que `pool_pre_ping=True` es de cada producto; hoy lo tienen libradesk, libracargo, libraclub y libra-panel, y no contalibra, restolibra, gestiolibra, medlibra ni ventalibra.
 
 **Consecuencias.** MINOR (propuesta v0.50.0), **con migración** (`0003`): la cabeza de la cadena cambia, y `exigir_schema_al_dia` hace que un producto que sube el pin sin correr `libraauth-migrar` no arranque (con el comando en el mensaje), aunque no use `UsadosEnBase`.
+
+
+## ADR-024 — El responsable acepta por adelantado la próxima versión de los Términos, desde adentro del sistema (2026-10-15)
+
+**Pedido del dueño.** Los Términos 1.1 (ADR-020: el abono pasa a precio final con IVA incluido) entran solos el 09-11-2026 (ADR-021).
+La cláusula 29.2 pide 30 días de aviso y la 29.4 un acuerdo expreso para un cambio de precio. Decidió que esa conformidad se dé
+**dentro del sistema** y no por correo: que el responsable de cada cliente pueda aceptar la 1.1 al entrar, antes de que rija.
+
+**Problema.** El estado no sabía de la próxima versión (ADR-020 lo dejó fuera a propósito: «no cubre un aviso adentro del
+sistema») y `POST /aceptar` rechazaba con 409 cualquier versión que no fuera la vigente. La única aceptación posible de la 1.1
+era el 09-11, con la aplicación ya bloqueada.
+
+**Qué ya existía (se miró antes de diseñar).** `version_vigente(hoy)` por fecha, `texto_proximo`/`hash_proximo`/`texto_html_proximo`,
+y una tabla de aceptaciones con la **versión y el hash** en cada fila. Con eso, lo que hace falta es una sola cosa: poder escribir
+la fila de la 1.1 antes de la fecha. El 09-11 `aceptacion_vigente()` busca **por versión**, así que la encuentra sin tocarla.
+
+**Decisión.**
+- **`GET /terminos` suma `proxima`**: `{version, vigente_desde, hash_texto, aceptada, aceptada_por, aceptada_at,
+  resumen_del_cambio, texto, texto_html}`, o `null` si no hay próxima anunciada. `texto` y `texto_html` sólo viajan con `?texto=1`
+  (igual que los de la vigente: ~30 KB que el gate no necesita en cada carga). **Los campos que ya había no cambian.** El
+  `resumen_del_cambio` es `RESUMEN_PROXIMA`, una constante junto a `VERSION_PROXIMA`/`PROXIMA_DESDE`/`ARCHIVO_PROXIMA`.
+- **`POST /aceptar` acepta la vigente o la próxima**, con la misma regla de roles (`ROLES_QUE_ACEPTAN`, cláusula 30.5, 403 antes que
+  nada), la misma fila (`AceptacionTerminos`: versión, hash del texto, usuario, IP, user-agent, fecha) y el mismo rastro
+  (`GET /historial`). Otra versión sigue siendo 409. Es idempotente por versión. `TerminosRepository.registrar_proxima` la
+  escribe y **no toca la memoria de `esta_aceptada`**: aceptar la 1.1 no dice nada de la vigente, que sigue pendiente si lo estaba.
+- **El 09-11 la instancia que ya aceptó no queda pendiente.** No hay código nuevo para eso: es la propiedad de buscar por versión.
+  Un test mueve la fecha y lo fija con el mismo proceso, sin redeploy; su control negativo (sin aceptación adelantada, sigue
+  pendiente) evita que el verde se explique por un gate que ya no corta.
+- **Una demo no ve el aviso ni acepta la próxima** (`proxima: null`, y `POST` de la 1.1 da 409): en una demo no hay Cliente ni
+  contrato (`exige_aceptacion()`), el mismo argumento que para `pendiente`; y el reset nocturno borra la tabla, así que una
+  aceptación ahí no probaría nada.
+- **Sin cambios de schema ni migración**: ninguna columna nueva. La aceptación adelantada se distingue de una normal porque su
+  `aceptado_at` es anterior a la `vigente_desde` de su versión. Un producto que sube el pin no corre `libraauth-migrar`.
+- **El texto de la 1.1 queda congelado.** La fila adelantada guarda (versión, hash) y el 09-11 se encuentra por versión; si el
+  Markdown de la 1.1 cambiara después de que un cliente la aceptó, esa fila probaría haber aceptado otro texto, sin síntoma. Un
+  test fija el sha256 de la 1.1: cambiar el contenido exige una versión nueva (1.2), como ya dice el comentario de
+  `VERSION_VIGENTE`. (La aceptación de la vigente tiene el mismo supuesto, pero ahí no hay ventana entre aceptar y regir.)
+
+**Prefijos.** Nada cambia: el bloque `proxima` y `POST /aceptar` cuelgan del mismo router, así que ContaLibra y RestoLibra
+(`build_terminos_router(prefix="/api/terminos")`) lo sirven donde ya lo servían; un test lo fija. El frontend ya lo sabe por
+`terminosPath` de `createAuthContext`.
+
+**Cuando la próxima rige.** `proxima_anunciada()` devuelve `None` (`texto_proximo` ya lo hacía) y `proxima` vuelve a `null`. La
+limpieza de ADR-020 (pasar la 1.1 a `VERSION_VIGENTE` y quitar las constantes de la próxima) suma una a la lista: `RESUMEN_PROXIMA`.
+Mientras no se haga, no estorba.
+
+**Lo que no resuelve.**
+- No avisa a quien no puede aceptar: el estado se lo cuenta (`puede_aceptar`), pero la decisión de mostrarlo es del frontend.
+- Una instancia nueva que acepta la 1.0 después del anuncio ve el aviso igual: son dos aceptaciones, a propósito.
+- La conformidad por escrito de la 29.4 sigue siendo del dueño; esto es la forma de darla, no un reemplazo del aviso.
+
+**Consecuencias.** MINOR (propuesta v0.51.0), **sin migración**. Un frontend anterior ignora `proxima` (campo nuevo, aditivo).
+Para que el responsable vea el aviso hace falta `libra-ui` 0.153.0 (`GateTerminos`); sin él, el endpoint anda y nadie lo muestra.
+
+**Verificación.** **779 → 793 tests** (1 omitido igual que antes): 14 nuevos en `tests/test_terminos.py` y 1 reescrito
+(`test_el_dia_anterior_sigue_rigiendo_la_1_0`, que afirmaba el 409 de la 1.1 y ahora afirma que se registra sin destrabar la 1.0).
+**Contra `origin/develop` (el `terminos.py` anterior con los tests nuevos) fallan 13 de 48**: los 11 que ejercen el estado y la
+aceptación adelantada, el del prefijo `/api/terminos` y el reescrito; los otros 2 nuevos pasan en los dos árboles a propósito: el
+control negativo del 09-11 (sin aceptación adelantada sigue pendiente) y el que congela el hash de la 1.1. Suite completa en
+PostgreSQL local con `-n 4` y `ruff` limpios.
