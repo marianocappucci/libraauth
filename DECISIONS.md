@@ -749,3 +749,52 @@ Para que el responsable vea el aviso hace falta `libra-ui` 0.153.0 (`GateTermino
 aceptación adelantada, el del prefijo `/api/terminos` y el reescrito; los otros 2 nuevos pasan en los dos árboles a propósito: el
 control negativo del 09-11 (sin aceptación adelantada sigue pendiente) y el que congela el hash de la 1.1. Suite completa en
 PostgreSQL local con `-n 4` y `ruff` limpios.
+
+
+## ADR-025 — Token de servicio con rotación sin corte, y credencial de integración aparte (2026-10-18)
+
+**Pedido del dueño (2026-10-18).** El token de servicio pasa de «uno por producto» a «uno por instancia», y lo que llama a una
+instancia para meterle datos (integraciones, ingesta de comprobantes) deja de usar ese token y lleva una credencial propia. Este es
+el primer paso de la serie y sólo toca libraauth: los productos y el backoffice adoptan después.
+
+**Problema.** `LIBRA_SERVICE_TOKEN` es compartido por las instancias de un producto (medido el 2026-08-20: dos clientes distintos de
+LibraDesk tienen el mismo), y una integración que lo tiene abre además usuarios, SMTP y el resto de lo que administra el backoffice.
+Para pasar a uno por instancia hay que cambiar el token en la instancia y en el backoffice, y hoy eso es un corte: entre que cambia
+uno y cambia el otro, el backoffice recibe 401.
+
+**Qué ya existía (se miró antes de diseñar).** `token_de_servicio_valido()` (`x-internal-auth`, `hmac.compare_digest`, falla cerrado
+sin variable) y la credencial del panel por instancia (`LIBRA_PANEL_TOKEN`/`x-panel-auth`, `PANEL_USER`, gates propios aplicados
+router por router), que es el precedente que se copia.
+
+**Decisión.**
+- **Rotación sin corte**: `LIBRA_SERVICE_TOKEN_ANTERIOR`. Si está definida, `token_de_servicio_valido()` acepta el nuevo **o** el
+  anterior. Se rota así: se pone el nuevo en la instancia y el viejo en `_ANTERIOR`; se cambia el backoffice; se borra `_ANTERIOR`.
+  Vacía o ausente no vale nada (cada variable por sí sola; un header vacío nunca entra).
+- **Siempre las dos comparaciones**, con `hmac.compare_digest` y sin cortocircuito: el tiempo de respuesta no dice cuál coincidió
+  ni que hay una rotación en curso. Se comparan bytes, así que un header no ASCII da `False` en vez de un `TypeError`.
+- **Aviso de token corto**: si una variable definida tiene menos de 32 caracteres (`LARGO_MINIMO_DE_TOKEN`), un `WARNING` en
+  `libraauth.session_auth`, una vez por variable y por proceso, con el nombre y nunca el valor. No se rechaza: no se le corta el
+  servicio a una instancia en producción por esto.
+- **Credencial de integración**: `LIBRA_INTEGRACION_TOKEN` (+ `LIBRA_INTEGRACION_TOKEN_ANTERIOR`, misma rotación), header
+  `x-integracion-auth`, `token_de_integracion_valido()`, identidad `INTEGRACION_USER` (`@integracion`, `id: None`,
+  `es_integracion: True`). Su `role` es `"integracion"` y **no** `"admin"`: si por un descuido llega a código que pregunta por admin,
+  la respuesta es no.
+- **Dos gates nuevos**, aplicados router por router:
+  - `json_api_require_admin_o_servicio_o_integracion`: admin de la instancia, servicio o integración. Para `/api/integraciones/*` y
+    la ingesta de comprobantes que también se maneja desde la pantalla. Con la sesión hace lo mismo que el de servicio (Términos y
+    excepción de lectura de la demo).
+  - `json_api_require_integracion_o_servicio`: sólo credenciales de máquina, ninguna sesión (401). Para endpoints sin pantalla.
+- 🔴 **La integración no abre ningún gate anterior**: `json_api_require_admin`, `_staff`, `_admin_o_servicio`,
+  `_admin_o_servicio_o_panel`, `_panel_o_admin`, ni los routers de SMTP, usuarios y códigos de demo. Por eso son gates nuevos y no
+  una ampliación de `json_api_require_admin_o_servicio`, el mismo argumento que con el gate del panel (v0.35.0). Los tests lo fijan.
+
+**Lo que no cambia.** Sin las variables nuevas todo se comporta como antes. La credencial del panel no gana `_ANTERIOR` (no se
+pidió; se suma igual si hace falta). El panel sigue sin aceptar el token de servicio.
+
+**Lo que no resuelve.** Generar un token por instancia, cargarlo en el backoffice y mover cada ruta de integración al gate nuevo es
+trabajo de los PRs siguientes de la serie, en los productos y el backoffice.
+
+**Consecuencias.** MINOR (propuesta v0.52.0), **sin migración**, aditivo: constantes, funciones y gates nuevos; ninguna firma cambia.
+
+**Verificación.** `tests/test_token_rotacion_e_integracion.py` (nuevo, 31 tests) más `test_service_token.py`, `test_panel_token.py` y
+`test_gate_panel.py` sin cambios, en local sin xdist; suite completa en CI.
