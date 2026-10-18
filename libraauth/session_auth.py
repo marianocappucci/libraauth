@@ -9,6 +9,7 @@ aplica a un producto de instancia unica) y el endpoint `/auth/verify` de
 — este paquete no asume que el consumidor tenga una).
 """
 import hmac
+import logging
 import os
 import threading
 from collections.abc import Callable
@@ -576,14 +577,63 @@ SERVICE_USER = {
 }
 
 
-def token_de_servicio_valido(request: Request) -> bool:
-    esperado = os.environ.get(SERVICE_TOKEN_ENV, "")
-    if not esperado:
+#: Token anterior, para rotar sin corte (ADR-025). Mientras dura la rotacion
+#  la instancia acepta los dos; cuando todos los llamadores usan el nuevo, se
+#  borra esta variable. Vacia o ausente no vale nada.
+SERVICE_TOKEN_ANTERIOR_ENV = "LIBRA_SERVICE_TOKEN_ANTERIOR"
+
+#: Largo minimo recomendado de una credencial. Por debajo no se rechaza (no se
+#  puede cortar el servicio de una instancia en produccion por esto): se avisa
+#  en el log, una vez por variable y por proceso, sin el valor.
+LARGO_MINIMO_DE_TOKEN = 32
+
+_log = logging.getLogger("libraauth.session_auth")
+_ya_avisadas: set[str] = set()
+
+
+def _avisar_si_es_corto(nombre: str, valor: str) -> None:
+    if valor and len(valor) < LARGO_MINIMO_DE_TOKEN and nombre not in _ya_avisadas:
+        _ya_avisadas.add(nombre)
+        # Solo el nombre de la variable y el minimo; nunca el valor ni su largo.
+        _log.warning(
+            "%s tiene menos de %d caracteres: conviene rotarla por una mas larga",
+            nombre, LARGO_MINIMO_DE_TOKEN,
+        )
+
+
+def _token_valido(request: Request, header: str, env: str, env_anterior: str) -> bool:
+    """El header coincide con la credencial de `env` o con la de `env_anterior`.
+
+    **Opt-in por ausencia**: sin ninguna de las dos variables devuelve False sin
+    mirar el header.
+
+    🔴 **Se compara SIEMPRE contra las dos**, sin cortocircuito: si se cortara
+    al coincidir con la nueva, el tiempo de respuesta diria cual de las dos se
+    uso (y que hay una rotacion en curso). `compare_digest` y no `==`: el
+    operador normal filtra el largo y el prefijo por lo que tarda en devolver
+    False. Se comparan bytes para que un header con caracteres no ASCII de
+    False y no un `TypeError`.
+    """
+    nuevo = os.environ.get(env, "")
+    anterior = os.environ.get(env_anterior, "")
+    _avisar_si_es_corto(env, nuevo)
+    _avisar_si_es_corto(env_anterior, anterior)
+    if not nuevo and not anterior:
         return False
-    recibido = request.headers.get(SERVICE_TOKEN_HEADER, "")
-    # `compare_digest` y no `==`: comparar tokens con el operador normal filtra
-    # su largo y su prefijo por el tiempo que tarda en devolver False.
-    return bool(recibido) and hmac.compare_digest(recibido, esperado)
+    recibido = request.headers.get(header, "")
+    if not recibido:
+        return False
+    r = recibido.encode("utf-8")
+    ok_nuevo = hmac.compare_digest(r, nuevo.encode("utf-8")) if nuevo else False
+    ok_anterior = hmac.compare_digest(r, anterior.encode("utf-8")) if anterior else False
+    return ok_nuevo or ok_anterior
+
+
+def token_de_servicio_valido(request: Request) -> bool:
+    """`x-internal-auth` contra `LIBRA_SERVICE_TOKEN` o `LIBRA_SERVICE_TOKEN_ANTERIOR`."""
+    return _token_valido(
+        request, SERVICE_TOKEN_HEADER, SERVICE_TOKEN_ENV, SERVICE_TOKEN_ANTERIOR_ENV
+    )
 
 
 # ── Credencial del panel del cliente ────────────────────────────────────────
@@ -637,6 +687,50 @@ def token_de_panel_valido(request: Request) -> bool:
         return False
     recibido = request.headers.get(PANEL_TOKEN_HEADER, "")
     return bool(recibido) and hmac.compare_digest(recibido, esperado)
+
+
+# ── Credencial de integracion (ADR-025) ──────────────────────────────────────
+#
+# Tercera credencial, para lo que llama a la instancia **desde afuera y sin
+# usuario** para meter datos: integraciones (`/api/integraciones/*`) y la
+# ingesta de comprobantes. Hasta ahora esos llamadores usaban el token de
+# servicio, que abre ademas usuarios, SMTP, tema y el resto de lo que administra
+# el backoffice. Con una credencial propia, una integracion filtrada mete datos
+# en UNA instancia y no administra nada.
+#
+# 🔴 **Ningun gate anterior la acepta**, y es la propiedad que importa: solo
+# entra por `json_api_require_admin_o_servicio_o_integracion` y
+# `json_api_require_integracion_o_servicio`, que se ponen router por router.
+INTEGRACION_TOKEN_HEADER = "x-integracion-auth"
+INTEGRACION_TOKEN_ENV = "LIBRA_INTEGRACION_TOKEN"
+INTEGRACION_TOKEN_ANTERIOR_ENV = "LIBRA_INTEGRACION_TOKEN_ANTERIOR"
+
+#: Identidad de una request de integracion. Como `SERVICE_USER`, no es un
+#  usuario real (`id: None`).
+#
+#  ⚠️ **`role` es `"integracion"` y no `"admin"`, a proposito**: si por un
+#  descuido esta identidad llegara a codigo que pregunta `role == "admin"`, la
+#  respuesta es no.
+INTEGRACION_USER = {
+    "id": None,
+    "username": "@integracion",
+    "name": "Integracion",
+    "role": "integracion",
+    "active": True,
+    "es_integracion": True,
+}
+
+
+def token_de_integracion_valido(request: Request) -> bool:
+    """`x-integracion-auth` contra `LIBRA_INTEGRACION_TOKEN` o su `_ANTERIOR`.
+
+    Mismas reglas que `token_de_servicio_valido`: opt-in por ausencia, las dos
+    comparaciones siempre y en tiempo constante.
+    """
+    return _token_valido(
+        request, INTEGRACION_TOKEN_HEADER, INTEGRACION_TOKEN_ENV,
+        INTEGRACION_TOKEN_ANTERIOR_ENV,
+    )
 
 
 def _exigir_terminos(request: Request, usuario: dict | None) -> None:
@@ -762,6 +856,47 @@ def json_api_require_admin_o_servicio(request: Request, response: Response = Non
     if request.method in _METODOS_DE_LECTURA and es_visitante_de_demo(usuario):
         return usuario
     raise HTTPException(403, "forbidden")
+
+
+def json_api_require_admin_o_servicio_o_integracion(
+    request: Request, response: Response = None
+) -> dict:
+    """Como `json_api_require_admin_o_servicio`, y ademas la credencial de integracion.
+
+    Para las rutas de integracion (`/api/integraciones/*`) y la ingesta de
+    comprobantes, que tambien maneja un admin desde la pantalla del producto.
+    🔴 **No se amplio `json_api_require_admin_o_servicio`**: de aquel cuelgan
+    usuarios, SMTP, tema y mas, y la integracion no tiene que abrir nada de eso.
+
+    Los tokens primero (una request con token no trae cookie); despues, la
+    sesion con el mismo gate de Terminos y la misma excepcion de lectura de la
+    demo que el gate de servicio.
+    """
+    if token_de_servicio_valido(request):
+        return dict(SERVICE_USER)
+    if token_de_integracion_valido(request):
+        return dict(INTEGRACION_USER)
+    usuario = json_api_get_current_user(request, request.app.state.session_auth, response)
+    _exigir_terminos(request, usuario)
+    if usuario["role"] == "admin":
+        return usuario
+    if request.method in _METODOS_DE_LECTURA and es_visitante_de_demo(usuario):
+        return usuario
+    raise HTTPException(403, "forbidden")
+
+
+def json_api_require_integracion_o_servicio(request: Request) -> dict:
+    """Solo credenciales de maquina: integracion o servicio. Ninguna sesion.
+
+    Para endpoints que no tienen pantalla (un webhook, la ingesta automatica):
+    que un admin logueado tampoco entre achica lo que expone una cookie robada.
+    Sin token valido es 401, igual que una sesion ausente.
+    """
+    if token_de_servicio_valido(request):
+        return dict(SERVICE_USER)
+    if token_de_integracion_valido(request):
+        return dict(INTEGRACION_USER)
+    raise HTTPException(401, "not authenticated")
 
 
 #: Variable de entorno que enciende `POST /auth/demo`.
