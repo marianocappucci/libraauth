@@ -95,6 +95,25 @@ Dos cosas que conviene saber antes de apoyarse en esto:
   alternativa es que nadie pueda entrar al sistema porque falla el que anota
   que entraron.
 
+## La cookie de sesión por http: `LIBRAAUTH_COOKIE_SECURE` (v0.53.0, ADR-026)
+
+La cookie de sesión de la app (`SessionAuth`) sale con `HttpOnly`, `SameSite=Lax` y
+**`Secure`**. `Secure` es el default y en la nube no se toca: la app se sirve por https.
+
+Donde la app se sirve por **http** en una red local —el nodo de LibraEdge:
+`http://localhost:8000` en la PC y `http://<IP>:8000` desde las otras cajas— una
+cookie `Secure` no se guarda y el login «entra» (200) pero el pedido siguiente da 401.
+Para ese caso:
+
+```
+LIBRAAUTH_COOKIE_SECURE=0    # también false, no u off (sin importar mayúsculas)
+```
+
+Sólo esos valores la apagan. Vacía, ausente, `1`, `true` o un error de tipeo
+(`falso`) la dejan `Secure`, y un valor que no se reconoce se avisa en el log. Con
+la marca apagada se avisa una vez por proceso. La cookie del backoffice de superadmin
+(`AdminAuth`) no lee esta variable: sigue siendo `Secure` siempre.
+
 ## Captcha «No soy un robot» (v0.40.0)
 
 `build_json_api_auth_router(captcha=True)` agrega `GET /auth/captcha` y exige
