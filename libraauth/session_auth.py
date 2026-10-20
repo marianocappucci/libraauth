@@ -99,6 +99,58 @@ def _ya_tiene_set_cookie(response: Response, cookie_name: str) -> bool:
     )
 
 
+_log = logging.getLogger("libraauth.session_auth")
+
+
+# ── La marca `Secure` de la cookie de sesion (ADR-026, 2026-10-20) ──────────
+#
+# 🔴 **Default: `Secure`.** En la nube la app se sirve siempre por https (detras
+# del proxy con Let's Encrypt) y eso no cambia. La variable existe por el nodo de
+# LibraEdge, que sirve el producto por **http** en la LAN (`http://localhost:8000`
+# en la PC y `http://<IP>:8000` desde las otras cajas): una cookie `Secure` que
+# llega por http no se guarda -- ningun navegador la acepta desde una IP, y
+# WebKitGTK (la app de escritorio en Linux) tampoco desde `localhost` --, el login
+# da 200 y el pedido siguiente 401.
+#
+# Solo un valor explicito de "falso" la apaga. Cualquier otra cosa -- vacia,
+# ausente, `1`, `true` o un error de tipeo como `falso` o `flase` -- deja la
+# cookie `Secure`: equivocarse tiene que dejar la seguridad puesta, no sacarla.
+COOKIE_SECURE_ENV = "LIBRAAUTH_COOKIE_SECURE"
+_VALORES_FALSOS = frozenset({"0", "false", "no", "off"})
+_avisos_cookie: set[str] = set()
+
+
+def cookie_secure() -> bool:
+    """Si la cookie de sesion de la app lleva la marca `Secure` (ver arriba).
+
+    Se lee en cada cookie que se emite, no al construir `SessionAuth`: es una
+    lectura de `os.environ` y asi un cambio de entorno no depende de cuando se
+    instancio la app. Avisa en el log una vez por proceso cuando la marca queda
+    apagada, y cuando la variable tiene un valor que no se reconoce (y por eso
+    se ignora)."""
+    crudo = os.environ.get(COOKIE_SECURE_ENV)
+    if crudo is None:
+        return True
+    valor = crudo.strip().lower()
+    if valor in _VALORES_FALSOS:
+        if "apagada" not in _avisos_cookie:
+            _avisos_cookie.add("apagada")
+            _log.warning(
+                "%s apagada: la cookie de sesion sale sin Secure. Solo para servir "
+                "la app por http en una red local (nodo de LibraEdge).",
+                COOKIE_SECURE_ENV,
+            )
+        return False
+    if valor not in ("", "1", "true", "yes", "si", "on") and "desconocido" not in _avisos_cookie:
+        _avisos_cookie.add("desconocido")
+        _log.warning(
+            "%s tiene un valor que no se reconoce: se ignora y la cookie sigue "
+            "saliendo con Secure (para apagarla: 0, false, no u off).",
+            COOKIE_SECURE_ENV,
+        )
+    return True
+
+
 def _resolve_secret_key(dev_fallback: str, missing_error: str) -> str:
     secret = os.environ.get("SECRET_KEY", "")
     if secret:
@@ -137,7 +189,8 @@ class SessionAuth:
     def create_session_cookie(self, response, username: str):
         token = self._signer.dumps(username)
         response.set_cookie(
-            self.cookie_name, token, httponly=True, samesite="lax", secure=True
+            self.cookie_name, token, httponly=True, samesite="lax",
+            secure=cookie_secure(),
         )
 
     def clear_session_cookie(self, response):
@@ -587,7 +640,6 @@ SERVICE_TOKEN_ANTERIOR_ENV = "LIBRA_SERVICE_TOKEN_ANTERIOR"
 #  en el log, una vez por variable y por proceso, sin el valor.
 LARGO_MINIMO_DE_TOKEN = 32
 
-_log = logging.getLogger("libraauth.session_auth")
 _ya_avisadas: set[str] = set()
 
 

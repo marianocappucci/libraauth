@@ -798,3 +798,48 @@ trabajo de los PRs siguientes de la serie, en los productos y el backoffice.
 
 **Verificación.** `tests/test_token_rotacion_e_integracion.py` (nuevo, 31 tests) más `test_service_token.py`, `test_panel_token.py` y
 `test_gate_panel.py` sin cambios, en local sin xdist; suite completa en CI.
+
+## ADR-026 — La marca `Secure` de la cookie de sesión de la app se puede apagar por entorno, para el nodo de LibraEdge (2026-10-20)
+
+**Problema (medido en una VM Ubuntu 26.04 con el nodo de ContaLibra, libraedge v0.15.0).** El nodo de LibraEdge sirve el
+producto por **http** en la LAN: `http://localhost:8000` en la PC y `http://<IP>:8000` desde las otras cajas. `SessionAuth`
+ponía la cookie con `secure=True` fijo. En la app de escritorio (Tauri sobre WebKitGTK) `POST /api/login` daba 200, la cookie
+no se guardaba y el pedido siguiente daba 401: WebKit no hace la excepción de `localhost` para cookies `Secure` por http. Desde
+las otras cajas, por `http://<IP>:8000`, **ningún** navegador la guardaría (Chrome y Firefox sólo exceptúan `localhost`).
+
+**Qué ya existía (se miró antes de diseñar).**
+- Las variables de libraauth se leen con `os.environ.get` en el momento de usarlas (`LIBRAAUTH_PROXIES_DE_CONFIANZA` en
+  `auth_events.py`, los tokens de ADR-025), con prefijo `LIBRAAUTH_` para lo propio del paquete.
+- Los flags booleanos se leen con `.strip().lower()` contra una lista cerrada (`DEMO_MODE` en `session_auth.py`).
+- El aviso en el log una vez por proceso, con el nombre de la variable y nunca el valor (ADR-025, token corto).
+- Las únicas cookies que pone libraauth son la de sesión de `SessionAuth` (`create_session_cookie`, también usada por la
+  renovación deslizante del ADR-017 y por el login de la demo) y la del backoffice de `AdminAuth`. El captcha (ADR-014) no usa
+  cookies, y no hay CSRF ni «recordarme» con cookie propia.
+- La **lectura** de la sesión (`get_current_user`, los guards y `/me`) no mira el esquema de la URL: sólo valida la firma.
+
+**Decisión.**
+- `LIBRAAUTH_COOKIE_SECURE` (`COOKIE_SECURE_ENV`) y `cookie_secure()` en `session_auth.py`. **Default: `Secure`.** Sólo un
+  «falso» explícito la apaga: `0`, `false`, `no`, `off` (sin importar mayúsculas ni espacios). Cualquier otro valor —vacío, `1`,
+  `true`, `falso`, `flase`— la deja `Secure`: un error de configuración tiene que dejar la seguridad puesta.
+- Se lee en cada `create_session_cookie`, así que el login, el login de la demo y la renovación deslizante salen con la misma
+  marca. `HttpOnly` y `SameSite=Lax` no cambian.
+- Aviso `WARNING` en `libraauth.session_auth` una vez por proceso si la marca queda apagada, y otro si la variable tiene un valor
+  que no se reconoce (se ignora). Sólo el nombre de la variable.
+- **`AdminAuth` no la lee**: el backoffice de superadmin no se sirve en nodos y su cookie sigue `Secure` siempre (un test lo fija).
+
+**Quién la apaga.** El instalador de LibraEdge, en el `nodo.env` de cada nodo (libraedge ADR-016). Ninguna instancia de la nube.
+
+**Lo que no cambia.** Sin la variable, todo igual. Un producto con un libraauth anterior a esta versión ignora la variable: en el
+nodo queda como hoy (login roto por http) hasta que suba el pin.
+
+**Lo que no resuelve.** La cookie viaja en claro por la LAN del local (sin TLS). Es el mismo riesgo que ya tenía la clave en el
+`POST /api/login` por http; servir el nodo por https con un certificado local es otro trabajo. `Strict-Transport-Security` (que
+pone `libracore.security_headers`) por http lo ignoran los navegadores (RFC 6797 §8.1) y no aplica a IPs: no hace falta tocarlo.
+
+**Consecuencias.** MINOR (propuesta v0.53.0), **sin migración**, aditivo: una constante y una función nuevas; ninguna firma cambia.
+
+**Verificación.** `tests/test_cookie_secure.py` (nuevo): default `Secure`; los cuatro falsos (con mayúsculas y espacios) la
+apagan; vacío, verdaderos y valores raros no; login y `/api/me` de punta a punta por `http://<IP>:8000` con el router JSON real;
+sin la variable, por http, el cliente no devuelve la cookie (401, el bug); la lectura no exige https; logout por http; renovación
+con la misma marca; avisos del log; `AdminAuth` sin la variable. Más `test_session_auth.py` sin cambios.
+
