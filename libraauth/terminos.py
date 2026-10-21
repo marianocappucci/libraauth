@@ -52,6 +52,7 @@ from starlette.requests import Request
 
 from .auth_events import ip_del_request
 from .models import AceptacionTerminos
+from .nodo import error_solo_en_el_central, es_nodo
 
 #: Version vigente del contrato. **Subirla es el disparador de la re-aceptacion**
 #: (clausula 29.3): al arrancar con una version que la instancia no tiene
@@ -397,10 +398,15 @@ def exige_aceptacion() -> bool:
     (`DEMO_MODE` y `DEMO_USERNAME`) justamente para que no se prenda por copiar
     un `.env` de una instancia a otra. Medido sobre las 10 instancias vivas:
     devuelve el usuario en las 8 demos y `None` en las 2 de cliente.
+
+    **Un nodo de LibraEdge tampoco exige aceptar** (ADR-027). La aceptación es la prueba de la cláusula 30.3 y se hace
+    una vez, en el central: una fila escrita en el nodo no llegaría a ningún lado (o la pisaría el espejo) y, mientras no
+    bajara una, el gate dejaría al local entero sin poder vender por un contrato que el cliente ya aceptó en la web. Si
+    el espejo trae la aceptación, `GET /terminos` la sigue mostrando.
     """
     from .session_auth import demo_username  # circular: session_auth importa este modulo
 
-    return demo_username() is None
+    return demo_username() is None and not es_nodo()
 
 
 def hay_terminos_pendientes(request: Request) -> bool:
@@ -559,7 +565,8 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
             # 403 del gate no alcanzaria: la demo quedaria trabada igual, del
             # lado del navegador y sin un solo 403 en los logs que lo explique.
             "pendiente": aceptacion is None and exige_aceptacion(),
-            "puede_aceptar": user.get("role") in ROLES_QUE_ACEPTAN,
+            # En un nodo no se acepta (ADR-027): el boton no tiene que aparecer.
+            "puede_aceptar": user.get("role") in ROLES_QUE_ACEPTAN and not es_nodo(),
             "aceptada_por": (aceptacion or {}).get("nombre") or (aceptacion or {}).get("username"),
             "aceptada_at": (aceptacion or {}).get("aceptado_at"),
             "texto": texto_vigente() if incluir_texto else None,
@@ -582,6 +589,8 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
         user: dict = Depends(json_api_get_current_user),
     ):
         repo = _repo(request)
+        if es_nodo():
+            raise error_solo_en_el_central("Los Términos se aceptan desde la versión web.")
         if user.get("role") not in ROLES_QUE_ACEPTAN:
             raise HTTPException(
                 status_code=403,

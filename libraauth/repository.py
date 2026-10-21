@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from .hashing import DUMMY_PASSWORD_HASH, hash_password, needs_rehash, verify_password
 from .models import Usuario
+from .nodo import es_nodo
 
 
 class UsernameTaken(Exception):
@@ -220,7 +221,12 @@ class UserRepository:
         sabe su contrasena: negarle la entrada porque no se pudo actualizar un
         detalle de almacenamiento seria cambiar un problema chico por uno
         grande. Se reintenta solo, en el proximo login.
+
+        **En un nodo de LibraEdge no escribe** (ADR-027): `usuarios` es un espejo del central, y el hash se actualiza
+        cuando el usuario entra al central y el espejo lo baja.
         """
+        if es_nodo():
+            return
         try:
             with self.session_factory() as session:
                 u = session.get(Usuario, uid)

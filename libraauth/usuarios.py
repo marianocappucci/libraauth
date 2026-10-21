@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
+from .nodo import exigir_central_si_escribe
 from .repository import UsernameTaken, UsuarioConHistorial
 
 if TYPE_CHECKING:
@@ -212,13 +213,18 @@ def build_users_router(
     | `GET /{id}`                                    | Gestiolibra, MedLibra,      |
     |                                                 | LibraCargo, LibraClub       |
 
+    **En un nodo de LibraEdge las escrituras (alta, edición, clave, baja) contestan 409 `solo_en_el_central`** (ADR-027):
+    la tabla `usuarios` del nodo es un espejo del central y se administra desde la versión web. Las lecturas andan.
+
     Las dos últimas filas de la tabla de "contraseña" y la de "desactivar al
     único admin activo" son estrictamente MÁS estrictas que lo que tenía
     cualquier producto -- nadie pierde una protección al adoptar esto, y
     Contalibra gana la del rol inválido en la edición que tenía rota.
     """
+    # `exigir_central_si_escribe` va DESPUES del guard: quien no es admin recibe su 401/403 y no se entera de si esto es
+    # un nodo. Cuelga del router y no de cada ruta, para que una ruta que se agregue mañana nazca cerrada en el nodo.
     router = APIRouter(prefix=prefix, tags=tags or ["usuarios"],
-                        dependencies=[Depends(admin_guard)])
+                        dependencies=[Depends(admin_guard), Depends(exigir_central_si_escribe)])
 
     def _repositorio(request: Request) -> "UserRepository":
         if get_repository is not None:

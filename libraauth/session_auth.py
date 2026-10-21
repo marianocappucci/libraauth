@@ -33,6 +33,7 @@ from .auth_events import (
 from .captcha import Captcha, UsadosDeCaptcha
 from .crypto import ClaveDeCifradoAusente
 from .demo_codigos import DIAS_DEFECTO, USOS_DEFECTO, CodigoInvalido
+from .nodo import exigir_central
 from .password_reset import EmailNotConfigured, InvalidResetToken
 from .smtp_settings import SIN_CAMBIOS
 
@@ -1236,6 +1237,9 @@ def build_json_api_auth_router(
         trabajando. Cerrarla lo dejaria afuera justo despues de un cambio
         exitoso, que se lee como un error.
         """
+        # En un nodo de LibraEdge la clave se cambia en el central (ADR-027). Despues de la identidad y antes de mirar la
+        # clave actual: ni siquiera cuenta como intento fallido.
+        exigir_central()
         users = request.app.state.users
         # `check_credentials` y no una comparacion propia: es el unico lugar del
         # paquete que sabe verificar un hash, y ademas corre en tiempo constante.
@@ -1397,6 +1401,8 @@ def build_json_api_auth_router(
             endpoint publico y sin sesion, y una respuesta distinta lo
             convertiria en un buscador de usuarios y correos dados de alta.
             """
+            # En un nodo no hay recuperacion por correo: la clave vive en el central (ADR-027).
+            exigir_central()
             # Sin captcha, este endpoint manda correos en nombre de la
             # instancia a quien se quiera y a la velocidad que se quiera.
             if captcha and not _captcha_de(request, captcha_usados).verificar(data.captcha):
@@ -1413,6 +1419,7 @@ def build_json_api_auth_router(
 
         @router.post("/reset-password", response_model=_UserOut)
         def reset_password(data: _ResetPasswordRequest, request: Request):
+            exigir_central()  # ADR-027: en un nodo `usuarios` es un espejo
             servicio = request.app.state.password_reset
             try:
                 resultado = servicio.reset(data.token, data.new_password)
