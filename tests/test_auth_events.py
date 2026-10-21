@@ -319,3 +319,16 @@ def test_registrar_seguro_sin_state_no_explota(sessions):
     req = _FakeRequest()
     req.app = type("A", (), {"state": type("S", (), {})()})()
     registrar_seguro(req, LOGIN, "admin")  # no levanta
+
+
+def test_en_un_nodo_la_ip_es_siempre_el_par_directo(monkeypatch):
+    """🔴 v0.55.0 (ADR-028): en un nodo de LibraEdge no hay proxy adelante y las redes de confianza son las del local. Un
+    puesto en 192.168.1.51 que rota `X-Forwarded-For` esquivaba el bloqueo por intentos (medido: 12 de 12 con 401), y sin
+    captcha en el nodo el bloqueo es lo que frena."""
+    from libraauth.nodo import NODE_ID_ENV
+
+    monkeypatch.setenv(NODE_ID_ENV, "nodo-del-local-1")
+    for falsa in ("8.8.8.1", "8.8.8.2", "203.0.113.7, 10.0.0.1"):
+        assert ip_del_request(_FakeRequest({"x-forwarded-for": falsa}, client_host="192.168.1.51")) == "192.168.1.51"
+    monkeypatch.delenv(NODE_ID_ENV)
+    assert ip_del_request(_FakeRequest({"x-forwarded-for": "8.8.8.1"}, client_host="192.168.1.51")) == "8.8.8.1"
