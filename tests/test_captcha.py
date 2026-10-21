@@ -12,6 +12,10 @@ Lo que se fija, en orden de lo que se rompe sin que se note:
    ven los productos que todavia no lo adoptaron.
 5. Que el bloqueo por IP siga cortando **antes** que el captcha, y que un
    captcha invalido no cuente como intento fallido.
+6. (v0.55.0, ADR-028) Que **en un nodo de LibraEdge no se pida captcha**, que el
+   desafio lo diga (`{"requerido": false}`), que un frontend viejo que lo mande
+   igual no rompa nada, y que el bloqueo por IP siga cortando. Cada caso lleva su
+   contraprueba fuera de un nodo.
 """
 import base64
 import json
@@ -26,7 +30,19 @@ from sqlalchemy.orm import sessionmaker
 from libraauth.auth_events import AuthEventRepository
 from libraauth.captcha import COSTO, PAYLOAD_MAXIMO, VIGENCIA_SEGUNDOS, Captcha
 from libraauth.models import Base
+from libraauth.nodo import NODE_ID_ENV
 from libraauth.session_auth import build_json_api_auth_router
+
+
+@pytest.fixture(autouse=True)
+def _fuera_de_un_nodo(monkeypatch):
+    """Por defecto, esto es el central: el nodo se prende en cada test que lo pide (`nodo`)."""
+    monkeypatch.delenv(NODE_ID_ENV, raising=False)
+
+
+@pytest.fixture
+def nodo(monkeypatch):
+    monkeypatch.setenv(NODE_ID_ENV, "nodo-del-local-1")
 
 
 def _barato(secret="clave-de-la-instancia-a", **kwargs):
@@ -281,3 +297,68 @@ def test_olvide_mi_contrasena_exige_captcha():
                json={"identificador": "ana", "captcha": _captcha(c)})
     assert r.status_code == 200, r.text
     assert recuperacion.pedidos == ["ana"]
+
+
+# ── En un nodo de LibraEdge no se pide captcha (v0.55.0, ADR-028) ───────────
+
+def test_en_un_nodo_el_desafio_dice_que_no_hace_falta(nodo):
+    r = _cliente(_app()).get("/auth/captcha")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"requerido": False}
+    assert r.headers["cache-control"] == "no-store"
+
+
+def test_en_un_nodo_el_login_entra_sin_captcha(nodo):
+    r = _cliente(_app()).post("/auth/login", json=CLAVE_BUENA)
+    assert r.status_code == 200, r.text
+
+
+def test_fuera_de_un_nodo_el_desafio_sigue_siendo_un_desafio_y_sin_captcha_es_400():
+    """La contraprueba de los dos de arriba: sin `LIBRAEDGE_NODE_ID` nada cambia."""
+    c = _cliente(_app())
+    desafio = c.get("/auth/captcha").json()
+    assert "requerido" not in desafio
+    assert "parameters" in desafio and "signature" in desafio
+    assert c.post("/auth/login", json=CLAVE_BUENA).status_code == 400
+
+
+def test_en_un_nodo_un_frontend_viejo_que_manda_captcha_igual_entra_y_no_gasta_el_desafio(nodo):
+    """Un frontend de antes de libra-ui 0.177.0 contra un nodo nuevo: el campo `captcha` se ignora, venga bueno o basura."""
+    app = _app()
+    c = _cliente(app)
+    assert c.post("/auth/login", json=_con(CLAVE_BUENA, "no-es-un-payload")).status_code == 200
+    # Un desafio emitido fuera del nodo y resuelto sigue sin consumirse: el nodo no lo mira.
+    capt = app.state.captcha
+    payload = _resolver(capt.emitir())
+    assert c.post("/auth/login", json=_con(CLAVE_BUENA, payload)).status_code == 200
+    assert capt.verificar(payload) is True
+
+
+def test_en_un_nodo_la_clave_mala_sigue_siendo_401(nodo):
+    """Sin captcha la clave es lo que queda: sigue verificandose."""
+    assert _cliente(_app()).post("/auth/login", json=CLAVE_MALA).status_code == 401
+
+
+def test_en_un_nodo_el_bloqueo_por_intentos_fallidos_sigue_cortando(nodo, sessions):
+    """🔴 Lo unico que frena la fuerza bruta en el nodo: cinco fallidos desde una IP en 15 minutos y el sexto es 429, aun con
+    la clave buena. Los fallidos se anotan igual que con captcha."""
+    c = _cliente(_app(sessions=sessions))
+    for _ in range(5):
+        assert c.post("/auth/login", json=CLAVE_MALA).status_code == 401
+    assert c.post("/auth/login", json=CLAVE_BUENA).status_code == 429
+
+
+def test_con_el_flag_apagado_un_nodo_tampoco_tiene_desafio(nodo):
+    """El nodo no prende el endpoint: sólo deja de exigirlo donde el producto lo prendió."""
+    c = _cliente(_app(captcha=False, inyectar=False))
+    assert c.get("/auth/captcha").status_code == 404
+    assert c.post("/auth/login", json=CLAVE_BUENA).status_code == 200
+
+
+def test_en_un_nodo_olvide_mi_contrasena_sigue_cerrado(nodo):
+    """No hay recupero por correo en un nodo (ADR-027): 409, no 200 ni 400 de captcha."""
+    recuperacion = _RecuperacionFalsa()
+    c = _cliente(_app(recuperacion=recuperacion))
+    r = c.post("/auth/forgot-password", json={"identificador": "ana"})
+    assert r.status_code == 409, r.text
+    assert recuperacion.pedidos == []

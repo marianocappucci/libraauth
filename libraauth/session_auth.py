@@ -33,7 +33,7 @@ from .auth_events import (
 from .captcha import Captcha, UsadosDeCaptcha
 from .crypto import ClaveDeCifradoAusente
 from .demo_codigos import DIAS_DEFECTO, USOS_DEFECTO, CodigoInvalido
-from .nodo import exigir_central
+from .nodo import es_nodo, exigir_central
 from .password_reset import EmailNotConfigured, InvalidResetToken
 from .smtp_settings import SIN_CAMBIOS
 
@@ -1087,7 +1087,9 @@ def build_json_api_auth_router(
     forgot-password. Es opt-in para que cada producto lo prenda junto con la
     pantalla de libra-ui que lo resuelve: prenderlo sin ella dejaria a todos
     afuera. El bloqueo por IP sigue cortando antes, y un captcha que falta o
-    no vale es un 400 que **no** cuenta como intento fallido.
+    no vale es un 400 que **no** cuenta como intento fallido. **En un nodo de
+    LibraEdge no se pide** (v0.55.0, ADR-028): el desafio contesta
+    `{"requerido": false}` y el login ignora el campo `captcha`.
 
     `captcha_usados` (ADR-023) es donde el captcha anota los desafios ya resueltos
     (un desafio sirve una sola vez). Por defecto, la memoria del proceso: **con
@@ -1135,6 +1137,13 @@ def build_json_api_auth_router(
                     datos[clave] = _con_bandera_demo(user).get(clave, datos.get(clave))
         return datos
 
+    def _exige_captcha() -> bool:
+        """`True` si este pedido tiene que traer el captcha resuelto (ADR-028).
+
+        El flag `captcha=` es del producto; el nodo de LibraEdge lo apaga por su cuenta, y se lee en cada pedido (como
+        `es_nodo()`), no al armar el router: un cambio de entorno no depende de cuando arranco el proceso."""
+        return captcha and not es_nodo()
+
     if captcha:
         @router.get("/captcha")
         def captcha_desafio(request: Request, response: Response):
@@ -1143,8 +1152,14 @@ def build_json_api_auth_router(
             Sin sesion, como el login. `no-store` porque cada desafio sirve una
             sola vez: uno cacheado por un proxy seria el mismo para todos, y el
             primero que lo usara se lo gastaria al resto.
+
+            **En un nodo de LibraEdge no hay desafio** (ADR-028): contesta
+            `{"requerido": false}` con 200, y el login no pide ni mira el captcha.
+            Fuera de un nodo, la forma de siempre (`parameters` + `signature`).
             """
             response.headers["Cache-Control"] = "no-store"
+            if es_nodo():
+                return {"requerido": False}
             return _captcha_de(request, captcha_usados).emitir()
 
     @router.post("/login", response_model=_UserOut)
@@ -1177,7 +1192,7 @@ def build_json_api_auth_router(
         # un desafio resuelto. Si falta o no vale no se anota nada: no se llego
         # a probar ninguna contrasena, y contarlo dejaria bloquear gratis una
         # IP compartida.
-        if captcha and not _captcha_de(request, captcha_usados).verificar(data.captcha):
+        if _exige_captcha() and not _captcha_de(request, captcha_usados).verificar(data.captcha):
             raise HTTPException(400, CAPTCHA_INVALIDO)
         users = request.app.state.users
         user = users.check_credentials(data.username, data.password)
@@ -1405,7 +1420,7 @@ def build_json_api_auth_router(
             exigir_central()
             # Sin captcha, este endpoint manda correos en nombre de la
             # instancia a quien se quiera y a la velocidad que se quiera.
-            if captcha and not _captcha_de(request, captcha_usados).verificar(data.captcha):
+            if _exige_captcha() and not _captcha_de(request, captcha_usados).verificar(data.captcha):
                 raise HTTPException(400, CAPTCHA_INVALIDO)
             servicio = request.app.state.password_reset
             try:

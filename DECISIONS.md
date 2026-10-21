@@ -918,3 +918,69 @@ abiertas, gate de Términos cortando) hasta que suba el pin.
 **Verificación.** `tests/test_nodo.py` (nuevo, 28 tests), con las contrapruebas del central; puesto sobre el código sin el arreglo, 11
 de los 28 se ponen rojos (el resto son las contrapruebas del central y las lecturas, que tienen que pasar en los dos). Más los
 archivos vecinos en local sin xdist; suite completa en CI.
+
+## ADR-028 — En un nodo de LibraEdge no se pide captcha (2026-10-21)
+
+**Decisión del humano (2026-10-21).** En un nodo de LibraEdge no se pide captcha: al nodo sólo se llega por la red del local, no
+desde internet. Siguen el bloqueo por intentos fallidos y la clave. En la nube (fuera de un nodo) todo sigue igual. Es una
+excepción a la decisión del 2026-09-11 de ADR-014 («el captcha va siempre»), que se tomó pensando en un servicio público.
+
+**Problema (medido en una prueba real, 2026-10-21).** Desde un puesto (otra PC del local) se entra a la PC principal por
+`http://<IP-LAN>:8000`. El widget ALTCHA muestra «Secure context (HTTPS) required.»: resuelve la prueba de trabajo con WebCrypto
+(`crypto.subtle`), que Chromium/WebView2 y WebKitGTK sólo exponen en contextos seguros (https o `localhost`). Sin widget no hay
+solución, y sin solución el login da 400. Resultado: nadie podía iniciar sesión desde un puesto, ni en la app de escritorio
+(Tauri) ni en un navegador. No se arregla del lado del widget: es una restricción del navegador sobre el origen, y poner https
+con certificado propio en cada PC del local es otro proyecto (ver ADR-026, que ya apagó la marca `Secure` de la cookie por lo mismo).
+
+**Qué ya existía (se miró antes de diseñar).**
+- `libraauth.nodo.es_nodo()` (ADR-027): `LIBRAEDGE_NODE_ID` definida y no vacía, leída en cada llamada.
+- Las rutas que exigen captcha cuando `captcha=True`, relevadas con `grep` de `captcha` en `session_auth.py`: **dos**,
+  `POST {prefijo}/login` y `POST {prefijo}/forgot-password`. No hay alta pública ni otra ruta con captcha; `AdminAuth` (backoffice)
+  no lo usa. En un nodo `forgot-password` ya daba 409 `solo_en_el_central` antes de mirar el captcha (ADR-027).
+- **Cómo lo consume el frontend** (`libra-ui`, `src/captcha.ts`, `useCaptcha`): consulta `GET {captchaPath}` al montar y sólo
+  dibuja el widget y deshabilita «Ingresar» si la respuesta tiene la **forma** de un desafío (`parameters` objeto + `signature`
+  texto). Cualquier otra cosa —un 404, el `index.html` del catch-all de la SPA, un JSON sin esa forma— deja el captcha apagado y el
+  login manda sólo usuario y clave. Es decir: el contrato «sin captcha» ya existía del lado del cliente; faltaba que el servidor
+  lo dijera.
+- **El bloqueo por intentos fallidos** que sigue protegiendo el login (no se toca): `max_intentos_fallidos` (default **5**) por
+  `ventana_fallidos_minutos` (default `VENTANA_FALLIDOS_MINUTOS` = **15**) en `build_json_api_auth_router` (`session_auth.py`, login:
+  el corte va antes de mirar la credencial); cuenta los `login_fallido` de la IP del cliente en `auth_log`
+  (`AuthEventRepository.contar_fallidos_recientes` y `contar_fallidos_seguro`, `auth_events.py`) y contesta **429**. La IP sale de
+  `ip_del_request`. Lo que sigue valiendo: un fallido se anota aunque el usuario no exista, y el 429 corta con la clave buena.
+
+**Decisión.**
+1. **Contrato: `GET {prefijo}/captcha` contesta `200 {"requerido": false}` en un nodo.** Con `Cache-Control: no-store`, igual que
+   el desafío. Fuera de un nodo no cambia ni un byte: el desafío de siempre (`parameters` + `signature`), sin campo `requerido`.
+   La regla para el cliente es la que ya aplica libra-ui: *hay captcha si y sólo si la respuesta es un desafío*; `requerido: false`
+   es la forma explícita de decir que no. Se descartaron: un **204** (el cliente de libra-ui parsea JSON y un cuerpo vacío es un
+   error que hoy se traga igual, pero «no hace falta» se confunde con «falló»), un **404** (indistinguible de un producto sin
+   captcha y rompe el monitoreo de rutas) y un **campo en otro endpoint** (el login no consulta otro antes: sería una consulta
+   más para el mismo dato).
+2. **El login y `forgot-password` no exigen ni validan el captcha en un nodo.** Un helper local, `_exige_captcha()`
+   (`captcha and not es_nodo()`), se lee **en cada pedido**, no al armar el router. El flag `captcha=` sigue siendo del producto: en
+   un nodo sólo deja de exigir donde el producto lo había prendido; un router con `captcha=False` no gana el endpoint.
+3. **Un frontend viejo contra un nodo nuevo no queda peor que hoy.** Si manda `captcha` (bueno o basura) el campo se ignora, sin
+   tocar el desafío (un desafío resuelto no se gasta). Y uno viejo que no sabe de `requerido` ya trata la respuesta como «sin
+   captcha», porque no es un desafío: no dibuja el widget y entra. Por eso no hace falta coordinar el orden de los bumps.
+4. **El central no cambia.** Sin `LIBRAEDGE_NODE_ID`, todo igual; cada caso nuevo lleva su contraprueba.
+
+**Lo que no resuelve (abierto).**
+- ✅ **El bloqueo por IP se esquivaba en la LAN (medido el 2026-10-21) y se cierra acá.** `ip_del_request` leía `X-Forwarded-For`
+  cuando el par directo era de una red de confianza, y `REDES_DE_CONFIANZA` incluye las del local: un puesto en `192.168.1.51` que
+  rotaba la cabecera hizo doce intentos con 401 sin bloquearse. En un nodo **no hay proxy adelante** (el producto corre con uvicorn en
+  la PC del local, servicio de systemd o de Windows, y los puestos le hablan directo a `<IP>:8000`), así que en un nodo
+  `ip_del_request` toma siempre el par directo y no lee la cabecera. Test en `tests/test_auth_events.py`.
+- El bloqueo es **por IP**, no por usuario: quien reparte los intentos entre varias IPs (varios puestos) no lo dispara. Es el mismo
+  límite que motivó el captcha en ADR-014; no hay bloqueo por cuenta en libraauth.
+- `forgot-password` sigue cerrado en el nodo (409, ADR-027); no hay recupero de clave ahí.
+
+**Consecuencias.** MINOR (propuesta v0.55.0), **sin migración**, aditivo: un helper y dos condiciones. El contrato del endpoint en
+un nodo cambia de «un desafío» a `{"requerido": false}`; ningún cliente de la familia depende de que ahí haya un desafío (el único
+consumidor es `useCaptcha` de libra-ui, que ya lo descarta por la forma). Se sube en libra-ui 0.177.0 (ADR-091) la prueba que lo
+fija y la documentación del contrato.
+
+**Verificación.** `tests/test_captcha.py`, 8 tests nuevos: en un nodo el desafío dice `{"requerido": false}` y no se cachea; el login
+entra sin captcha; con un captcha basura o resuelto entra igual y el desafío no se gasta; la clave mala da 401; cinco fallidos y el
+sexto es 429 aun con la clave buena; con `captcha=False` no hay endpoint; `forgot-password` da 409. Contraprueba fuera de un
+nodo: el desafío conserva su forma y sin captcha el login da 400. Puesto sobre el código sin el arreglo, 5 de los 8 se ponen
+rojos (los otros tres son contrapruebas que tienen que pasar en los dos lados).

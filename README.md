@@ -141,6 +141,12 @@ proveedor externo, sin cookies y sin tocar la CSP—. El widget va en
 - Cada desafio sirve **una vez** y vence a los diez minutos.
 - El bloqueo por IP corta antes; un captcha que falta o no vale es un 400 y
   **no** suma intentos fallidos.
+- **En un nodo de LibraEdge no se pide** (v0.55.0, ADR-028): con `LIBRAEDGE_NODE_ID` definida, `GET /auth/captcha` contesta
+  `{"requerido": false}` y ni el login ni `forgot-password` miran el campo `captcha` (un frontend viejo que lo mande igual no
+  rompe nada). Motivo: el widget necesita `crypto.subtle`, que el navegador sólo da en https o `localhost`, y un puesto entra al
+  nodo por `http://<IP-LAN>:8000`. Queda el bloqueo por intentos fallidos (5 por IP en 15 minutos, 429). El cliente tiene que
+  tratar la respuesta como «hay captcha» sólo si tiene la forma de un desafío (`parameters` + `signature`), como hace `useCaptcha`
+  de libra-ui. Sin la variable, nada cambia.
 - Fuera del router (el backoffice): `Captcha(secret_key)`, con `emitir()` y
   `verificar(payload)`. Tiene que ser **uno por proceso**: la lista de
   desafios usados vive adentro.

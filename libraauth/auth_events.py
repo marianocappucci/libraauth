@@ -30,6 +30,7 @@ from starlette.requests import Request
 
 from .auditoria import ts_legible
 from .models import AuthEvent
+from .nodo import es_nodo
 
 # Los tres eventos que registra el router de este paquete. Son strings y no un
 # Enum para que un producto pueda anotar uno propio (ej. "password_reset") sin
@@ -134,8 +135,15 @@ def ip_del_request(request: Request) -> str:
     Y el header **solo se lee si el par directo es un proxy de confianza**. Si
     alguien llega al contenedor sin pasar por NPM, lo que diga `X-Forwarded-For`
     es suyo de punta a punta y no se le cree nada.
+
+    **En un nodo de LibraEdge** (ADR-028) el header no se lee nunca: vale el par directo.
     """
     directo = request.client.host if request.client else ""
+    if es_nodo():
+        # En un nodo de LibraEdge no hay proxy adelante (los puestos le hablan directo a `<IP>:8000`), y las redes de
+        # confianza son las del local: creerle a `X-Forwarded-For` dejaria esquivar el bloqueo por intentos con solo
+        # cambiar el header, y sin captcha en el nodo (ADR-028) el bloqueo es lo que frena.
+        return directo[:64]
     reenviada = request.headers.get("x-forwarded-for", "")
     if not reenviada or not _es_proxy_de_confianza(directo):
         return directo[:64]
