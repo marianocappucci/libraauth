@@ -16,6 +16,7 @@ al migrar un producto hay que mirar cual llamaba, no asumir.
 import os
 import secrets
 
+from .nodo import NODE_ID_ENV, es_nodo
 from .repository import UserRepository
 from .session_auth import ROLES_PROHIBIDOS_EN_DEMO, demo_password, demo_username
 
@@ -24,6 +25,17 @@ from .session_auth import ROLES_PROHIBIDOS_EN_DEMO, demo_password, demo_username
 #: Contalibra usa `("admin", "operador", "cajero")` y Restolibra agrega
 #: `"mozo"`. Por eso `ensure_demo_user` acepta `rol=` — ver su docstring.
 ROL_DEMO = "staff"
+
+
+def _aviso_nodo(que: str) -> None:
+    """Deja en el log que en un nodo de LibraEdge no se creó un usuario (ADR-027).
+
+    🔴 Los usuarios del nodo son los del central: los baja el espejo. Crear acá un `admin` local con otro id choca con
+    `UNIQUE(username)` cuando baja el `admin` del central, y traba la bajada de la tabla entera."""
+    print(
+        f"[INFO] {NODE_ID_ENV} definida: este es un nodo de LibraEdge y los usuarios son los del central; "
+        f"no se crea {que}."
+    )
 
 
 def ensure_demo_user(repo: "UserRepository", *, rol: str = ROL_DEMO) -> str | None:
@@ -79,6 +91,9 @@ def ensure_demo_user(repo: "UserRepository", *, rol: str = ROL_DEMO) -> str | No
     username = demo_username()
     if not username:
         return None
+    if es_nodo():
+        _aviso_nodo(f"el usuario de demo {username!r} ni se le pone clave")
+        return None
     if rol in ROLES_PROHIBIDOS_EN_DEMO:
         raise RuntimeError(
             f"rol={rol!r} esta en ROLES_PROHIBIDOS_EN_DEMO: el usuario que se "
@@ -122,7 +137,12 @@ def ensure_default_admin(repo: "UserRepository", *, env_prefix: str) -> None:
     arranca (a diferencia del patron `ensure_admin_user()` que genera una
     contrasena aleatoria y solo loguea un warning — no se adopta ese
     comportamiento acá, mismo criterio que ya usaba
-    `libracore.db.usuarios.ensure_default_admin`)."""
+    `libracore.db.usuarios.ensure_default_admin`).
+
+    **En un nodo de LibraEdge no crea nada y no exige la contraseña** (ADR-027): los usuarios son los del central."""
+    if es_nodo():
+        _aviso_nodo("el admin inicial")
+        return
     if repo.list():
         return
     username = os.environ.get(f"{env_prefix}_ADMIN_USERNAME", "admin")
@@ -148,6 +168,8 @@ def ensure_admin_user(repo: "UserRepository") -> None:
     A diferencia de `ensure_default_admin`, **no es fail-closed**: si no hay
     `ADMIN_PASSWORD` genera una aleatoria y la imprime por stdout.
 
+    **En un nodo de LibraEdge no crea nada** (ADR-027): los usuarios son los del central.
+
     > Eso significa que la contrasena inicial **queda en los logs del
     > contenedor**, legible para cualquiera con acceso a ellos, y que una
     > instancia mal configurada arranca igual en vez de avisar. Se preserva
@@ -155,6 +177,9 @@ def ensure_admin_user(repo: "UserRepository") -> None:
     > cambiarlo de prepo podria dejar una instancia nueva sin poder arrancar;
     > pero para un producto nuevo conviene `ensure_default_admin`.
     """
+    if es_nodo():
+        _aviso_nodo("el admin inicial")
+        return
     if repo.list():
         return
     username = os.environ.get("ADMIN_USER", "admin")

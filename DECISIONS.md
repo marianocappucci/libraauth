@@ -843,3 +843,78 @@ apagan; vacío, verdaderos y valores raros no; login y `/api/me` de punta a punt
 sin la variable, por http, el cliente no devuelve la cookie (401, el bug); la lectura no exige https; logout por http; renovación
 con la misma marca; avisos del log; `AdminAuth` sin la variable. Más `test_session_auth.py` sin cambios.
 
+
+## ADR-027 — Los usuarios de un nodo de LibraEdge son los del central: el nodo no los escribe (2026-10-21)
+
+**Decisión del humano (2026-10-21).** Los usuarios del nodo son los del central. Cada cajero entra con su usuario y su clave de
+siempre aunque no haya internet; los cambios de usuarios se hacen en el central (la versión web) y bajan al volver la conexión.
+`usuarios` es una tabla **espejo** del nodo (LibraEdge la baja del central): el nodo la lee, no la escribe.
+
+**Problema (medido con la base real).** En un nodo recién instalado `ensure_default_admin` / `ensure_admin_user` ven la tabla vacía y
+crean un `admin` local con clave aleatoria. Cuando baja el `admin` del central —otro id, mismo `username`— el `INSERT` choca con
+`UNIQUE(username)` y **traba la bajada de la tabla entera** (`test_el_choque_que_motivo_el_cambio`). Y por la API, cualquier alta,
+edición, cambio de clave o baja hecha en el nodo es una escritura que el espejo pisa en la próxima bajada, o que se queda sin
+subir a ningún lado.
+
+**Qué ya existía (se miró antes de diseñar).**
+- libraedge reconoce el nodo por `LIBRAEDGE_NODE_ID` (`cli.py`, `_requerido`), pero no exporta un helper, y libraauth no depende de
+  libraedge ni de nada de la familia: el helper es propio y lee la misma variable.
+- Los 409 con `detail` de código ya tienen precedente en `terminos.py` (`{"code": "terminos_pendientes", "mensaje": ...}`): el
+  frontend matchea por el código, no por el texto.
+- Las variables se leen con `os.environ.get` en el momento de usarlas (ADR-025, ADR-026).
+- Los puntos que escriben `usuarios` (relevados con `grep` de `.create(`, `.update(`, `.update_password(`, `.delete(`,
+  `session.add`/`commit` sobre `Usuario`): `bootstrap.py` (tres funciones), `usuarios.py` (alta, edición, clave, baja),
+  `session_auth.py` (`/auth/change-password`, `/auth/reset-password`), `password_reset.py` (vía `reset`), `repository.py`
+  (`_rehash`). `AdminAuth` (el superadmin del backoffice) no usa `usuarios`.
+
+**Decisión.**
+- `libraauth/nodo.py` (nuevo): `es_nodo()` —`LIBRAEDGE_NODE_ID` definida y no vacía, leída en cada llamada—, la guarda
+  `exigir_central()` y `exigir_central_si_escribe(request)`, y `error_solo_en_el_central(mensaje)`. Contestan **409** con
+  `detail = {"code": "solo_en_el_central", "mensaje": "Los usuarios se administran desde la versión web."}`.
+- **Arranque.** `ensure_default_admin`, `ensure_admin_user` y `ensure_demo_user` no crean nada en un nodo y dejan una línea
+  `[INFO]` que nombra la variable. `ensure_default_admin` tampoco exige `<PREFIX>_ADMIN_PASSWORD` ahí (el nodo no la tiene y no la
+  necesita). Es el mismo cierre para los tres: son los únicos que crean usuarios al arrancar.
+- **API de usuarios.** `build_users_router` cuelga `exigir_central_si_escribe` del **router entero**, después del guard de admin
+  (quien no es admin sigue recibiendo su 401/403 y no se entera de si es un nodo): alta, edición, clave de otro, **clave propia por
+  el ABM** y baja dan 409; las lecturas (`GET`) andan. Cuelga del router y no de cada ruta para que una ruta que se agregue
+  mañana nazca cerrada en el nodo. La guarda corre antes de validar el cuerpo: un cuerpo inválido da 409, no 422.
+- **Clave propia y recupero por correo** (los otros caminos que escriben `usuarios`): `POST /auth/change-password`,
+  `POST /auth/forgot-password` y `POST /auth/reset-password` llaman a `exigir_central()` y dan el mismo 409. El cambio de clave propia
+  lo hace después de la identidad y antes de mirar la clave actual, así que ni cuenta como intento fallido.
+- **`_rehash`** no escribe en un nodo: el login sigue verificando la clave (sin internet, contra el espejo) y deja el hash como
+  está; se migra a argon2 cuando el usuario entra al central y el espejo lo baja.
+- **Términos y Condiciones.** *Hoy*, el gate lee `aceptaciones_terminos` de la base local: si el espejo no la trae (inferido, no medido: no se
+  verificó qué tablas espeja cada instalación), el nodo arranca con el gate **cortando**: el local entero queda sin vender con un 403 `terminos_pendientes`; y si el `admin` espejado acepta ahí, la
+  prueba de la cláusula 30.3 queda escrita en una base que no es la del central. *Decisión*: `exige_aceptacion()` devuelve `False`
+  en un nodo —igual que en una demo—, con lo que el gate no corta, `pendiente` es `false` y no hay aviso de próxima versión;
+  `puede_aceptar` es `false`; `POST /terminos/aceptar` da 409 `solo_en_el_central` con «Los Términos se aceptan desde la versión
+  web.»; y si el espejo trae una aceptación, `GET /terminos` y `/historial` la siguen mostrando. La aceptación se hace una sola vez,
+  en el central.
+- **Usuario dado de baja.** Un `activo=false` que baja del central ya corta la sesión: `json_api_get_current_user` vuelve a leer el
+  usuario en cada pedido y da 401 si `active` es falso, y `check_credentials` no deja volver a entrar. No hizo falta código; el
+  test lo fija con la base real (`test_el_usuario_que_baja_inactivo_pierde_la_sesion_del_nodo`).
+
+**Lo que no cambia.** Sin `LIBRAEDGE_NODE_ID`, todo igual: cada caso nuevo lleva su contraprueba en el central. Ninguna firma cambia.
+
+**Lo que no resuelve (abierto).**
+- **Baja física en el central.** `UserRepository.delete()` hace `DELETE` físico y convierte la violación de FK en
+  `UsuarioConHistorial` (409 «desactivalo»), así que en el central un usuario con historial ya no se puede borrar. El riesgo es
+  otro: un `DELETE` de un usuario *sin* historial en el central baja al nodo como borrado, y si el nodo tiene filas propias que lo
+  referencian (turnos, ventas aún sin subir) viola la FK y **traba el espejo**. Recomendación, **no implementada** (cambia el
+  comportamiento del central: el 204 de la baja pasaría a ser una desactivación y la fila seguiría ocupando el `username`): que la
+  baja desde el ABM sea lógica (`activo=false`) y que el borrado físico quede para quien lo pida expresamente. Va a decisión.
+- **Guards de las apps server-rendered.** `SessionAuth.require_auth/require_admin/require_role` y `get_current_user_json` de
+  Contalibra/Restolibra no miran `active` de la sesión en curso (sólo `json_api_get_current_user` lo hace): un usuario desactivado
+  conserva la sesión ya abierta hasta que vence la cookie. Pasa igual en el central; en el nodo no se puede cortar de otra forma.
+  Se informa aparte, no se toca acá.
+- **`PasswordResetService.reset()` llamado directo** por un producto (sin pasar por el router) no tiene la guarda: es de la capa de
+  servicio, y los routers de libraauth, que son su único llamador en la familia, sí.
+- El valor de `LIBRAEDGE_NODE_ID` no se valida contra nada: alcanza con que esté definida.
+
+**Consecuencias.** MINOR (propuesta v0.54.0), **sin migración**, aditivo: un módulo nuevo (`libraauth.nodo`) y guardas que sólo actúan
+con la variable. El producto con un libraauth anterior a esta versión se comporta como hoy en el nodo (admin local, escrituras
+abiertas, gate de Términos cortando) hasta que suba el pin.
+
+**Verificación.** `tests/test_nodo.py` (nuevo, 28 tests), con las contrapruebas del central; puesto sobre el código sin el arreglo, 11
+de los 28 se ponen rojos (el resto son las contrapruebas del central y las lecturas, que tienen que pasar en los dos). Más los
+archivos vecinos en local sin xdist; suite completa en CI.

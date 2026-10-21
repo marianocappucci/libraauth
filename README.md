@@ -114,6 +114,19 @@ Sólo esos valores la apagan. Vacía, ausente, `1`, `true` o un error de tipeo
 la marca apagada se avisa una vez por proceso. La cookie del backoffice de superadmin
 (`AdminAuth`) no lee esta variable: sigue siendo `Secure` siempre.
 
+## Nodo de LibraEdge: los usuarios son los del central (v0.54.0, ADR-027)
+
+Un proceso con `LIBRAEDGE_NODE_ID` definida es un **nodo de LibraEdge**: la PC del local, que espeja `usuarios` del central y
+trabaja sin internet. Ahí los usuarios son los del central y el nodo no los escribe:
+
+- `ensure_default_admin`, `ensure_admin_user` y `ensure_demo_user` no crean nada (y `ensure_default_admin` no exige la clave).
+- Alta, edición, cambio de clave y baja del router de usuarios, `POST /auth/change-password` y el recupero por correo contestan
+  **409** con `detail = {"code": "solo_en_el_central", "mensaje": ...}`. Las lecturas andan.
+- El login no reescribe el hash (`_rehash`), y los Términos no se exigen ni se aceptan en el nodo.
+- La guarda es una sola: `libraauth.nodo.exigir_central` (y `es_nodo()` para preguntar).
+
+Un usuario que baja del central con `activo=false` pierde la sesión en el nodo. Sin la variable, nada cambia.
+
 ## Captcha «No soy un robot» (v0.40.0)
 
 `build_json_api_auth_router(captcha=True)` agrega `GET /auth/captcha` y exige
