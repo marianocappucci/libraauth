@@ -17,7 +17,15 @@ def test_la_lista_por_defecto_es_la_de_libracore():
     ui = pytest.importorskip("libracore.db.url_de_instancia")
     if not hasattr(ui, "comparte_base_con_el_dominio"):
         pytest.skip("libracore anterior a v1.103.0")
-    for prefijo in ("contalibra", "restolibra", "ventalibra", "libradesk"):
+    una_sola = ["contalibra", "restolibra", "ventalibra", "libradesk"]
+    core_aparte = ["gestiolibra", "medlibra"]
+    # libracore v1.190.1 (ADR-078, 2026-10-22): LibraCargo y LibraClub pasan a una sola base.
+    unidas = ["libracargo", "libraclub"]
+    if "libracargo" in getattr(ui, "_UNA_SOLA_BASE", ()):
+        una_sola += unidas
+    else:
+        core_aparte += unidas
+    for prefijo in una_sola:
         assert migrar._comparte_base_segun_libracore(prefijo) is True
-    for prefijo in ("gestiolibra", "medlibra", "libracargo", "libraclub"):
+    for prefijo in core_aparte:
         assert migrar._comparte_base_segun_libracore(prefijo) is False
