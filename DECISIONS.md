@@ -984,3 +984,19 @@ entra sin captcha; con un captcha basura o resuelto entra igual y el desafío no
 sexto es 429 aun con la clave buena; con `captcha=False` no hay endpoint; `forgot-password` da 409. Contraprueba fuera de un
 nodo: el desafío conserva su forma y sin captcha el login da 400. Puesto sobre el código sin el arreglo, 5 de los 8 se ponen
 rojos (los otros tres son contrapruebas que tienen que pasar en los dos lados).
+
+## ADR-029 — `verificar_captcha`: la verificación pública para las rutas propias de un producto (2026-10-28)
+
+**Problema.** El portal de jugadores de LibraClub pide captcha en su propio login (`/api/portal/login`) y, para no partir el
+anti-replay en dos, verifica con el mismo `Captcha` de proceso que el router de `/auth`. libraauth no exponía cómo obtenerlo:
+el producto llamaba a la función privada `_captcha_de` por atributo de módulo y documentaba que «el arreglo de fondo sería que
+libraauth exporte una versión pública de esto» (pendientes de la familia, Motores).
+
+**Qué ya existía.** `_captcha_de(request, usados)` (un `Captcha` por proceso, creado con el `SECRET_KEY` de la instancia si el
+producto no inyectó uno) y `captcha_usados=` (ADR-023). Las suites de los nueve productos y del panel parchean
+`libraauth.session_auth._captcha_de` para no resolver un desafío real en cada login.
+
+**Decisión.** `libraauth.session_auth.verificar_captcha(request, respuesta, usados=None) -> bool`, que delega en `_captcha_de`
+buscándola en el módulo en cada llamada: el parche de las suites sigue valiendo, sin tocar ningún `conftest.py`. No mira si es
+un nodo (ADR-028): la ruta del producto decide si exige captcha, como el router con `_exige_captcha()`. `_captcha_de` sigue
+existiendo con el mismo nombre y la misma firma, porque es el punto que parchean los tests.

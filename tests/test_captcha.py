@@ -22,7 +22,7 @@ import json
 
 import pytest
 from altcha import Challenge, Payload, solve_challenge
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -31,7 +31,7 @@ from libraauth.auth_events import AuthEventRepository
 from libraauth.captcha import COSTO, PAYLOAD_MAXIMO, VIGENCIA_SEGUNDOS, Captcha
 from libraauth.models import Base
 from libraauth.nodo import NODE_ID_ENV
-from libraauth.session_auth import build_json_api_auth_router
+from libraauth.session_auth import CAPTCHA_INVALIDO, build_json_api_auth_router, verificar_captcha
 
 
 @pytest.fixture(autouse=True)
@@ -362,3 +362,64 @@ def test_en_un_nodo_olvide_mi_contrasena_sigue_cerrado(nodo):
     r = c.post("/auth/forgot-password", json={"identificador": "ana"})
     assert r.status_code == 409, r.text
     assert recuperacion.pedidos == []
+
+
+# --- `verificar_captcha`, la verificación pública para rutas propias del producto (ADR-029) ---------------------------
+
+
+def _app_con_ruta_propia(**kw):
+    """El router de `/auth` y una ruta del producto que verifica con `verificar_captcha`, como el portal de LibraClub."""
+    app = _app(**kw)
+
+    @app.post("/portal/login")
+    def portal_login(request: Request, cuerpo: dict):
+        if not verificar_captcha(request, cuerpo.get("captcha", "")):
+            raise HTTPException(400, CAPTCHA_INVALIDO)
+        return {"ok": True}
+
+    return app
+
+
+def test_verificar_captcha_acepta_el_desafio_de_auth_captcha():
+    c = _cliente(_app_con_ruta_propia())
+    assert c.post("/portal/login", json={"captcha": _captcha(c)}).status_code == 200
+
+
+def test_verificar_captcha_sin_respuesta_es_falso():
+    c = _cliente(_app_con_ruta_propia())
+    assert c.post("/portal/login", json={}).status_code == 400
+
+
+def test_un_desafio_usado_en_el_portal_no_sirve_para_el_login():
+    """🔴 Un solo `Captcha` de proceso: el anti-replay no se parte entre la ruta del producto y el login."""
+    c = _cliente(_app_con_ruta_propia())
+    payload = _captcha(c)
+    assert c.post("/portal/login", json={"captcha": payload}).status_code == 200
+    assert c.post("/auth/login", json=_con(CLAVE_BUENA, payload)).status_code == 400
+
+
+def test_sin_captcha_inyectado_crea_el_del_proceso_con_los_usados_del_producto():
+    """Si a la ruta propia le toca crear el `Captcha` del proceso, lo crea con los `usados` que le pasa el producto."""
+    from libraauth.captcha import UsadosEnMemoria
+
+    usados = UsadosEnMemoria()
+    app = _app(inyectar=False)
+
+    @app.get("/probar")
+    def probar(request: Request):
+        verificar_captcha(request, "basura", usados)
+        return {}
+
+    _cliente(app).get("/probar")
+    assert app.state.captcha._usados is usados
+
+
+def test_verificar_captcha_respeta_el_parche_de_captcha_de(monkeypatch):
+    """Las suites de los productos parchean `libraauth.session_auth._captcha_de`: la función pública lo tiene que ver."""
+    class _Aprueba:
+        def verificar(self, respuesta):
+            return True
+
+    monkeypatch.setattr("libraauth.session_auth._captcha_de", lambda request, usados=None: _Aprueba())
+    c = _cliente(_app_con_ruta_propia())
+    assert c.post("/portal/login", json={"captcha": "cualquier-cosa"}).status_code == 200
