@@ -482,6 +482,21 @@ def _captcha_de(request: Request, usados: UsadosDeCaptcha | None = None) -> Capt
     return captcha
 
 
+def verificar_captcha(request: Request, respuesta: str, usados: UsadosDeCaptcha | None = None) -> bool:
+    """`True` si `respuesta` resuelve un desafio emitido por el `Captcha` de la app (ADR-029).
+
+    Para las rutas propias de un producto que piden captcha fuera del router de `/auth` (el portal de jugadores de
+    LibraClub): verifican con el **mismo** `Captcha` de proceso que el login, asi un desafio resuelto sirve una sola vez
+    entre las dos rutas y `GET {prefijo}/captcha` hace de desafio para las dos. `usados` es el `captcha_usados=` que el
+    producto le paso al router: si a esta ruta le toca crear el `Captcha` del proceso, lo crea anotando en el mismo lugar.
+
+    `_captcha_de` se busca en el modulo en cada llamada, no se captura: las suites de los productos la parchean
+    (`libraauth.session_auth._captcha_de`) para no resolver un desafio real en cada login, y el parche vale tambien aca.
+    No mira si es un nodo (ADR-028): eso lo decide la ruta, como el router con `_exige_captcha()`.
+    """
+    return _captcha_de(request, usados).verificar(respuesta)
+
+
 def json_api_get_session_auth(request: Request) -> "SessionAuth":
     return request.app.state.session_auth
 
