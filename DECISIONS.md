@@ -1000,3 +1000,53 @@ producto no inyectó uno) y `captcha_usados=` (ADR-023). Las suites de los nueve
 buscándola en el módulo en cada llamada: el parche de las suites sigue valiendo, sin tocar ningún `conftest.py`. No mira si es
 un nodo (ADR-028): la ruta del producto decide si exige captcha, como el router con `_exige_captcha()`. `_captcha_de` sigue
 existiendo con el mismo nombre y la misma firma, porque es el punto que parchean los tests.
+
+
+## ADR-030 — Términos propios de una instancia y mail de recuperación con la marca (marca blanca) (2026-10-30)
+
+**Estado:** propuesta, pedida por el humano para vender los productos a marca blanca: términos propios del revendedor («términos propios del revendedor», decisión del 2026-10-29) y su nombre y dominio en los mails. PR 3 de 15 del piloto (diseño en el wiki, `marca-blanca-piloto-diseno`). Sin migración.
+
+**Contexto.** Hasta acá el contrato era uno solo, el de la familia: constantes del módulo (`VERSION_VIGENTE`, `ARCHIVO_TERMINOS`, la próxima `VERSION_PROXIMA`), con el prestador escrito adentro. Una instancia de un revendedor tiene que mostrar y registrar **sus** términos, no los de Libra. Y el mail de recuperación firmaba con un `product_name` fijo y armaba el enlace con una `reset_url_base` que cada producto lee de una variable de entorno con un default `dev.<producto>.com.ar`.
+
+**Qué ya existía** (se miró antes). La aceptación ya es **de la instancia** y guarda versión y hash (`AceptacionTerminos`); la pantalla `Terminos.tsx` de `libra-ui` dibuja el `texto_html` que le sirve el servidor, así que **no necesita cambios**; `PasswordResetService` ya recibe `smtp_config` como fuente resuelta en cada uso y `email_from_name` ya es por instancia. **No existía:** un contrato que no fuera el del módulo, ni forma de que el nombre y la URL base del mail cambiaran por instancia.
+
+**Decisión.**
+- **`Contrato`** (versión, vigencia, texto, hash, `propio`) y `contrato_de_la_familia()`. **El texto es perezoso**: el gate corre en cada pedido gateado y casi siempre sólo necesita la versión; leer y hashear ~30 KB por cada uno sería pagar el contrato entero para contestar un booleano.
+- **`TerminosRepository(..., contrato_propio=, exigir_propio=)`**, dos ganchos opcionales. `contrato_propio()` devuelve el contrato de ESTA instancia (un `Contrato` o un `dict` con `version`, `vigente_desde` y `texto`) o `None`; `exigir_propio()` dice que la instancia **debe** tener uno. Sin ganchos, el repositorio es el de siempre (los 48 tests de `test_terminos.py` pasan sin tocarse).
+- **Sin contrato propio y con `exigir_propio`, no hay contrato.** El gate corta con el mismo código (`terminos_pendientes`, que el frontend ya sabe frenar) más `sin_contrato: true`, el estado trae `version` y `hash_texto` vacíos y `puede_aceptar: false` (ni el admin), y aceptar es 409. **Nunca se cae a los términos de Libra**: un fallback «amable» haría que el cliente de un revendedor aceptara un contrato con otro prestador.
+- **La prueba de un contrato propio es versión Y hash.** Si el revendedor cambia el texto sin cambiar la versión, o pasa de los términos de Libra a los suyos con el mismo número («1.0»), la aceptación vieja **no vale**. La caché de «ya aceptó» usa la misma clave. Para el contrato de la familia nada cambia (una corrección de tipeo sin subir la versión no vuelve a frenar a nadie).
+- **La próxima versión de la familia (la 1.1 del 09-11-2026) no se anuncia ni se acepta** en una instancia con términos propios, ni se la rige.
+- **Un texto propio que no cumple la forma se ignora con un error en el log**: con `exigir_propio` la instancia queda frenada; sin él, es una instancia común. Nunca un 500 en cada pedido.
+- **`PasswordResetService(product_name=, reset_url_base=)` aceptan un texto o una función**, resuelta en cada pedido de recuperación (sigue habiendo texto fijo). Las dos propiedades siguen siendo **asignables** (convertir `smtp_config` en solo lectura ya rompió a Contalibra y Restolibra).
+
+**Por qué así.**
+- **Se resuelven ANTES de buscar al usuario**, igual que el SMTP. Si una función de la marca fallara después de la búsqueda, el error sólo ocurriría con cuentas que existen, y el endpoint volvería a ser un buscador de usuarios. Un nombre o una URL que no se pueden resolver son `EmailNotConfigured` (503, ya mapeado), igual para una cuenta que existe y una que no.
+- **La URL base sale del producto, nunca del `Host` del pedido**: un enlace armado con el encabezado de quien lo pide permite que un atacante haga llegar a la víctima un mail legítimo cuyo enlace apunta a su servidor.
+- **Los ganchos reciben funciones y no una dependencia de `libracore`**: `libraauth` no depende de `libracore` (ni al revés). El producto los une en su factory.
+- **Validación de la forma, no del contenido legal**: versión de hasta 20 caracteres (`[A-Za-z0-9][A-Za-z0-9._-]*`, con `fullmatch`: el `$` de Python acepta un salto de línea final y un test lo encontró), fecha `dd-mm-aaaa` real, texto no vacío de hasta 300.000 caracteres.
+
+**Qué no resuelve.**
+- **Dónde se guardan los términos propios** (es de la instancia, igual que el tema y la marca): `libracore.terminos_propios`, en el PR hermano. Este PR sólo es el mecanismo.
+- **Las páginas públicas de términos** (`libra_web_kit.legal_gen`) siguen siendo las de la familia; las de un revendedor no se generan.
+- **`totp.EMISOR = "Libra Backoffice"`** es lo que ve en su aplicación de autenticación quien entra a un backoffice. No es de las instancias de clientes; se revisará si el revendedor llega a tener acceso a uno.
+- **Revisión legal:** el texto lo escribe y lo valida el humano con su asesor; el código sólo garantiza que sea el que se muestra, se hashea y se registra.
+
+**Cómo lo adopta un producto** (PR 5 a 13), en su factory, con la versión de `libracore` que traiga `terminos_propios` y `nombre_de_marca`:
+
+    app.state.terminos = TerminosRepository(
+        sessions,
+        contrato_propio=terminos_propios.leer_terminos_propios,   # el mismo objeto mientras el archivo no cambie
+        exigir_propio=marca_router.es_marca_propia,
+    )
+    app.state.password_reset = PasswordResetService(
+        sessions,
+        product_name=lambda: marca_router.nombre_de_marca("VentaLibra"),
+        reset_url_base=os.environ.get("VENTALIBRA_RESET_URL_BASE", "https://dev.ventalibra.com.ar/reset-password"),
+        ...
+    )
+
+🔴 **La URL base sigue viniendo de la variable de entorno por instancia** (`<PRODUCTO>_RESET_URL_BASE`, ya documentada en `clientes.example.yml`), y su **default apunta a `dev.<producto>.com.ar`**, un dominio de Libra. En una instancia de un revendedor la variable hay que setearla al dominio de la instancia, o el enlace del mail sale con el de Libra. Es un paso del alta (runbook del PR 4 del piloto); este PR deja la puerta abierta a que sea una función, pero no la usa.
+
+**Consecuencias.** MINOR (`0.57.0`): API nueva y campos nuevos y opcionales en `GET /terminos` (`propio`, `sin_contrato`). Sin los ganchos, nada cambia.
+
+**Tests** (`tests/test_terminos_propios.py`, 43; `tests/test_password_reset_marca.py`, 17; el resto de la suite de términos y de reset, sin tocar): el contrato propio es el que se muestra, se hashea y se registra; el hash no depende de los finales de línea; el mismo número con otro texto vuelve a quedar pendiente (y la caché lo respeta); sin contrato la instancia queda frenada y no cae a la familia; la próxima de la familia no entra; el gate no lee el texto; una fuente de nombre o URL rota falla igual para una cuenta que existe y una que no, sin dejar tokens; las propiedades siguen siendo asignables. Seis roturas deliberadas los ponen en rojo.
