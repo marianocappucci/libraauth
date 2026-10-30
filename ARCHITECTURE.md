@@ -40,12 +40,17 @@ import) — el resto orbita alrededor de él.
   secretos en reposo, con errores tipados (`ClaveDeCifradoAusente`,
   `SecretoIndescifrable`).
 - **`password_reset.py`** (`PasswordResetService`): tokens de reseteo con
-  expiración; errores `InvalidResetToken`/`EmailNotConfigured`.
+  expiración; errores `InvalidResetToken`/`EmailNotConfigured`. `product_name` y
+  `reset_url_base` pueden ser una función (marca blanca, ADR-030).
 - **`terminos.py`** (`TerminosRepository`): términos y condiciones versionados
   por hash (`hash_vigente`, `exige_aceptacion`, `hay_terminos_pendientes`) — un
   producto puede exigir la aceptación de la versión vigente antes de operar.
   Si hay una próxima versión anunciada (`proxima_anunciada`), `GET /terminos` la
   suma como `proxima` y `POST /aceptar` admite aceptarla por adelantado (ADR-024).
+  Una instancia de un revendedor de marca blanca puede tener **términos propios**
+  (`Contrato`, `TerminosRepository(contrato_propio=, exigir_propio=)`, ADR-030): la
+  prueba es versión y hash, y sin sus términos cargados la instancia queda frenada y
+  no cae a los de la familia.
 - **`demo_codigos.py`** (`DemoCodigoRepository`): códigos de acceso demo de un
   solo uso, hasheados.
 - **`auth_events.py`** (`AuthEventRepository`): registro de accesos e intentos

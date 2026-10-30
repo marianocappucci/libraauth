@@ -43,6 +43,24 @@ class EmailNotConfigured(Exception):
     error no dependa de eso."""
 
 
+def _resolver_texto(fuente: "str | Callable[[], str]", nombre: str) -> str:
+    """El valor de una fuente que puede ser un texto fijo o una función. Un texto fijo se devuelve tal cual (como siempre, vacío
+    incluido); una función que falla o devuelve algo vacío levanta `EmailNotConfigured`.
+
+    Se usa **antes** de buscar al usuario (ver `request_reset`): si fallara después, el error sólo ocurriría con cuentas que
+    existen, y el endpoint volvería a revelar cuáles son.
+    """
+    if not callable(fuente):
+        return fuente
+    try:
+        valor = fuente()
+    except Exception as exc:
+        raise EmailNotConfigured(f"No se pudo resolver {nombre} para el mail de recuperación: {exc}") from exc
+    if not isinstance(valor, str) or not valor.strip():
+        raise EmailNotConfigured(f"{nombre} no devolvió un texto para el mail de recuperación.")
+    return valor.strip()
+
+
 def _utcnow() -> datetime:
     # Naive en UTC, para comparar contra columnas DateTime sin timezone
     # (que es lo que escribe `server_default=func.now()` en SQLite).
@@ -61,6 +79,13 @@ class PasswordResetService:
     query string (ej. `https://dev.gestiolibra.com.ar/reset-password`); el
     servicio le agrega `?token=...`.
 
+    **`product_name` y `reset_url_base` pueden ser una función** (ADR-030, marca blanca): se resuelve en cada pedido de recuperación,
+    no al construir el servicio. Así una instancia de un revendedor manda el mail con SU nombre —`lambda: marca_guardada().get("nombre")
+    or "VentaLibra"`— y con SU dominio en el enlace. Sigue aceptando un texto fijo, como siempre.
+
+    🔴 **La URL base sale del producto, NUNCA del `Host` del pedido.** Un enlace de recuperación armado con el encabezado que manda
+    quien lo pide permite que un atacante haga llegar a la víctima un mail legítimo cuyo enlace apunta a su propio servidor.
+
     `send_email` permite inyectar otro transporte (los tests le pasan uno que
     acumula en memoria). Por defecto usa el SMTP propio del motor.
     """
@@ -69,8 +94,8 @@ class PasswordResetService:
         self,
         session_factory: Callable[[], Session],
         *,
-        product_name: str,
-        reset_url_base: str,
+        product_name: "str | Callable[[], str]",
+        reset_url_base: "str | Callable[[], str]",
         ttl_minutes: int = 60,
         smtp_config: "SmtpConfig | Callable[[], SmtpConfig] | None" = None,
         send_email: Callable[..., None] | None = None,
@@ -78,8 +103,9 @@ class PasswordResetService:
         now: Callable[[], datetime] = _utcnow,
     ):
         self.session_factory = session_factory
-        self.product_name = product_name
-        self.reset_url_base = reset_url_base.rstrip("?&")
+        # Se guarda la FUENTE, no el valor (ver las dos propiedades de abajo).
+        self._product_name_source = product_name
+        self._reset_url_base_source = reset_url_base
         self.ttl_minutes = ttl_minutes
         # Se guarda la FUENTE, no el valor. Ver `smtp_config` mas abajo.
         self._smtp_config_source = (
@@ -88,6 +114,25 @@ class PasswordResetService:
         self._send_email = send_email
         self.min_password_length = min_password_length
         self._now = now
+
+    @property
+    def product_name(self) -> str:
+        """El nombre con el que se firma el mail, resuelto **en cada uso**. Asignable, igual que `smtp_config` (ver el setter de
+        ahí: convertir un atributo en propiedad de solo lectura ya rompió a los consumidores que lo pisaban con `setattr`)."""
+        return _resolver_texto(self._product_name_source, "product_name")
+
+    @product_name.setter
+    def product_name(self, valor: "str | Callable[[], str]") -> None:
+        self._product_name_source = valor
+
+    @property
+    def reset_url_base(self) -> str:
+        """La pantalla que recibe el token, resuelta en cada uso y sin `?`/`&` finales. Asignable (ver `product_name`)."""
+        return _resolver_texto(self._reset_url_base_source, "reset_url_base").rstrip("?&")
+
+    @reset_url_base.setter
+    def reset_url_base(self, valor: "str | Callable[[], str]") -> None:
+        self._reset_url_base_source = valor
 
     @property
     def smtp_config(self) -> SmtpConfig:
@@ -147,6 +192,10 @@ class PasswordResetService:
                 "LIBRAAUTH_SMTP_FROM_EMAIL en el entorno)."
             )
 
+        # Igual que el SMTP: el nombre y la URL base se resuelven ANTES de mirar si el usuario existe (ver `_resolver_texto`).
+        producto = self.product_name
+        url_base = self.reset_url_base
+
         ident = (identificador or "").strip()
         if not ident:
             return 0
@@ -183,18 +232,24 @@ class PasswordResetService:
             session.commit()
 
         for email, username, nombre, token in destinatarios:
-            self._enviar(smtp, email=email, username=username, nombre=nombre, token=token)
+            self._enviar(
+                smtp, email=email, username=username, nombre=nombre, token=token, producto=producto, url_base=url_base,
+            )
         return len(destinatarios)
 
     def _enviar(
-        self, smtp: SmtpConfig, *, email: str, username: str, nombre: str, token: str
+        self, smtp: SmtpConfig, *, email: str, username: str, nombre: str, token: str,
+        producto: str | None = None, url_base: str | None = None,
     ) -> None:
-        link = f"{self.reset_url_base}?token={token}"
-        asunto = f"Recuperar la contraseña de {self.product_name}"
+        # Sin `producto`/`url_base` (quien llama directo, como algunos tests) se resuelven acá.
+        producto = producto if producto is not None else self.product_name
+        url_base = url_base if url_base is not None else self.reset_url_base
+        link = f"{url_base}?token={token}"
+        asunto = f"Recuperar la contraseña de {producto}"
         cuerpo = (
             f"Hola {nombre or username},\n\n"
             f"Recibimos un pedido para restablecer la contraseña de la cuenta "
-            f"'{username}' en {self.product_name}.\n\n"
+            f"'{username}' en {producto}.\n\n"
             f"Para elegir una contraseña nueva, entrá acá:\n{link}\n\n"
             f"El enlace vence en {self.ttl_minutes} minutos y se puede usar una "
             f"sola vez.\n\n"

@@ -33,7 +33,9 @@ comporta como antes de esta version — ver `hay_terminos_pendientes`.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+import logging
+import re
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -125,6 +127,20 @@ def _archivo_vigente(hoy: date | None = None) -> Path:
 #: Codigo que devuelve el gate en el `detail` del 403. El frontend matchea por
 #: esto y no por el texto del mensaje.
 CODIGO_PENDIENTE = "terminos_pendientes"
+
+logger = logging.getLogger(__name__)
+
+
+class ContratoSinCargar(RuntimeError):
+    """La instancia debe tener Términos propios (marca blanca, ADR-030) y todavía no los cargó: no hay nada que registrar."""
+
+
+#: Lo que ve quien entra a una instancia de revendedor cuyos Términos todavía no se cargaron. Sin nombre de proveedor a propósito:
+#: este paquete no sabe quién es.
+MENSAJE_SIN_CONTRATO = (
+    "Esta cuenta todavía no tiene cargados sus Términos y Condiciones del Servicio, así que no se puede continuar. "
+    "Avisale a tu proveedor."
+)
 
 #: Roles que pueden aceptar. Clausula 30.5: solo obliga al Cliente quien tiene
 #: facultades para hacerlo. Un operador ve la pantalla pero no el boton.
@@ -225,11 +241,104 @@ def proxima_anunciada() -> dict | None:
     }
 
 
+#: Una versión propia es un identificador corto, no una frase: va en la fila probatoria y en la URL de la aceptación.
+_VERSION_PROPIA = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,19}")
+
+#: Tope del texto propio (en caracteres). El de la familia pesa ~30 KB; esto da mucho margen y acota lo que se lee y se hashea.
+MAX_TEXTO_PROPIO = 300_000
+
+
+def normalizar_texto(texto: str) -> str:
+    """CRLF/CR a LF: lo que hace estable al hash, venga el texto de un archivo, de un formulario o de un `PUT` (ver `texto_vigente`)."""
+    return texto.replace("\r\n", "\n").replace("\r", "\n")
+
+
+class Contrato:
+    """El contrato que rige en UNA instancia: versión, desde cuándo, el texto y su huella (ADR-030).
+
+    Hay dos orígenes. **El de la familia** (`contrato_de_la_familia`) es el de siempre, el de los módulos de arriba. **Uno propio**
+    (`propio=True`) es el que un revendedor de marca blanca carga para sus clientes: el producto lo entrega por el gancho
+    `contrato_propio` de `TerminosRepository`.
+
+    🔑 **El texto es perezoso a propósito.** El gate corre en CADA pedido gateado y casi siempre sólo necesita la versión; leer y
+    hashear ~30 KB por cada uno sería pagar el contrato entero para contestar un booleano. `texto` puede ser un `str` o una función que
+    lo trae, y se normaliza y se hashea una sola vez, la primera vez que alguien lo pide.
+    """
+
+    def __init__(self, *, version: str, vigente_desde: str, texto: str | Callable[[], str], propio: bool = False):
+        self.version = version
+        self.vigente_desde = vigente_desde
+        self.propio = propio
+        self._origen_del_texto = texto
+        self._texto: str | None = None
+        self._hash: str | None = None
+
+    @property
+    def texto(self) -> str:
+        if self._texto is None:
+            crudo = self._origen_del_texto() if callable(self._origen_del_texto) else self._origen_del_texto
+            self._texto = normalizar_texto(crudo)
+        return self._texto
+
+    @property
+    def hash(self) -> str:
+        """sha256 hex del texto normalizado: la huella de la cláusula 30.3 (la de este contrato, no la de la familia)."""
+        if self._hash is None:
+            self._hash = hashlib.sha256(self.texto.encode("utf-8")).hexdigest()
+        return self._hash
+
+    def html(self) -> str:
+        """El mismo texto en HTML, con el mismo convertidor que `texto_html` (ver ahí por qué es uno solo). No interviene en el hash."""
+        import markdown  # local: solo lo necesita quien va a mostrar el texto
+
+        return markdown.markdown(self.texto, extensions=["tables", "sane_lists"])
+
+    @classmethod
+    def propio_desde(cls, datos: Contrato | Mapping[str, object]) -> Contrato:
+        """Un contrato propio a partir de lo que entrega el producto (un `dict` con `version`, `vigente_desde` y `texto`).
+
+        Valida la forma: `ValueError` con una frase para mostrar si no cumple. **No valida el contenido legal**, eso es del humano.
+        """
+        if isinstance(datos, Contrato):
+            return datos
+        version = datos.get("version")
+        desde = datos.get("vigente_desde")
+        texto = datos.get("texto")
+        if not isinstance(version, str) or not _VERSION_PROPIA.fullmatch(version):
+            raise ValueError("version: hasta 20 caracteres (letras, números, punto, guion).")
+        if not isinstance(desde, str):
+            raise ValueError("vigente_desde: se espera dd-mm-aaaa.")
+        try:
+            _fecha(desde)
+        except ValueError:
+            raise ValueError("vigente_desde: se espera una fecha dd-mm-aaaa.") from None
+        if not isinstance(texto, str) or not texto.strip():
+            raise ValueError("texto: no puede estar vacío.")
+        if len(texto) > MAX_TEXTO_PROPIO:
+            raise ValueError(f"texto: máximo {MAX_TEXTO_PROPIO} caracteres.")
+        return cls(version=version, vigente_desde=desde, texto=texto, propio=True)
+
+
+def contrato_de_la_familia(version: str | None = None) -> Contrato:
+    """El contrato de siempre, el de los módulos de arriba. Con `version` fija (`TerminosRepository(version=...)`), esa versión."""
+    return Contrato(
+        version=version or version_vigente(), vigente_desde=vigente_desde(), texto=texto_vigente, propio=False,
+    )
+
+
 class TerminosRepository:
     """Lectura y escritura de la prueba de aceptacion.
 
     `session_factory` es el mismo que recibe `UserRepository`: el engine donde
     vive `usuarios`, no el del dominio del producto.
+
+    **Términos propios (ADR-030, marca blanca).** Dos ganchos opcionales; sin ellos el repositorio es el de siempre:
+
+    - `contrato_propio`: función sin argumentos que devuelve el contrato de ESTA instancia (un `Contrato` o un `dict` con `version`,
+      `vigente_desde` y `texto`) o `None` si no tiene uno. Se llama en cada pedido gateado: tiene que ser barata (el motor
+      `libracore.terminos_propios` cachea por fecha de modificación del archivo).
+    - `exigir_propio`: función sin argumentos; si devuelve `True` y no hay contrato propio, **no hay contrato**: el gate corta y nadie
+      puede aceptar. Es lo que impide que la instancia de un revendedor caiga, por un descuido, a los términos de Libra.
     """
 
     def __init__(
@@ -237,11 +346,19 @@ class TerminosRepository:
         session_factory: Callable[[], AbstractContextManager[Session]],
         *,
         version: str | None = None,
+        contrato_propio: Callable[[], Contrato | Mapping[str, object] | None] | None = None,
+        exigir_propio: Callable[[], bool] | None = None,
     ):
         self.session_factory = session_factory
         # Sin `version` explícita, la que rige HOY (`version_vigente()`), resuelta en cada llamada: el día que entra la
         # próxima, el gate vuelve a pedir aceptación sin reiniciar el proceso (ADR-021).
         self._version_fija = version
+        self._contrato_propio = contrato_propio
+        self._exigir_propio = exigir_propio
+        # El último contrato propio armado y la cosa de la que salió: si el producto devuelve el MISMO objeto (el caché de
+        # `libracore.terminos_propios`), no se vuelve a armar ni a hashear.
+        self._ultimo_origen: object | None = None
+        self._ultimo_contrato: Contrato | None = None
         # Cache de "esta instancia ya acepto la version vigente". Se prende una
         # sola vez y no se vuelve a apagar: una aceptacion no se deshace, y la
         # unica forma de volver a pendiente es subir `VERSION_VIGENTE`, que llega
@@ -251,9 +368,41 @@ class TerminosRepository:
         # consulta mas por request para leer un booleano que casi siempre es True.
         self._aceptada_en: str | None = None
 
+    def contrato(self) -> Contrato | None:
+        """El contrato que rige en esta instancia, o `None` si **debería tener uno propio y todavía no lo cargó**."""
+        propio = self._propio()
+        if propio is not None:
+            return propio
+        if self._exigir_propio is not None and self._exigir_propio():
+            return None
+        return contrato_de_la_familia(self._version_fija)
+
+    def _propio(self) -> Contrato | None:
+        if self._contrato_propio is None:
+            return None
+        origen = self._contrato_propio()
+        if origen is None:
+            return None
+        if origen is self._ultimo_origen and self._ultimo_contrato is not None:
+            return self._ultimo_contrato
+        try:
+            contrato = Contrato.propio_desde(origen)
+        except ValueError as exc:
+            # Un texto propio roto NO puede tumbar cada pedido ni, peor, hacer caer a la instancia a otro contrato: se trata como
+            # «sin contrato propio» y, si `exigir_propio` manda, la instancia queda frenada con el motivo en el log.
+            logger.error("Los términos propios de la instancia no son válidos y se ignoran: %s", exc)
+            return None
+        self._ultimo_origen, self._ultimo_contrato = origen, contrato
+        return contrato
+
     @property
     def version(self) -> str:
-        return self._version_fija or version_vigente()
+        contrato = self.contrato()
+        return contrato.version if contrato is not None else ""
+
+    def _clave_de_cache(self, contrato: Contrato) -> str:
+        # Un contrato propio se identifica por versión Y hash: dos textos distintos con la misma versión no son «el mismo aceptado».
+        return f"{contrato.version}#{contrato.hash}" if contrato.propio else contrato.version
 
     def aceptacion_de(self, version: str) -> dict | None:
         """La aceptacion de ESA version, o None si la instancia no la tiene."""
@@ -271,16 +420,33 @@ class TerminosRepository:
         🔑 **Busca por versión, sin mirar cuándo se aceptó.** Por eso una aceptación adelantada de la próxima (ADR-024)
         vale sola el día que esa versión pasa a regir: la fila ya está, con su versión y su hash.
         """
-        return self.aceptacion_de(self.version)
+        contrato = self.contrato()
+        if contrato is None:
+            return None
+        if not contrato.propio:
+            return self.aceptacion_de(contrato.version)
+        # 🔑 Un contrato propio se busca por versión Y hash: si el revendedor cambia el texto sin cambiar la versión (o cambia de los
+        # términos de Libra a los suyos con el mismo número, "1.0"), la aceptación vieja NO vale para el texto nuevo.
+        with self.session_factory() as session:
+            fila = session.execute(
+                select(AceptacionTerminos)
+                .where(AceptacionTerminos.version == contrato.version, AceptacionTerminos.hash_texto == contrato.hash)
+                .order_by(AceptacionTerminos.id.desc())
+            ).scalars().first()
+            return _a_dict(fila) if fila else None
 
     def esta_aceptada(self) -> bool:
-        # La cache es POR VERSIÓN: «ya aceptó la 1.0» no dice nada de la 1.1.
-        version = self.version
-        if self._aceptada_en == version:
+        # La cache es POR VERSIÓN: «ya aceptó la 1.0» no dice nada de la 1.1. (Sin contrato —un revendedor que todavía no cargó el
+        # suyo— nada está aceptado, y no se toca la cache.)
+        contrato = self.contrato()
+        if contrato is None:
+            return False
+        clave = self._clave_de_cache(contrato)
+        if self._aceptada_en == clave:
             return True
         hay = self.aceptacion_vigente() is not None
         if hay:
-            self._aceptada_en = version
+            self._aceptada_en = clave
         return hay
 
     def registrar(
@@ -295,16 +461,19 @@ class TerminosRepository:
         segunda aceptacion de la misma version no es un error del que haya que
         avisar: es alguien que apreto dos veces.
         """
-        version = self.version
+        contrato = self.contrato()
+        if contrato is None:
+            raise ContratoSinCargar("Esta instancia debe tener Términos propios y todavía no los cargó.")
+        clave = self._clave_de_cache(contrato)
         ya = self.aceptacion_vigente()
         if ya is not None:
-            self._aceptada_en = version
+            self._aceptada_en = clave
             return ya
         fila = self._guardar(
-            version=version, hash_texto=hash_vigente(), usuario_id=usuario_id,
+            version=contrato.version, hash_texto=contrato.hash, usuario_id=usuario_id,
             username=username, nombre=nombre, ip=ip, user_agent=user_agent,
         )
-        self._aceptada_en = version
+        self._aceptada_en = clave
         return fila
 
     def registrar_proxima(
@@ -317,7 +486,9 @@ class TerminosRepository:
         `historial`. **No toca la memoria de `esta_aceptada`**: aceptar la 1.1 no dice nada de la vigente. Levanta
         `ValueError` si ya no hay próxima (rige desde hoy, o se quitó): quien llama contesta 409.
         """
-        proxima = proxima_anunciada()
+        contrato = self.contrato()
+        # La próxima versión es de la familia: una instancia con términos propios (o que debería tenerlos) no la anuncia ni la acepta.
+        proxima = proxima_anunciada() if contrato is not None and not contrato.propio else None
         if proxima is None:
             raise ValueError("No hay una próxima versión anunciada.")
         ya = self.aceptacion_de(proxima["version"])
@@ -446,11 +617,24 @@ def exigir_terminos(request: Request, user: dict | None = None) -> None:
     obligaria a tocarlas sin que cambie nada.
     """
     if hay_terminos_pendientes(request):
+        contrato = request.app.state.terminos.contrato()
+        if contrato is None:
+            # Un revendedor de marca blanca cuya instancia todavía no tiene sus Términos: el mismo código (el frontend ya lo sabe
+            # frenar) más `sin_contrato`. Nadie puede aceptar nada hasta que se carguen; NO se cae a los de Libra.
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": CODIGO_PENDIENTE,
+                    "version": "",
+                    "sin_contrato": True,
+                    "mensaje": MENSAJE_SIN_CONTRATO,
+                },
+            )
         raise HTTPException(
             status_code=403,
             detail={
                 "code": CODIGO_PENDIENTE,
-                "version": version_vigente(),
+                "version": contrato.version if contrato.propio else version_vigente(),
                 "mensaje": (
                     "Los Términos y Condiciones del Servicio están pendientes de "
                     "aceptación por el responsable de la cuenta."
@@ -497,6 +681,11 @@ class _EstadoTerminos(BaseModel):
     texto_html: str | None = None
     #: La próxima versión anunciada que todavía no rige, o `None` (ADR-024). Los campos de arriba no cambian por esto.
     proxima: _ProximaVersion | None = None
+    #: `True` si el contrato de esta instancia es PROPIO (marca blanca, ADR-030) y no el de la familia.
+    propio: bool = False
+    #: `True` si la instancia debe tener Términos propios y todavía no los cargó: no hay nada que aceptar, `version` y `hash_texto`
+    #: vienen vacíos y `puede_aceptar` es `False`. El frontend lo trata como una instancia frenada, igual que a `pendiente`.
+    sin_contrato: bool = False
 
 
 class _AceptarRequest(BaseModel):
@@ -534,12 +723,16 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
             )
         return repo
 
-    def _proxima_para_esta_instancia() -> dict | None:
-        """El anuncio, o `None` si no hay o si esta instancia no tiene contrato que aceptar (una demo, ADR-024)."""
+    def _proxima_para_esta_instancia(repo: TerminosRepository) -> dict | None:
+        """El anuncio, o `None` si no hay, si esta instancia no tiene contrato que aceptar (una demo, ADR-024) o si su contrato es
+        propio (ADR-030): la próxima versión es de la familia, y no se le anuncia a quien no se rige por ella."""
+        contrato = repo.contrato()
+        if contrato is None or contrato.propio:
+            return None
         return proxima_anunciada() if exige_aceptacion() else None
 
     def _bloque_proxima(repo: TerminosRepository, incluir_texto: bool) -> dict | None:
-        anuncio = _proxima_para_esta_instancia()
+        anuncio = _proxima_para_esta_instancia(repo)
         if anuncio is None:
             return None
         aceptacion = repo.aceptacion_de(anuncio["version"])
@@ -554,11 +747,26 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
 
     def _estado(request: Request, user: dict, incluir_texto: bool) -> dict:
         repo = _repo(request)
+        contrato = repo.contrato()
+        if contrato is None:
+            # Debe tener Términos propios y no los cargó (ADR-030): no hay nada que aceptar y nadie puede aceptar.
+            return {
+                "version": "", "vigente_desde": "", "hash_texto": "",
+                "pendiente": exige_aceptacion(), "puede_aceptar": False,
+                "aceptada_por": None, "aceptada_at": None, "texto": None, "texto_html": None,
+                "proxima": None, "propio": True, "sin_contrato": True,
+            }
         aceptacion = repo.aceptacion_vigente()
+        if contrato.propio:
+            version, desde, huella = contrato.version, contrato.vigente_desde, contrato.hash
+            texto, html = (contrato.texto, contrato.html()) if incluir_texto else (None, None)
+        else:
+            version, desde, huella = version_vigente(), vigente_desde(), hash_vigente()
+            texto, html = (texto_vigente(), texto_html()) if incluir_texto else (None, None)
         return {
-            "version": version_vigente(),
-            "vigente_desde": vigente_desde(),
-            "hash_texto": hash_vigente(),
+            "version": version,
+            "vigente_desde": desde,
+            "hash_texto": huella,
             # 🔴 `exige_aceptacion()` y no solo `aceptacion is None`: en una demo
             # no hay contrato que aceptar, y **el frontend bloquea la aplicacion
             # entera con este booleano** (`GateTerminos`). Sin esto, exceptuar el
@@ -569,9 +777,11 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
             "puede_aceptar": user.get("role") in ROLES_QUE_ACEPTAN and not es_nodo(),
             "aceptada_por": (aceptacion or {}).get("nombre") or (aceptacion or {}).get("username"),
             "aceptada_at": (aceptacion or {}).get("aceptado_at"),
-            "texto": texto_vigente() if incluir_texto else None,
-            "texto_html": texto_html() if incluir_texto else None,
+            "texto": texto,
+            "texto_html": html,
             "proxima": _bloque_proxima(repo, incluir_texto),
+            "propio": contrato.propio,
+            "sin_contrato": False,
         }
 
     @router.get("", response_model=_EstadoTerminos)
@@ -603,8 +813,12 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
             ip=ip_del_request(request),
             user_agent=request.headers.get("user-agent", ""),
         )
-        anuncio = _proxima_para_esta_instancia()
-        if data.version == version_vigente():
+        contrato = repo.contrato()
+        if contrato is None:
+            raise HTTPException(status_code=409, detail=MENSAJE_SIN_CONTRATO)
+        anuncio = _proxima_para_esta_instancia(repo)
+        vigente = contrato.version if contrato.propio else version_vigente()
+        if data.version == vigente:
             repo.registrar(**ident)
         elif anuncio is not None and data.version == anuncio["version"]:
             # Aceptación por adelantado (ADR-024): la misma fila y la misma regla de roles. El día que esta versión
@@ -620,7 +834,7 @@ def build_terminos_router(*, prefix: str = "/terminos") -> APIRouter:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"La versión vigente es {version_vigente()}{proxima_txt} y se intentó aceptar "
+                    f"La versión vigente es {vigente}{proxima_txt} y se intentó aceptar "
                     f"{data.version}. Recargá la página para ver el texto actual."
                 ),
             )
