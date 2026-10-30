@@ -335,8 +335,10 @@ class TerminosRepository:
     **Términos propios (ADR-030, marca blanca).** Dos ganchos opcionales; sin ellos el repositorio es el de siempre:
 
     - `contrato_propio`: función sin argumentos que devuelve el contrato de ESTA instancia (un `Contrato` o un `dict` con `version`,
-      `vigente_desde` y `texto`) o `None` si no tiene uno. Se llama en cada pedido gateado: tiene que ser barata (el motor
-      `libracore.terminos_propios` cachea por fecha de modificación del archivo).
+      `vigente_desde` y `texto`) o `None` si no tiene uno. Se llama en cada pedido gateado: tiene que ser barata, y conviene que
+      devuelva **el mismo objeto** mientras nada cambie, así este repositorio no vuelve a armar ni a hashear el contrato
+      (`libracore.terminos_propios` lo hace comparando el contenido del archivo; una clave de fecha, largo e inodo parece suficiente y no
+      lo es: un archivo reemplazado con el mismo largo puede dejar el texto viejo).
     - `exigir_propio`: función sin argumentos; si devuelve `True` y no hay contrato propio, **no hay contrato**: el gate corta y nadie
       puede aceptar. Es lo que impide que la instancia de un revendedor caiga, por un descuido, a los términos de Libra.
     """
